@@ -53,7 +53,7 @@ global passive adversary; malicious application code above the API.
 ## Findings
 
 Severity uses likelihood × impact for this software's threat model. Each finding
-is tracked as an NB card.
+that needs a change is tracked as an NB card.
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
 
@@ -180,6 +180,22 @@ error code.
 
 **Fix.** Document the contract explicitly in the header/readme, and add null
 checks on the handle and on buffers where `len > 0` as cheap defence in depth.
+
+### SEC-12 — An invite holder can confirm a guessed link by naming it as a relay (Info) — no card
+
+Since NB-033 an invite holder the node never dialled learns none of its linked
+PeerIds. But relay fallback dials a waiting sender `Via` every relay it listed
+that the node is linked to, when the offer arrives (`on_offer`) or when that link
+comes up later (`handle_event`, `Connected`). So a holder can list a guessed
+PeerId X as a relay: if a relayed handshake from the node arrives through X, the
+node is linked to X.
+
+This predates NB-033 (it only extends the check to links that come up later) and
+is inherent to relay fallback. It is bounded: at most 8 guesses (`MAX_RELAYS`) per
+offer acted on, under the offer rate limits; each guess answers only "linked to X
+or not" and enumerates nothing; and X must actually relay to the holder, so X has
+to be linked to it. No fix planned; a stronger design (naming only links that
+agreed to relay) would be a separate card.
 
 ---
 

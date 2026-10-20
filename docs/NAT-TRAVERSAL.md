@@ -232,9 +232,10 @@ traversal privacy_modes_matrix -- --nocapture`:
   after a dial to it failed, since a holder can make its own dial fail. Relay fallback still works: a sender names
   its own links in its offer, and the node dials it through whichever of them it is, or later becomes, linked to.
   A node with no public or observed address (LAN or loopback only, no STUN) answers such a holder with an empty
-  address list, which is harmless: the holder dials the invite's addresses. The invite itself still carries LAN addresses in `Direct`: use
-  `PublicOnly` to keep them out of both. The invite key is a capability: anyone holding the invite has it, and it
-  doesn't rotate yet. So an invite works as a ticket to make the node dial back and link, and a PeerId does not.
+  address list, which is harmless: the holder dials the invite's addresses. The invite itself still carries LAN
+  addresses in `Direct`: use `PublicOnly` to keep them out of both. The invite key is a capability: anyone holding
+  the invite has it, and it doesn't rotate yet. So an invite works as a ticket to make the node dial back and link,
+  and a PeerId does not.
 - **Addresses a node dials or adopts** from offers, from peers' OBSERVED frames and from STUN are never port 0,
   unspecified, multicast, broadcast or link-local, and loopback only if the node is bound to loopback (NB-033(a)).
   An offer can't turn a node into a prober of its own host. It can still name LAN addresses, which the node dials
