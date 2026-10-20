@@ -618,7 +618,8 @@ fn http_complete(d: &[u8]) -> bool {
     let head = String::from_utf8_lossy(&d[..end]).to_ascii_lowercase();
     let len = head.split("\r\n").find_map(|l| l.strip_prefix("content-length:")?.trim().parse::<usize>().ok());
     match len {
-        Some(n) => d.len() >= end + 4 + n,
+        // The body read so far against the length, which a gateway may set to anything.
+        Some(n) => d.len() - (end + 4) >= n,
         None => head.contains("transfer-encoding: chunked") && d.ends_with(b"0\r\n\r\n"),
     }
 }
@@ -1170,6 +1171,19 @@ pub(crate) mod tests {
             let _ = parse_http(&chunked[..cut]); // never panics
         }
         assert_eq!(parse_http(b"garbage"), None);
+    }
+
+    /// NB-014 (found by fuzz_gateway_answers): a Content-Length near usize::MAX
+    /// overflowed the completeness check, a panic in debug builds on the mapping
+    /// thread. Such an answer is never complete: reading goes on to MAX_HTTP.
+    #[test]
+    fn huge_content_length_is_not_complete() {
+        for n in [u64::MAX, u64::MAX - 3, u64::MAX / 2] {
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n");
+            assert!(!http_complete(head.as_bytes()));
+            assert!(!http_complete(format!("{head}{DESC}").as_bytes()));
+        }
+        assert!(http_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
     }
 
     // Mock gateways on loopback, driving the real worker thread.
