@@ -307,6 +307,34 @@ fn nat_matrix_through_signaling() {
     assert_eq!(o.failures, (Some(Failure::Symmetric), Some(Failure::Symmetric)));
 }
 
+/// NB-035: a sequential symmetric NAT predicts its next port from its two STUN
+/// mappings and offers it; a cone peer probes the ports around it, so the pair
+/// punches though the cone side filters by port. Either side may dial first.
+#[test]
+fn sequential_symmetric_nats_punch_port_restricted_peers() {
+    let pairs =
+        [("sym-seq", "port-restr"), ("sym-seq", "cgnat(pr+pr)"), ("cgnat(pr+sym)", "port-restr"), ("cgnat(pr+sym)", "full-cone")];
+    let mut times = Vec::new();
+    for (a, b) in pairs {
+        for seed in 0..10 {
+            for (x, y) in [(a, b), (b, a)] {
+                let o = room_pair(&kind(x), &kind(y), 900 + seed);
+                assert!(o.direct, "{x} x {y}, seed {seed}: {o:?}");
+                times.push(o.t_connect);
+            }
+        }
+    }
+    times.sort();
+    println!("{} pairs direct, connect median {:?}, max {:?}", times.len(), times[times.len() / 2], times[times.len() - 1]);
+    // Random ports can't be predicted: no prediction, so no probing.
+    let mut w = World::new(3);
+    let (r, s) = (w.add(&kind("sym-random")), w.add(&kind("sym-seq")));
+    w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+    assert_eq!(w.peers[r].trav.predicted_addr(), None);
+    let next = w.peers[s].trav.predicted_addr().expect("sequential");
+    assert_eq!(next.port, w.peers[s].trav.public_addr().unwrap().port + 2);
+}
+
 #[test]
 fn symmetric_pair_relays_through_a_third_room_peer() {
     let mut w = World::new(10);

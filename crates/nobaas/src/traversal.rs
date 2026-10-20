@@ -81,6 +81,16 @@ const OFFER: u8 = 1;
 const ROOM_OFFER: u8 = 2;
 const INVITE_OFFER: u8 = 3;
 const PROOF_LEN: usize = 32;
+/// A symmetric NAT whose two STUN mappings are 1 to `MAX_STEP` ports apart, upwards,
+/// looks sequential: its next mapping is predictable.
+const MAX_STEP: u16 = 8;
+/// Ports probed around a predicted one. The NAT may have handed out a few more
+/// since STUN asked, and ports go up, so the window leans forward.
+const GUESS_BEFORE: i32 = 4;
+const GUESS_AFTER: i32 = 27;
+/// Starts the port prediction entry in an offer's address list. Decoders that
+/// predate it skip it, as an address they can't read.
+const PREDICTION_TAG: [u8; 2] = [0xfe, 1];
 
 /// What STUN says about this node's NAT.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -226,6 +236,8 @@ pub struct Traversal<A: Address> {
     next_round: Instant,
     public: Option<A>,
     nat: NatType,
+    /// The port a sequential symmetric NAT will likely pick next, at `public`'s IP.
+    prediction: Option<Prediction>,
     observed: Vec<A>,
     room: Option<Room>,
     remotes: BTreeMap<PeerId, Remote>,
@@ -270,6 +282,7 @@ impl<A: Address> Traversal<A> {
             next_round: Instant::ZERO,
             public: None,
             nat: NatType::Unknown,
+            prediction: None,
             observed: Vec::new(),
             room: None,
             remotes: BTreeMap::new(),
@@ -292,6 +305,14 @@ impl<A: Address> Traversal<A> {
     /// What STUN says about the NAT.
     pub fn nat_type(&self) -> NatType {
         self.nat
+    }
+
+    /// Where a symmetric NAT that hands out ports in sequence will likely map
+    /// this node's next new destination, from the step between its two STUN
+    /// mappings. Offers carry it, and cone peers probe the ports around it.
+    pub fn predicted_addr(&self) -> Option<A> {
+        let (public, p) = (self.public.as_ref()?, self.prediction?);
+        public.port_offset(i32::from(p.next) - i32::from(public.to_socket_addr()?.port()))
     }
 
     /// Why the last dial to `peer` failed, until it connects.
@@ -576,6 +597,10 @@ impl<A: Address> Traversal<A> {
             Some(first) if mapped.iter().all(|m| m == first) => NatType::Cone,
             Some(_) => NatType::Symmetric,
         };
+        self.prediction = match (self.nat, &mapped[..]) {
+            (NatType::Symmetric, [a, b, ..]) => Prediction::from_mappings(*a, *b),
+            _ => None,
+        };
     }
 
     /// Whether this node, in its room (if any), links with `peer` announcing `role`.
@@ -627,6 +652,15 @@ impl<A: Address> Traversal<A> {
             r.member = Some(o.role);
         }
         let loopback = self.loopback;
+        // A sequential symmetric NAT maps the sender's packets to us at a port
+        // near its prediction: probe those too (pointless from an open or
+        // symmetric NAT, which take any packet or would burn a port per probe).
+        let guesses: Vec<A> = match (o.predict, o.addrs.first()) {
+            (Some(p), Some(base)) if !matches!(self.nat, NatType::Open | NatType::Symmetric) => {
+                p.window(base).into_iter().filter(|a| dialable(a, loopback) && !o.addrs.contains(a)).collect()
+            }
+            _ => Vec::new(),
+        };
         let addrs: Vec<A> = o.addrs.into_iter().filter(|a| dialable(a, loopback) && !self.local.contains(a)).collect();
         let mut relay = self.relay();
         if relay.is_none() && room && o.role == Role::Host && matches!(self.privacy, Privacy::RelayOnly { .. }) {
@@ -639,14 +673,19 @@ impl<A: Address> Traversal<A> {
             if let Some(r) = relay.filter(|r| ep.is_connected(r) && !ep.is_connected(&from)) {
                 let _ = ep.connect_with(now, from, &[Path::Via(r)]);
             }
-        } else if ep.is_connected(&from) {
-            ep.add_candidates(now, &from, &addrs);
         } else {
-            let vias = o.relays.iter().filter(|p| **p != from && **p != self.id && ep.is_connected(p));
-            let mut targets: Vec<Path<A>> = vias.take(VIA_PER_DIAL).map(|p| Path::Via(*p)).collect();
-            targets.extend(addrs.into_iter().map(Path::Direct));
-            if !targets.is_empty() {
-                let _ = ep.connect_with(now, from, &targets);
+            if ep.is_connected(&from) {
+                ep.add_candidates(now, &from, &addrs);
+            } else {
+                let vias = o.relays.iter().filter(|p| **p != from && **p != self.id && ep.is_connected(p));
+                let mut targets: Vec<Path<A>> = vias.take(VIA_PER_DIAL).map(|p| Path::Via(*p)).collect();
+                targets.extend(addrs.into_iter().map(Path::Direct));
+                if !targets.is_empty() {
+                    let _ = ep.connect_with(now, from, &targets);
+                }
+            }
+            if !guesses.is_empty() {
+                ep.set_guesses(now, &from, &guesses);
             }
         }
         if o.reply {
@@ -670,6 +709,9 @@ impl<A: Address> Traversal<A> {
             Privacy::RelayOnly { .. } => self.relay().filter(|r| *r != to && ep.is_connected(r)).into_iter().collect(),
             _ => ep.connected_peers().filter(|p| **p != to).take(MAX_RELAYS).copied().collect(),
         };
+        let addrs = self.candidates_for(&to);
+        // The prediction is for the public address, so only when that leads.
+        let predict = self.prediction.filter(|_| self.public.is_some() && addrs.first() == self.public.as_ref());
         let o = Offer {
             kind,
             reply,
@@ -677,7 +719,8 @@ impl<A: Address> Traversal<A> {
             nat: self.nat,
             ts: self.wall_ms(now),
             nonce: self.rng.next_u64(),
-            addrs: self.candidates_for(&to),
+            addrs,
+            predict,
             relays,
         };
         let mut body = o.encode();
@@ -819,13 +862,52 @@ struct Offer<A> {
     ts: u64,
     nonce: u64,
     addrs: Vec<A>,
+    /// The sender's NAT's likely next port, at the first address's IP.
+    predict: Option<Prediction>,
     /// Peers the sender is connected to, which could relay.
     relays: Vec<PeerId>,
+}
+
+/// The port a sequential symmetric NAT will likely hand out next, and its step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Prediction {
+    next: u16,
+    step: u16,
+}
+
+impl Prediction {
+    /// From the mappings two STUN servers saw, in the order they were asked.
+    fn from_mappings<A: Address>(a: &A, b: &A) -> Option<Prediction> {
+        let (a, b) = (a.to_socket_addr()?, b.to_socket_addr()?);
+        let step = b.port().wrapping_sub(a.port());
+        let ok = a.ip() == b.ip() && (1..=MAX_STEP).contains(&step);
+        ok.then_some(Prediction { next: b.port().checked_add(step)?, step })
+    }
+
+    /// The addresses to probe: `base`'s IP, at ports around `next`.
+    fn window<A: Address>(&self, base: &A) -> Vec<A> {
+        let Some(port) = base.to_socket_addr().map(|s| i32::from(s.port())) else { return Vec::new() };
+        let at = |k: i32| base.port_offset(i32::from(self.next) + k * i32::from(self.step) - port);
+        (-GUESS_BEFORE..=GUESS_AFTER).filter_map(at).collect()
+    }
+
+    // [tag: fe 01] [step u8] [next u16 le]
+    fn encode(&self) -> [u8; 5] {
+        let [lo, hi] = self.next.to_le_bytes();
+        [PREDICTION_TAG[0], PREDICTION_TAG[1], self.step as u8, lo, hi]
+    }
+
+    fn decode(b: &[u8]) -> Option<Prediction> {
+        let &[t0, t1, step, lo, hi] = b else { return None };
+        let p = Prediction { next: u16::from_le_bytes([lo, hi]), step: step.into() };
+        ([t0, t1] == PREDICTION_TAG && (1..=MAX_STEP).contains(&p.step)).then_some(p)
+    }
 }
 
 impl<A: Address> Offer<A> {
     // [1|2|3] [flags] [role] [nat] [ts u64 le] [nonce u64 le] [n] n*([len] addr) [m] m*(32 B peer id)
     // A room (2) or invite (3) offer is followed, outside this body, by its 32-byte proof.
+    // One of the n entries may be a port prediction (see `Prediction::encode`), last.
     fn encode(&self) -> Vec<u8> {
         let role = [Role::Peer, Role::Host, Role::Client].iter().position(|r| *r == self.role).unwrap() as u8;
         let nat = [NatType::Unknown, NatType::Open, NatType::Cone, NatType::Symmetric].iter().position(|n| *n == self.nat);
@@ -837,12 +919,18 @@ impl<A: Address> Offer<A> {
         let mut v = vec![version, self.reply as u8, role, nat.unwrap() as u8];
         v.extend_from_slice(&self.ts.to_le_bytes());
         v.extend_from_slice(&self.nonce.to_le_bytes());
-        v.push(self.addrs.len().min(MAX_CANDIDATES) as u8);
-        for a in self.addrs.iter().take(MAX_CANDIDATES) {
+        let room = MAX_CANDIDATES - self.predict.is_some() as usize;
+        let n = self.addrs.len().min(room);
+        v.push((n + self.predict.is_some() as usize) as u8);
+        for a in self.addrs.iter().take(n) {
             let mut e = Vec::new();
             a.encode(&mut e);
             v.push(e.len() as u8);
             v.extend_from_slice(&e);
+        }
+        if let Some(p) = self.predict {
+            v.push(5);
+            v.extend_from_slice(&p.encode());
         }
         v.push(self.relays.len().min(MAX_RELAYS) as u8);
         for p in self.relays.iter().take(MAX_RELAYS) {
@@ -863,11 +951,14 @@ impl<A: Address> Offer<A> {
         if n as usize > MAX_CANDIDATES || flags > 1 {
             return None;
         }
-        let mut addrs = Vec::new();
+        let (mut addrs, mut predict) = (Vec::new(), None);
         for _ in 0..n {
             let (&len, r) = rest.split_first()?;
             let (a, r) = (r.get(..len as usize)?, r.get(len as usize..)?);
-            addrs.extend(A::decode(a));
+            match a.starts_with(&PREDICTION_TAG) {
+                true => predict = predict.or(Prediction::decode(a)),
+                false => addrs.extend(A::decode(a)),
+            }
             rest = r;
         }
         let (&m, mut rest) = rest.split_first()?;
@@ -887,6 +978,7 @@ impl<A: Address> Offer<A> {
             ts: u64::from_le_bytes(*ts),
             nonce: u64::from_le_bytes(*nonce),
             addrs,
+            predict,
             relays,
         })
     }
@@ -943,6 +1035,7 @@ mod tests {
             ts: 1_700_000_000_123,
             nonce: 42,
             addrs: vec!["203.0.113.5:4000".parse().unwrap(), "[2001:db8::1]:9".parse().unwrap()],
+            predict: None,
             relays: vec![id(2).peer_id()],
         };
         let b = o.encode();
@@ -981,7 +1074,8 @@ mod tests {
         addrs: Vec<SocketAddr>,
     ) -> Vec<u8> {
         let kind = proof.map_or(Proof::None, |p| p.0);
-        let o = Offer { kind, reply: true, role, nat: NatType::Cone, ts: 0, nonce, addrs, relays: vec![] };
+        let nat = NatType::Cone;
+        let o = Offer { kind, reply: true, role, nat, ts: 0, nonce, addrs, predict: None, relays: vec![] };
         let mut body = o.encode();
         if let Some((kind, k)) = proof {
             let label: &[u8] = if kind == Proof::Room { b"nb-offer" } else { b"nb-invite" };
@@ -1075,7 +1169,8 @@ mod tests {
         t.introduce(now, &ep, id(2).peer_id(), None);
         while t.poll_signal().is_some() {}
         let o = Offer::<SocketAddr> {
-            kind: Proof::Room, reply: true, role: Role::Host, nat: NatType::Cone, ts: 0, nonce: 1, addrs: vec![], relays: vec![],
+            kind: Proof::Room, reply: true, role: Role::Host, nat: NatType::Cone, ts: 0, nonce: 1, addrs: vec![],
+            predict: None, relays: vec![],
         };
         let body = o.encode();
         assert!(body.len() <= PROOF_LEN, "short enough to skip the proof split");
@@ -1420,10 +1515,16 @@ mod tests {
                 assert!(!t.handle_stun(&"192.0.2.99:3478".parse().unwrap(), b"not stun"));
                 assert!(t.handle_stun(&r.dst, &resp));
             }
-            (t.nat_type(), t.public_addr().copied())
+            (t.nat_type(), t.public_addr().copied(), t.predicted_addr())
         };
-        assert_eq!(run([4000, 4000]), (NatType::Cone, Some("203.0.113.9:4000".parse().unwrap())));
-        assert_eq!(run([4000, 4001]).0, NatType::Symmetric);
+        assert_eq!(run([4000, 4000]), (NatType::Cone, Some("203.0.113.9:4000".parse().unwrap()), None));
+        // NB-035: mappings a small step apart, upwards, predict the next one.
+        let at = |port: u16| Some(SocketAddr::new([203, 0, 113, 9].into(), port));
+        assert_eq!(run([4000, 4001]), (NatType::Symmetric, at(4000), at(4002)));
+        assert_eq!(run([4000, 4008]).2, at(4016));
+        for random in [[4000, 4009], [4001, 4000], [4000, 51234], [65534, 65535]] {
+            assert_eq!(run(random), (NatType::Symmetric, at(random[0]), None), "{random:?}");
+        }
         // Unanswered: retransmitted twice, then given up until the next round.
         let mut t = Traversal::new(&ia, [3; 32], 0, vec![local], vec![s1]);
         let mut sent = 0;
@@ -1433,5 +1534,84 @@ mod tests {
         }
         assert_eq!((sent, t.nat_type()), (3, NatType::Unknown));
         assert_eq!(t.poll_timeout(), Some(Instant::ZERO + STUN_INTERVAL));
+    }
+    /// NB-035: the prediction rides in the address list as an entry no address
+    /// decoder reads, so offers stay readable by nodes that predate it, and a
+    /// full list makes room for it.
+    #[test]
+    fn predictions_round_trip_in_offers() {
+        let p = Prediction { next: 20_002, step: 1 };
+        let entry = p.encode();
+        assert_eq!(Prediction::decode(&entry), Some(p));
+        assert_eq!(SocketAddr::decode(&entry), None);
+        for bad in [[0xfe, 1, 0, 1, 2], [0xfe, 1, 9, 1, 2], [0xfe, 2, 1, 1, 2]] {
+            assert_eq!(Prediction::decode(&bad), None);
+        }
+        let addrs: Vec<SocketAddr> = (0..8).map(|i| SocketAddr::from(([198, 51, 100, 7], 4000 + i))).collect();
+        let o = Offer {
+            kind: Proof::None,
+            reply: false,
+            role: Role::Peer,
+            nat: NatType::Symmetric,
+            ts: 5,
+            nonce: 6,
+            addrs: addrs.clone(),
+            predict: Some(p),
+            relays: vec![],
+        };
+        let b = o.encode();
+        let got = Offer::<SocketAddr>::decode(&b).unwrap();
+        assert_eq!((got.addrs, got.predict), (addrs[..7].to_vec(), Some(p)));
+        assert_eq!(b[20], 8, "eight entries: the most an older decoder takes");
+        // The window: the predicted port's IP, leaning forward.
+        let w = p.window(&addrs[0]);
+        assert_eq!(w.len(), 32);
+        assert_eq!((w[0].port(), w[4].port(), w[31].port()), (19_998, 20_002, 20_029));
+        assert!(w.iter().all(|a| a.ip() == addrs[0].ip()));
+    }
+
+    /// NB-035: a cone node probes the ports around a symmetric peer's
+    /// prediction; an open or symmetric one doesn't.
+    #[test]
+    fn cone_nodes_probe_predicted_ports() {
+        let me = id(1).peer_id();
+        let there: SocketAddr = "198.51.100.9:20000".parse().unwrap();
+        let (s1, s2): (SocketAddr, SocketAddr) = ("192.0.2.1:3478".parse().unwrap(), "192.0.2.2:3478".parse().unwrap());
+        for (ports, probes) in [([5000, 5000], true), ([5000, 5000 + 1], false), ([7000, 7000], false)] {
+            let local: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let mut t = Traversal::new(&id(1), [3; 32], 0, vec![local], vec![s1, s2]);
+            let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+            t.handle_timeout(Instant::ZERO, &mut ep);
+            let mapped = if ports[0] == 7000 { [10, 0, 0, 2] } else { [203, 0, 113, 9] };
+            for (r, port) in std::iter::from_fn(|| t.poll_transmit()).collect::<Vec<_>>().iter().zip(ports) {
+                let tx = stun::parse_binding_request(&r.payload).unwrap();
+                t.handle_stun(&r.dst, &stun::binding_response(&tx, SocketAddr::new(mapped.into(), port)));
+            }
+            let peer = id(2);
+            t.introduce(Instant::ZERO, &ep, peer.peer_id(), None);
+            let o = Offer {
+                kind: Proof::None,
+                reply: false,
+                role: Role::Peer,
+                nat: NatType::Symmetric,
+                ts: 0,
+                nonce: 1,
+                addrs: vec![there],
+                predict: Some(Prediction { next: 20_002, step: 1 }),
+                relays: vec![],
+            };
+            let sealed = sealed::seal(&peer, &me, [7; 32], &o.encode()).unwrap();
+            let now = Instant::from_millis(10);
+            t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed);
+            let sent = dials(&mut ep, now);
+            let nat = t.nat_type();
+            assert_eq!(sent.len(), if probes { 32 } else { 1 }, "{nat:?}");
+            assert_eq!(sent[0], there);
+            if probes {
+                // Not the advertised port again; the rest of the window.
+                assert!(sent[1..].iter().all(|a| a.ip() == there.ip() && a.port() != 20_000));
+                assert!(sent.contains(&"198.51.100.9:20002".parse().unwrap()));
+            }
+        }
     }
 }

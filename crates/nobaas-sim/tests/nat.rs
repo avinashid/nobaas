@@ -323,6 +323,50 @@ fn same_nat_peers_use_lan_candidates() {
     assert_eq!(sim.path(a, b), Some(Path::Direct(lan_b)));
 }
 
+/// NB-035: a sequential symmetric NAT S maps its next new destination to the
+/// port after its last one. Its cone peer C, behind a port-restricted NAT, can't
+/// punch to the port S's relay saw, but can to guesses around the next one, while
+/// relayed and while dialling. A relay-only C ignores guesses.
+#[test]
+fn guessed_ports_punch_a_sequential_symmetric_nat() {
+    let sym = Kind::Nat("sym-seq", NatConfig::symmetric_sequential());
+    let pr = Kind::Nat("pr", NatConfig::port_restricted());
+    // S's NAT (nat 0) gave R port 20000; the next mapping is 20001.
+    let guesses = |sim: &Sim| (0..8).map(|k| SimAddr::new(sim.nat_ip(0), 20_000 + k)).collect::<Vec<_>>();
+    for (guess, relay_only) in [(false, false), (true, false), (true, true)] {
+        let (mut sim, r, s, c) = trio(&sym, &pr, Config::default(), 12);
+        sim.nodes[c].endpoint.set_relay_only(relay_only);
+        sim.connect_via(c, r, s, &[]).unwrap();
+        assert!(sim.run_until(Duration::from_secs(2), |sim| connected(sim, c, s)));
+        if guess {
+            let (now, ps, g) = (sim.now, sim.peer_id(s), guesses(&sim));
+            sim.nodes[c].endpoint.set_guesses(now, &ps, &g);
+        }
+        sim.run_until(Duration::from_secs(6), |sim| is_direct(sim, c, s));
+        let direct = is_direct(&sim, c, s);
+        assert_eq!(direct, guess && !relay_only, "guess {guess}, relay-only {relay_only}");
+        if direct {
+            assert_eq!(sim.path(c, s), Some(Path::Direct(SimAddr::new(sim.nat_ip(0), 20_001))));
+            // Guesses go out every fifth punch round only.
+            let sent = sim.nodes[c].endpoint.stats().punches_sent;
+            assert!(sent < 8 * 3, "{sent} punches");
+        }
+    }
+    // No relay: S dials C's public address while C dials S's guesses.
+    let (mut sim, r, s, c) = trio(&sym, &pr, Config::default(), 13);
+    let (ps, pc) = (sim.peer_id(s), sim.peer_id(c));
+    let c_public = SimAddr::new(sim.nat_ip(1), nobaas_sim::HOST_PORT);
+    sim.nodes[r].endpoint.disconnect(&ps);
+    sim.nodes[r].endpoint.disconnect(&pc);
+    let (now, g) = (sim.now, guesses(&sim));
+    sim.nodes[s].endpoint.connect(now, c_public, pc).unwrap();
+    sim.nodes[c].endpoint.connect(now, g[0], ps).unwrap();
+    sim.nodes[c].endpoint.set_guesses(now, &ps, &g);
+    assert!(sim.run_until(Duration::from_secs(5), |sim| connected(sim, s, c)));
+    assert!(is_direct(&sim, s, c));
+    assert_eq!(sim.path(c, s), Some(Path::Direct(SimAddr::new(sim.nat_ip(0), 20_001))));
+}
+
 #[derive(Debug)]
 struct Outcome {
     connected: bool,
