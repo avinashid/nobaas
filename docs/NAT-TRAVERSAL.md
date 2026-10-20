@@ -73,8 +73,12 @@ deterministically) run by one thread with its own UDP socket, so the node's sock
   finds the router by SSDP either way). IPv4 sockets only, and not ones bound to loopback.
 - **Lease.** 2 hours asked for, renewed at half of what the router grants. PCP renewals reuse the nonce and suggest
   the port held. A UPnP port already taken on the router is retried on 2 random high ports; a router that only
-  allows permanent UPnP leases gets one, deleted with the node. A failed renewal drops the address and starts over.
-  Dropping the node deletes the mapping (it waits up to 2 s for that).
+  allows permanent UPnP leases gets one, deleted with the node. A PCP or NAT-PMP answer with lifetime 0 means no
+  mapping, and counts as a refusal. A failed renewal drops the address and starts over.
+  Dropping the node deletes the mapping. It waits for that: usually a few milliseconds, at most 7 s (an HTTP
+  exchange under way, then the delete's own).
+- **After a crash.** A node that never drops leaves the mapping on the router until its lease runs out (2 hours),
+  or for good under UPnP's permanent-lease fallback, until the router restarts or someone deletes it.
 - **Only public addresses.** If the router's external address is carrier-grade NAT (100.64/10) or private, another
   NAT sits beyond it: the state is `NotPublic { addr }`, nothing is offered, and the mapping is deleted (NAT-PMP
   and UPnP check the address before mapping).
@@ -295,9 +299,16 @@ traversal privacy_modes_matrix -- --nocapture`:
     isn't public. So a LAN responder can't send the node's HTTP requests to a third party;
   - control URLs on another host, and service types or paths with spaces, quotes or control characters, are
     refused, so nothing from the description can break out of a request line or header;
-  - HTTP answers are capped at 64 KiB, with 1.5 s connect, read and write timeouts.
-  A host on the LAN that answers SSDP before the router can still make the node send it the mapping requests, or
-  report a false mapped address. The second only adds a wrong candidate, which nothing can complete a handshake on.
+  - HTTP answers are capped at 64 KiB, and each exchange (connect, request and answer) at 3 s overall, so a
+    gateway that drips its answer a byte at a time can't hold the mapping thread, or the delete on drop.
+
+  Accepted residual risk: a rogue host on the LAN, or one spoofing another's address, can
+  - receive the mapping requests, by answering SSDP before the router;
+  - report a false mapped address. That adds a wrong candidate: the node's peers dial it, a few Noise initiations
+    per peer per room, and no one can complete a handshake there. Any room member can already cause as much by
+    listing an address in its own offer;
+  - by spoofing an SSDP answer's source as another LAN host, make the node send that host's private `ip:port` one
+    fixed GET for a path it chose, then SOAP POSTs if it answers like a gateway.
 - **STUN servers** see the node's public address. A forged STUN answer needs the 96-bit transaction id and the
   server's source address.
 

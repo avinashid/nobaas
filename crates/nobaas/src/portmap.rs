@@ -35,9 +35,12 @@ const RETRY: Duration = Duration::from_secs(300);
 /// UPnP ports tried when the node's own port is taken on the router.
 const IGD_PORT_TRIES: u32 = 3;
 const MAX_HTTP: usize = 64 * 1024;
-const HTTP_TIMEOUT: Duration = Duration::from_millis(1500);
-/// How long dropping a node waits for its mapping's delete to go out.
-const STOP_WAIT: Duration = Duration::from_secs(2);
+/// Most time one HTTP exchange (connect, send, read the answer) may take, however
+/// slowly the gateway sends its bytes.
+const HTTP_DEADLINE: Duration = Duration::from_secs(3);
+/// How long dropping a node waits for its mapping's delete to go out: an HTTP
+/// exchange already under way, then the delete's own.
+const STOP_WAIT: Duration = Duration::from_secs(7);
 const PCP_VERSION: u8 = 2;
 const PCP_MAP: u8 = 1;
 const UDP: u8 = 17;
@@ -440,10 +443,11 @@ fn pcp_response(d: &[u8], nonce: &[u8; 12], port: u16) -> Option<Pcp> {
     if d[24..36] != nonce[..] || d[36] != UDP || u16::from_be_bytes([d[40], d[41]]) != port {
         return None;
     }
-    if d[3] != 0 {
+    let lifetime = u32::from_be_bytes(d[4..8].try_into().ok()?);
+    // Lifetime 0 means there is no mapping (RFC 6887 §15): never one to keep.
+    if d[3] != 0 || lifetime == 0 {
         return Some(Pcp::Refused);
     }
-    let lifetime = u32::from_be_bytes(d[4..8].try_into().ok()?);
     let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&d[44..60]).ok()?).to_ipv4_mapped();
     let ext = u16::from_be_bytes([d[42], d[43]]);
     match ip {
@@ -470,14 +474,15 @@ fn natpmp_address(d: &[u8]) -> Option<Result<Ipv4Addr, ()>> {
     }
 }
 
-/// A NAT-PMP UDP mapping answer for `port`: the external port and lifetime, or `Err`.
+/// A NAT-PMP UDP mapping answer for `port`: the external port and lifetime, or
+/// `Err` (lifetime 0 included: that answers a delete, RFC 6886 §3.4).
 fn natpmp_mapping(d: &[u8], port: u16) -> Option<Result<(u16, u32), ()>> {
     if d.len() < 16 || d[..2] != [0, 129] || u16::from_be_bytes([d[8], d[9]]) != port {
         return (d.len() >= 4 && d[..2] == [0, 129] && d[2..4] != [0, 0]).then_some(Err(()));
     }
     let (result, ext) = (u16::from_be_bytes([d[2], d[3]]), u16::from_be_bytes([d[10], d[11]]));
     let lifetime = u32::from_be_bytes([d[12], d[13], d[14], d[15]]);
-    Some(if result == 0 && ext != 0 { Ok((ext, lifetime)) } else { Err(()) })
+    Some(if result == 0 && ext != 0 && lifetime != 0 { Ok((ext, lifetime)) } else { Err(()) })
 }
 
 const SSDP_SEARCH: &[u8] = b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\n\
@@ -604,16 +609,23 @@ fn http_complete(d: &[u8]) -> bool {
     }
 }
 
-/// Sends a request and reads the answer, both within [`HTTP_TIMEOUT`] per step.
-fn http(req: &HttpRequest) -> Option<Vec<u8>> {
-    let mut s = TcpStream::connect_timeout(&req.to, HTTP_TIMEOUT).ok()?;
-    s.set_read_timeout(Some(HTTP_TIMEOUT)).ok()?;
-    s.set_write_timeout(Some(HTTP_TIMEOUT)).ok()?;
+/// Sends a request and reads the answer, all within `deadline` ([`HTTP_DEADLINE`]):
+/// a gateway that drips its answer is cut off, not waited for.
+fn http(req: &HttpRequest, deadline: Duration) -> Option<Vec<u8>> {
+    let end = std::time::Instant::now() + deadline;
+    // The time left, or `None` once it's up (a zero timeout would mean none at all).
+    let left = || end.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero());
+    let mut s = TcpStream::connect_timeout(&req.to, left()?).ok()?;
+    s.set_write_timeout(Some(left()?)).ok()?;
     s.write_all(&req.bytes).ok()?;
     let (mut out, mut buf) = (Vec::new(), [0u8; 4096]);
     while out.len() <= MAX_HTTP && !http_complete(&out) {
+        s.set_read_timeout(Some(left()?)).ok()?;
         match s.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            // The gateway closed: that ends an answer without a length.
+            Ok(0) => break,
+            // Cut off (or timed out) mid-answer: no answer.
+            Err(_) => return None,
             Ok(n) => out.extend_from_slice(&buf[..n]),
         }
     }
@@ -639,7 +651,7 @@ pub(crate) fn default_gateway(local: Ipv4Addr) -> Ipv4Addr {
 }
 
 /// Runs a [`Mapper`] on its own thread and UDP socket, for a [`Node`](crate::Node).
-/// Dropping it deletes the mapping (waiting up to 2 s for that to go out).
+/// Dropping it deletes the mapping, waiting up to [`STOP_WAIT`] for that to go out.
 pub(crate) struct Worker {
     stop: Arc<AtomicBool>,
     /// The thread's socket, on loopback: a datagram there wakes it to stop.
@@ -675,13 +687,21 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
-    fn drop(&mut self) {
+impl Worker {
+    /// Stops the thread, which deletes the mapping first. Whether it finished
+    /// within [`STOP_WAIT`].
+    fn shut_down(&mut self) -> bool {
         self.stop.store(true, Ordering::Release);
         if let Ok(s) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
             let _ = s.send_to(&[0], self.wake);
         }
-        let _ = self.done.recv_timeout(STOP_WAIT);
+        self.done.recv_timeout(STOP_WAIT).is_ok()
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.shut_down();
     }
 }
 
@@ -701,7 +721,7 @@ fn run(mut m: Mapper, sock: UdpSocket, stop: &AtomicBool, states: &mpsc::Sender<
                 let _ = sock.send_to(&data, to);
             }
             let Some(req) = m.poll_http() else { break };
-            let res = http(&req);
+            let res = http(&req, HTTP_DEADLINE);
             m.handle_http(now(), res.as_deref());
         }
         if last != Some(m.state()) {
@@ -1020,6 +1040,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_zero_lifetime_answer_is_no_mapping() {
+        // Lifetime 0 means deleted: PCP counts it as a refusal, so NAT-PMP is asked next...
+        let ext = SocketAddrV4::new(EXT, 41000);
+        let mut m = mapper();
+        let req = one(&mut m);
+        m.handle_datagram(t(1), GW, &pcp_answer(&req, 0, 0, ext));
+        assert_eq!((m.state(), one(&mut m)), (PortMapping::Trying, vec![0, 0]), "NAT-PMP next");
+        // ...and so does NAT-PMP, so UPnP is.
+        m.handle_datagram(t(2), GW, &natpmp_addr_answer(0, EXT));
+        let map = one(&mut m);
+        m.handle_datagram(t(3), GW, &natpmp_map_answer(&map, 0, 40001, 0));
+        assert_eq!(m.state(), PortMapping::Trying);
+        assert_eq!(sent(&mut m), vec![(SSDP, SSDP_SEARCH.to_vec())], "then UPnP");
+        // A renewal answered with lifetime 0 drops the address and starts over.
+        let mut m = mapper();
+        let req = one(&mut m);
+        m.handle_datagram(t(1), GW, &pcp_answer(&req, 0, 120, ext));
+        m.handle_timeout(t(60_001));
+        let renew = one(&mut m);
+        m.handle_datagram(t(60_002), GW, &pcp_answer(&renew, 0, 0, ext));
+        assert_eq!(m.state(), PortMapping::Trying);
+        assert_eq!(&one(&mut m)[42..44], &[0, 0], "a fresh request");
+    }
+
+    #[test]
     fn ssdp_answers_must_point_at_their_lan_sender() {
         let lan: SocketAddr = "192.168.1.1:1900".parse().unwrap();
         let ok = ssdp_answer("http://192.168.1.1:5000/rootDesc.xml");
@@ -1156,18 +1201,29 @@ pub(crate) mod tests {
         assert_eq!(lifetime_of(&log.lock().unwrap()[1]), 0, "removed at once");
     }
 
-    /// A UPnP gateway on loopback: SSDP on UDP, description and SOAP on HTTP. PCP
-    /// and NAT-PMP are refused. Keeps the SOAP actions it was asked.
-    fn upnp_gateway() -> (SocketAddr, SocketAddr, Arc<Mutex<Vec<String>>>) {
+    /// A gateway on loopback that refuses PCP and NAT-PMP.
+    fn refusing_gateway() -> SocketAddr {
         let (gw, _) = mock_gateway(|r| match r {
             [2, ..] => Some(pcp_answer(r, 2, 0, SocketAddrV4::new(EXT, 0))),
             [0, 0] => Some(natpmp_addr_answer(2, EXT)),
             _ => None,
         });
+        gw
+    }
+
+    /// An SSDP responder on loopback pointing at a description at `at`.
+    fn ssdp_responder(at: SocketAddr) -> SocketAddr {
+        let location = format!("http://{at}/rootDesc.xml");
+        mock_gateway(move |_| Some(ssdp_answer(&location))).0
+    }
+
+    /// A UPnP gateway on loopback: SSDP on UDP, description and SOAP on HTTP. PCP
+    /// and NAT-PMP are refused. Keeps the SOAP actions it was asked.
+    fn upnp_gateway() -> (SocketAddr, SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let gw = refusing_gateway();
         let http = TcpListener::bind("127.0.0.1:0").unwrap();
         let at = http.local_addr().unwrap();
-        let location = format!("http://{at}/rootDesc.xml");
-        let (ssdp, _) = mock_gateway(move |_| Some(ssdp_answer(&location)));
+        let ssdp = ssdp_responder(at);
         let actions = Arc::new(Mutex::new(Vec::new()));
         let seen = actions.clone();
         std::thread::spawn(move || {
@@ -1205,5 +1261,55 @@ pub(crate) mod tests {
         drop(w);
         let want = ["GET", "GetExternalIPAddress", "AddPortMapping", "DeletePortMapping"];
         assert!(eventually(|| *actions.lock().unwrap() == want), "{:?}", actions.lock().unwrap());
+    }
+
+    /// An HTTP server on loopback that answers anything with `Content-Length: 1000`,
+    /// then sends one byte every 200 ms. Counts the connections it took.
+    fn dripping_server() -> (SocketAddr, Arc<Mutex<usize>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = l.local_addr().unwrap();
+        let taken = Arc::new(Mutex::new(0));
+        let count = taken.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let mut s = s.unwrap();
+                *count.lock().unwrap() += 1;
+                std::thread::spawn(move || {
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n");
+                    while s.write_all(b"x").is_ok() {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                });
+            }
+        });
+        (at, taken)
+    }
+
+    #[test]
+    fn http_gives_up_on_a_dripping_gateway_at_its_deadline() {
+        let (at, _) = dripping_server();
+        let start = std::time::Instant::now();
+        assert_eq!(http(&HttpRequest { to: at, bytes: http_get(at, "/") }, HTTP_DEADLINE), None);
+        let took = start.elapsed();
+        assert!(took >= HTTP_DEADLINE && took < HTTP_DEADLINE + Duration::from_secs(1), "{took:?}");
+        // One that sends half an answer and goes quiet: the read times out, and half an answer is none.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut s = l.accept().unwrap().0;
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf").unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        assert_eq!(http(&HttpRequest { to: at, bytes: http_get(at, "/") }, Duration::from_millis(300)), None);
+    }
+
+    #[test]
+    fn worker_stuck_on_a_dripping_gateway_still_stops() {
+        let (at, taken) = dripping_server();
+        let mut w = Worker::spawn(PORT, refusing_gateway(), ssdp_responder(at), [9; 20]).unwrap();
+        assert!(eventually(|| *taken.lock().unwrap() == 1), "fetching the description");
+        let start = std::time::Instant::now();
+        assert!(w.shut_down(), "the thread finished");
+        assert!(start.elapsed() < HTTP_DEADLINE + Duration::from_secs(1), "{:?}", start.elapsed());
     }
 }
