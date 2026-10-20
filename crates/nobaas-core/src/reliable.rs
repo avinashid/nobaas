@@ -21,7 +21,9 @@ pub(crate) const RECV_WINDOW: u32 = 1024;
 const INITIAL_CWND: f64 = 16.0;
 const MIN_CWND: f64 = 4.0;
 /// A fragment this many sequence numbers below the highest acknowledged one is
-/// presumed lost and resent without waiting for its timeout.
+/// presumed lost and resent without waiting for its timeout, once it is also
+/// a quarter of the minimum RTT later than its ACK was expected (RACK's
+/// reordering window, RFC 8985): a fragment merely overtaken costs nothing.
 const DUP_THRESHOLD: u32 = 3;
 /// Queueing delay (RTT above the minimum seen) at which the window backs off,
 /// before any loss: keeps buffers short on paths that never drop (a browser
@@ -45,6 +47,11 @@ struct Fragment {
     tries: u32,
     /// Already scheduled for fast retransmit in this round.
     fast: bool,
+    /// First sequence number sent after this fragment's latest transmission.
+    /// Only an ACK at least DUP_THRESHOLD past it shows that copy was lost:
+    /// ACKs for fragments already in flight when it went out say nothing about
+    /// it, so each loss costs one fast retransmit, not one per ACK.
+    epoch: u32,
     /// Sent again as a tail probe: its ACK can't be timed (Karn's rule).
     probed: bool,
     /// Every transmission (first and retransmissions) is sent twice.
@@ -55,6 +62,8 @@ struct Fragment {
 
 pub(crate) struct RelSend {
     next_seq: u32,
+    /// One past the newest fragment sent so far.
+    sent_end: u32,
     /// (seq, fin, urgent, data)
     queued: VecDeque<(u32, bool, bool, Vec<u8>)>,
     inflight: BTreeMap<u32, Fragment>,
@@ -90,6 +99,7 @@ impl RelSend {
     pub(crate) fn new() -> Self {
         RelSend {
             next_seq: 0,
+            sent_end: 0,
             queued: VecDeque::new(),
             inflight: BTreeMap::new(),
             buffered: 0,
@@ -216,19 +226,17 @@ impl RelSend {
             }
             self.cwnd = self.cwnd.min(65536.0);
         }
-        // Fast retransmit: fragments well below the highest acknowledged one.
+        // Fast retransmit: fragments well below the highest acknowledged one,
+        // after the reordering window. The window is cut when they are resent.
         if let Some(h) = highest {
-            let mut lost = false;
+            let srtt = self.srtt.unwrap_or(self.rto);
+            let reorder = self.min_rtt.unwrap_or(srtt) / 4;
             for (&s, f) in self.inflight.range_mut(..h.saturating_sub(DUP_THRESHOLD - 1)) {
                 debug_assert!(s < h);
-                if !f.fast && f.due > now {
+                if !f.fast && f.due > now && h >= f.epoch.saturating_add(DUP_THRESHOLD - 1) {
                     f.fast = true;
-                    f.due = now;
-                    lost = true;
+                    f.due = f.due.min(now.max(f.sent_at + srtt + reorder));
                 }
-            }
-            if lost {
-                self.on_loss(now);
             }
         }
         if newly > 0 {
@@ -283,8 +291,9 @@ impl RelSend {
 
     /// Appends due retransmissions, then new fragments, while they fit in `max` bytes.
     pub(crate) fn write_frames(&mut self, now: Instant, window: usize, out: &mut Vec<u8>, max: usize) {
-        let mut timed_out = false;
+        let mut lost = false;
         let mut resent = false;
+        let sent_end = self.sent_end;
         for (&seq, f) in self.inflight.iter_mut() {
             if f.due > now {
                 continue;
@@ -292,9 +301,10 @@ impl RelSend {
             if out.len() + REL_OVERHEAD + f.data.len() > max {
                 break;
             }
-            timed_out |= !f.fast;
+            lost = true;
             resent = true;
             f.fast = false;
+            f.epoch = sent_end;
             f.dup_at = f.urgent.then_some(now + URGENT_GAP);
             wire::put_reliable(out, seq, f.fin, &f.data);
             f.tries += 1;
@@ -306,7 +316,7 @@ impl RelSend {
             f.due = now + backoff;
             self.retransmits += 1;
         }
-        if timed_out {
+        if lost {
             self.on_loss(now);
         }
         for (&seq, f) in self.inflight.iter_mut() {
@@ -361,12 +371,14 @@ impl RelSend {
                     due: now + self.rto,
                     tries: 1,
                     fast: false,
+                    epoch: seq + 1,
                     probed: false,
                     urgent,
                     dup_at,
                 },
             );
             sent_new = true;
+            self.sent_end = seq + 1;
             self.fragments_sent += 1;
         }
         if sent_new || (self.probe_at.is_none() && !self.probe_used) {
@@ -473,6 +485,70 @@ mod tests {
         assert_eq!(tx.fragments_sent, 3, "a retransmission is not a new fragment");
         tx.on_ack(Instant::from_millis(450), 3, 0);
         assert_eq!(tx.next_due(), None);
+    }
+
+    #[test]
+    fn fast_retransmit_once_per_loss_event() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        for i in 0..64u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(drain(&mut tx, Instant::ZERO).len(), 16);
+        let resends_of_0 = |frags: &[(u32, bool, Vec<u8>)]| frags.iter().filter(|f| f.0 == 0).count();
+        // Seq 0 is lost; 1..16 arrive and are acknowledged one by one, past
+        // the reordering window. The first three expose the gap, the rest were
+        // already in flight when 0 was resent and are no news about that copy,
+        // even those acknowledged more than a round trip after it.
+        let mut resent = 0;
+        let mut t = Instant::from_millis(130);
+        for k in 1..16u32 {
+            tx.on_ack(t, 0, (1u64 << k) - 1);
+            resent += resends_of_0(&drain(&mut tx, t));
+            t = t + Duration::from_millis(20);
+        }
+        assert_eq!(resent, 1, "one loss, one fast retransmit");
+        assert!(!tx.failed);
+        // That copy is lost too: fragments sent after it are acknowledged, so
+        // it goes once more (at the ACK for 22, three past the 20 sent after
+        // it), and only once while those later fragments are acknowledged.
+        for k in 16..32u32 {
+            tx.on_ack(t, 0, (1u64 << k) - 1);
+            resent += resends_of_0(&drain(&mut tx, t));
+            t = t + Duration::from_millis(10);
+        }
+        assert_eq!(resent, 2);
+        assert!(!tx.failed);
+    }
+
+    #[test]
+    fn reordered_fragment_is_not_resent() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        for i in 0..16u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(drain(&mut tx, Instant::ZERO).len(), 16);
+        // Seq 0 is overtaken by 1..8: it is resent only if still missing a
+        // quarter RTT after its ACK was due.
+        let t = Instant::from_millis(100);
+        tx.on_ack(t, 0, 0xff);
+        assert!(drain(&mut tx, t).iter().all(|f| f.0 != 0));
+        assert_eq!(tx.next_due(), Some(Instant::from_millis(125)));
+        tx.on_ack(Instant::from_millis(110), 16, 0);
+        assert_eq!(tx.retransmits, 0);
+        assert!(tx.cwnd() > INITIAL_CWND as u32, "no window cut: {}", tx.cwnd());
+        // Still missing after the window: resent, and the window is cut then.
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        for i in 0..16u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        drain(&mut tx, Instant::ZERO);
+        tx.on_ack(t, 0, 0xff);
+        let cwnd = tx.cwnd();
+        assert_eq!(drain(&mut tx, Instant::from_millis(125)), vec![(0, true, vec![0])]);
+        assert!(tx.cwnd() < cwnd);
     }
 
     #[test]

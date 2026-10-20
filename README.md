@@ -306,7 +306,8 @@ drops the link: builds before 1.0 don't promise to interoperate.
 The reliable lane is a small, real-time-tuned transport:
 
 - **Selective ACKs.** A cumulative ACK plus a 64-bit bitmap. Fragments 3 sequence numbers behind the highest ACK
-  are fast-retransmitted without waiting for a timeout.
+  are fast-retransmitted without waiting for a timeout, once per loss: only an ACK for a fragment sent after the
+  last copy counts, and a quarter of the minimum RTT is allowed for reordering (as in RACK) before resending.
 - **RTO.** Initial 300 ms, bounded to 20 ms–5 s, with backoff capped at 10 s. A 25 ms ACK-delay allowance (as in
   QUIC's `max_ack_delay`) covers busy game frames and browser event loops. A fragment is declared dead after 16
   sends.
