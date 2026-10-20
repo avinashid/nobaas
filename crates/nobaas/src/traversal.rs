@@ -15,10 +15,13 @@
 //! 3. The recipient dials every candidate and answers with its own; the first
 //!    side dials on the answer. Both dial at once, so each NAT has already let
 //!    the other side's packets in: the handshake punches through cone NATs.
-//! 4. Where punching can't work (symmetric NATs on both sides), each also dials
-//!    through a peer both are connected to ([`Path::Via`]); core moves the link
-//!    off the relay if a direct path turns up. With no such peer the dial fails
-//!    with [`Failure::Symmetric`]: there is no TURN server, by design.
+//! 4. A symmetric NAT picks a new port for each peer, so the address it offers is
+//!    not the one its packets come from. If it hands ports out in sequence, it
+//!    offers a prediction and the other side probes the ports around it.
+//! 5. Where punching can't work (symmetric against port-filtering NATs), each also
+//!    dials through a peer both are connected to ([`Path::Via`]); core moves the
+//!    link off the relay if a direct path turns up. With no such peer the dial
+//!    fails with [`Failure::Symmetric`]: there is no TURN server, by design.
 //!
 //! Rooms are closed by their name. The room *topic* is a hash every relay sees, so
 //! it proves nothing; a separate *room key*, hashed from the name under another
@@ -101,10 +104,15 @@ pub enum NatType {
     /// No NAT: the public address is the socket's own.
     Open,
     /// The NAT keeps one public port for every destination (full, restricted or
-    /// port-restricted cone): hole punching works.
+    /// port-restricted cone). Punching works with other cone and open peers, and
+    /// usually with symmetric ones, but not always: a port-restricted cone only
+    /// lets in packets from ports it has sent to, so it can't punch a symmetric
+    /// NAT that picks its ports at random. STUN can't tell the cone kinds apart.
     Cone,
-    /// The NAT picks a new public port per destination: punching works only
-    /// towards cone peers, and two symmetric peers need a relay.
+    /// The NAT picks a new public port per destination: punching works towards
+    /// open, full-cone and restricted-cone peers, towards port-restricted ones
+    /// only if the ports come in a predictable sequence, and two symmetric peers
+    /// need a relay.
     Symmetric,
 }
 
@@ -143,11 +151,36 @@ pub enum Privacy {
 pub enum Failure {
     /// No handshake answer on any address: the peer is gone, or a firewall drops UDP.
     Unreachable,
-    /// One peer is behind a symmetric NAT and the other behind one that only lets
-    /// in replies (port-restricted or symmetric), so punching can't work, and no
-    /// peer connected to both could relay. Nobaas has no TURN server; a third peer
-    /// in the room that both can reach fixes it.
-    Symmetric,
+    /// The NAT on `Side` is symmetric (a new public port per destination) and the
+    /// other side's router only lets in packets from ports it has sent to, so
+    /// punching can't work, and no peer connected to both could relay. Nobaas has
+    /// no TURN server; a third peer in the room that both can reach fixes it.
+    Symmetric(Side),
+}
+
+/// Which end of a link a [`Failure`] is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// This node.
+    Ours,
+    /// The peer.
+    Theirs,
+    /// Both.
+    Both,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sym = "is symmetric (a new public port per destination)";
+        let filters = "router only lets in packets from ports it has sent to";
+        let end = "so hole punching can't work, and no peer linked to both could relay";
+        match self {
+            Failure::Unreachable => write!(f, "no answer on any address: the peer is gone, or a firewall drops UDP"),
+            Failure::Symmetric(Side::Ours) => write!(f, "this side's NAT {sym} and the peer's {filters}, {end}"),
+            Failure::Symmetric(Side::Theirs) => write!(f, "the peer's NAT {sym} and this side's {filters}, {end}"),
+            Failure::Symmetric(Side::Both) => write!(f, "both NATs are symmetric (a new port per destination), {end}"),
+        }
+    }
 }
 
 /// Something the host must do on its signaling carrier.
@@ -512,7 +545,12 @@ impl<A: Address> Traversal<A> {
                 let r = self.remotes.entry(*peer).or_default();
                 r.seen_at = now;
                 let sym = |a: NatType, b: NatType| a == NatType::Symmetric && b != NatType::Open;
-                r.failure = Some(if sym(mine, r.nat) || sym(r.nat, mine) { Failure::Symmetric } else { Failure::Unreachable });
+                r.failure = Some(match (sym(mine, r.nat), sym(r.nat, mine)) {
+                    (true, true) => Failure::Symmetric(Side::Both),
+                    (true, false) => Failure::Symmetric(Side::Ours),
+                    (false, true) => Failure::Symmetric(Side::Theirs),
+                    (false, false) => Failure::Unreachable,
+                });
             }
             Event::Disconnected { peer, .. } if self.picked == Some(*peer) => self.picked = None,
             Event::AddrObserved { addr, .. } => {
@@ -1613,5 +1651,16 @@ mod tests {
                 assert!(sent.contains(&"198.51.100.9:20002".parse().unwrap()));
             }
         }
+    }
+    /// NB-035: a failure reads as a sentence that names the symmetric side.
+    #[test]
+    fn failures_say_which_side_is_symmetric() {
+        let say = |f: Failure| f.to_string();
+        assert!(say(Failure::Unreachable).contains("firewall drops UDP"));
+        let ours = say(Failure::Symmetric(Side::Ours));
+        assert!(ours.starts_with("this side's NAT is symmetric") && ours.contains("the peer's router only lets in"));
+        let theirs = say(Failure::Symmetric(Side::Theirs));
+        assert!(theirs.starts_with("the peer's NAT is symmetric") && theirs.contains("this side's router only lets in"));
+        assert!(say(Failure::Symmetric(Side::Both)).starts_with("both NATs are symmetric"));
     }
 }

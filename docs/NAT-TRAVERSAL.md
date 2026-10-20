@@ -25,6 +25,31 @@ unchanged; this layer feeds it addresses.
   transaction id.
 - NAT type: no answer, or one, gives `Unknown`. A mapped address equal to a local one is `Open`. Two servers
   reporting the same mapping is `Cone`, different ones `Symmetric`.
+- `Cone` covers full, restricted and port-restricted cones, which STUN can't tell apart. So `Cone` doesn't
+  promise a punch: a port-restricted cone only lets in packets from ports it has sent to, and fails against a
+  symmetric NAT whose ports can't be predicted (see the matrix below).
+
+## Port prediction
+
+A symmetric NAT gives each destination a new public port, so the port it offers (from STUN) is not the one its
+packets to the peer come from, and a port-restricted peer drops them. Many symmetric NATs hand ports out in
+sequence, though:
+
+- **Prediction.** If both STUN mappings share an IP and the second is 1 to 8 ports above the first, the NAT looks
+  sequential with that step, and the next mapping is likely `second + step` (`Traversal::predicted_addr`).
+  Random-port NATs give no prediction.
+- **Offer.** The prediction rides in the offer's address list as a tagged entry (below), only when the public
+  address leads the list. It takes one of the 8 slots.
+- **Probing.** A receiver whose NAT is neither open nor symmetric (open and symmetric ones gain nothing, and a
+  symmetric one would spend a port per probe) hands the core 32 *guesses*: ports `next - 4·step` to
+  `next + 27·step`, leaning forward because the NAT may have given out more since STUN asked
+  (`Endpoint::set_guesses`). Guesses are probe-only:
+  - while dialling, every handshake retry also goes to each guess;
+  - while relayed, every 5th punch round (about two a second) probes them;
+  - a guess becomes the path only when the peer answers from it;
+  - relay-only links that go through a relay ignore them.
+- **Cost.** At most 32 guesses (`MAX_GUESSES` is 64) per offer acted on, each probed by about 6 handshake
+  packets while dialling: within the reflection bound below, but to ports of one IP the offer named.
 - Datagrams are told apart by their first byte (RFC 7983): STUN goes to the traversal, everything else to the
   endpoint.
 
@@ -65,7 +90,8 @@ ver   0x01 (plain), 0x02 (room) or 0x03 (invite)
       reply(0|1)  role(0 peer,1 host,2 client)  nat(0 unknown,1 open,2 cone,3 symmetric)
 ts    u64 LE      sender's Unix time in ms
 nonce u64 LE      random
-n     u8 (<= 8)   then n x [len u8][Address::encode]
+n     u8 (<= 8)   then n x [len u8][Address::encode], or one port prediction entry:
+                  [5][0xfe 0x01][step u8][next port u16 LE]
 m     u8 (<= 8)   then m x 32-byte PeerId (peers the sender is connected to)
 proof 32 B        version 2: HMAC(room key, "nb-offer" || sender || recipient || everything above)
                   version 3: HMAC(recipient's invite key, "nb-invite" || sender || recipient || everything above)
@@ -80,7 +106,9 @@ The decoder rejects:
 - n or m above 8;
 - truncation and trailing bytes.
 
-Addresses that fail to decode are skipped.
+Addresses that fail to decode are skipped. Decoders from before port prediction read the prediction entry as
+an address that fails to decode, so old and new nodes still talk; the prediction is just unused. A decoded
+prediction with step 0 or above 8 is dropped.
 
 ## Rules
 
@@ -130,8 +158,11 @@ Addresses that fail to decode are skipped.
   others, even invite holders, can't crowd out the punch of a dial this node made. The
   limits bound what floods can make a node dial, seal or publish, and are ample for the room sizes this layer
   targets (no mesh limit yet).
-- **Failure.** When a dial ends in `ConnectFailed`, `failure(peer)` is `Symmetric` if one side is symmetric and
-  the other isn't open, and `Unreachable` otherwise.
+- **Failure.** When a dial ends in `ConnectFailed`, `failure(peer)` is `Symmetric(side)` if one side is
+  symmetric and the other isn't open, and `Unreachable` otherwise. `side` is `Ours`, `Theirs` or `Both`. Its
+  `Display` is a sentence for users, such as "the peer's NAT is symmetric (a new public port per destination)
+  and this side's router only lets in packets from ports it has sent to, so hole punching can't work, and no
+  peer linked to both could relay". Godot shows it as `get_connect_error_message()`.
 
 ## Privacy modes
 
@@ -170,8 +201,8 @@ unordered pair once) plus two peers behind one non-hairpinning NAT, from `cargo 
 traversal privacy_modes_matrix -- --nocapture`:
 
 ```text
-                            Direct: direct 25, relayed 12, failed 0
-                        PublicOnly: direct 24, relayed 13, failed 0
+                            Direct: direct 29, relayed  8, failed 0
+                        PublicOnly: direct 28, relayed  9, failed 0
            RelayOnly { via: None }: direct  0, relayed 37, failed 0
 ```
 
@@ -235,19 +266,24 @@ Crates added to `nobaas` by NAT traversal:
   - sealed offers turning into dials, and replay and stale drops;
   - separate budgets under hello and offer floods, the per-sender limit, nonces kept only for offers acted on;
   - the dialable-address filter;
-  - STUN classification and retransmits.
+  - STUN classification and retransmits, port prediction from the two mappings;
+  - predictions round-tripping in offers, and cone (not open or symmetric) receivers probing them;
+  - failure messages naming the symmetric side.
 - `crates/nobaas/tests/room_security.rs`:
   - the security review's `sec_room_topic_only` repro, which no longer links;
   - links from non-members closed unseen;
   - members linking, and a pinned host.
 - `crates/nobaas-sim/tests/traversal.rs`:
   - NAT types from simulated STUN;
-  - the room-of-two matrix over 8 NAT kinds with 150 ms signaling latency;
+  - the room-of-two matrix over 8 NAT kinds with 150 ms signaling latency, each failure naming the right side;
+  - sequential symmetric NATs against port-restricted ones, over 10 seeds each way round: 80/80 direct;
   - a symmetric pair relayed through a third room peer;
   - an invite join that punches only with signaling;
   - the per-mode matrix above.
 - `crates/nobaas/tests/privacy.rs`: invites per mode and switched at runtime, `NoRelay`, relay-only room peers
   linking `Via(host)` with every event and every sealed offer checked for addresses, relay-only invites.
+- `crates/nobaas-sim/tests/nat.rs` `guessed_ports_punch_a_sequential_symmetric_nat`: guesses punch from a
+  dial and from a relayed link; a relay-only link ignores them.
 - `crates/nobaas-sim/tests/nat.rs` `relay_only_links_stay_relayed`: no packet between the two ends, either side
   dialling, and no punch.
 - `crates/nobaas/tests/nat_loopback.rs` (mock STUN servers, `MemoryHub`; an invite without its key gets no
@@ -255,19 +291,21 @@ Crates added to `nobaas` by NAT traversal:
   relay; `--ignored`: public relays and STUN, run by `scripts/gate.sh --nostr`).
 
 Room of two, signaling only, from `cargo test -p nobaas-sim --release --test traversal -- --nocapture`. D is
-direct, with ms to connect; F S is a failure reported as `Symmetric` on both sides:
+direct, with ms to connect. F S is a failure reported as `Symmetric` on both sides, as A reports it: `S<` A's
+NAT is the symmetric one, `S^` B's, `S2` both. Port prediction raised this from 43/64 direct; what still fails
+is two symmetric NATs, or a random-port symmetric NAT against a port-restricted one:
 
 ```text
          A \ B        public     full-cone    restricted    port-restr       sym-seq    sym-random  cgnat(pr+pr) cgnat(pr+sym)
         public         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360
      full-cone         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360
     restricted         D 510         D 510         D 510         D 860         D 860         D 860         D 510         D 860
-    port-restr         D 510         D 510         D 510         D 860           F S           F S         D 860           F S
-       sym-seq         D 510         D 530         D 510           F S           F S           F S           F S           F S
-    sym-random         D 510         D 530         D 510           F S           F S           F S           F S           F S
-  cgnat(pr+pr)         D 860         D 510         D 860         D 860           F S           F S         D 860           F S
- cgnat(pr+sym)         D 510         D 530         D 530           F S           F S           F S           F S           F S
-direct: 43/64
+    port-restr         D 510         D 510         D 510         D 860         D 510          F S^         D 860         D 860
+       sym-seq         D 510         D 530         D 510         D 510          F S2          F S2         D 510          F S2
+    sym-random         D 510         D 530         D 510          F S<          F S2          F S2          F S<          F S2
+  cgnat(pr+pr)         D 860         D 510         D 860         D 860         D 860          F S^         D 860         D 860
+ cgnat(pr+sym)         D 510         D 530         D 530         D 530          F S2          F S2         D 530          F S2
+direct: 51/64
 ```
 
 The simulated NATs follow RFC 4787 behaviours. Real carrier-grade NATs, mobile networks and firewalls that block

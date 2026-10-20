@@ -3,7 +3,7 @@
 //! Signaling is a deterministic in-memory broker with relay-like latency; no
 //! invite or address is exchanged out of band.
 
-use nobaas::traversal::{Failure, NatType, Privacy, Role, Signal, Traversal};
+use nobaas::traversal::{Failure, NatType, Privacy, Role, Side, Signal, Traversal};
 use nobaas::Topic;
 use nobaas_core::{Config, Event, Lane, Path, PeerId};
 use nobaas_sim::{NatConfig, NetConfig, Sim, SimAddr};
@@ -259,7 +259,8 @@ fn room_pair(a: &Kind, b: &Kind, seed: u64) -> Outcome {
 #[test]
 fn nat_matrix_through_signaling() {
     let ks = kinds();
-    println!("\nroom of two, signaling only: D = direct (ms to connect), F = failed (S: symmetric NAT, U: unreachable)");
+    println!("\nroom of two, signaling only: D = direct (ms to connect), F = failed (U: unreachable;");
+    println!("S: symmetric NAT on A's side (S<), B's (S^) or both (S2), as A reports it)");
     print!("{:>14}", "A \\ B");
     for b in &ks {
         print!("{:>14}", b.name());
@@ -272,15 +273,25 @@ fn nat_matrix_through_signaling() {
             let o = room_pair(a, b, 200 + (i * 16 + j) as u64);
             let cell = match (o.connected, o.failures) {
                 (true, _) => format!("{} {}", if o.direct { "D" } else { "R?" }, o.t_connect.as_millis()),
-                (false, (Some(Failure::Symmetric), _)) => "F S".to_string(),
+                (false, (Some(Failure::Symmetric(side)), _)) => {
+                    format!("F S{}", match side { Side::Ours => "<", Side::Theirs => "^", Side::Both => "2" })
+                }
                 (false, _) => "F U".to_string(),
             };
             print!("{cell:>14}");
             direct += o.direct as u32;
             if !o.connected {
-                // Only symmetric NATs stop two peers, and both sides say so.
-                let sym = Some(Failure::Symmetric);
-                assert_eq!(o.failures, (sym, sym), "{} x {}: {o:?}", a.name(), b.name());
+                // Only symmetric NATs stop two peers, both sides say so, and they
+                // agree on which side is symmetric: the one whose NAT is.
+                let sym = |k: &Kind| k.name().contains("sym");
+                let (sa, sb) = match (sym(a), sym(b)) {
+                    (true, true) => (Side::Both, Side::Both),
+                    (true, false) => (Side::Ours, Side::Theirs),
+                    (false, true) => (Side::Theirs, Side::Ours),
+                    (false, false) => panic!("{} x {} failed without a symmetric NAT: {o:?}", a.name(), b.name()),
+                };
+                let want = (Some(Failure::Symmetric(sa)), Some(Failure::Symmetric(sb)));
+                assert_eq!(o.failures, want, "{} x {}: {o:?}", a.name(), b.name());
             } else {
                 assert!(o.direct, "two peers alone can only be direct: {} x {}: {o:?}", a.name(), b.name());
             }
@@ -304,7 +315,16 @@ fn nat_matrix_through_signaling() {
     // Two random-port symmetric NATs can't punch, and say why.
     let o = room_pair(&kind("sym-random"), &kind("sym-random"), 9);
     assert!(!o.connected);
-    assert_eq!(o.failures, (Some(Failure::Symmetric), Some(Failure::Symmetric)));
+    let both = Some(Failure::Symmetric(Side::Both));
+    assert_eq!(o.failures, (both, both));
+    // Against a port-restricted cone, each side names the symmetric one.
+    let o = room_pair(&kind("sym-random"), &kind("port-restr"), 9);
+    assert!(!o.connected);
+    let (Some(a), Some(b)) = o.failures else { panic!("{o:?}") };
+    assert_eq!((a, b), (Failure::Symmetric(Side::Ours), Failure::Symmetric(Side::Theirs)));
+    assert!(a.to_string().starts_with("this side's NAT is symmetric"), "{a}");
+    assert!(b.to_string().starts_with("the peer's NAT is symmetric"), "{b}");
+    assert!(b.to_string().contains("this side's router only lets in packets from ports it has sent to"), "{b}");
 }
 
 /// NB-035: a sequential symmetric NAT predicts its next port from its two STUN

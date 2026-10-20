@@ -44,7 +44,7 @@ func _ready() -> void:
 	multiplayer.peer_connected.connect(_on_peer_connected)
 	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 	multiplayer.connected_to_server.connect(_on_connected_to_server)
-	multiplayer.connection_failed.connect(func(): _log("could not reach the host (%s)" % peer.get_connect_error()))
+	multiplayer.connection_failed.connect(func(): _log("could not reach the host: %s" % peer.get_connect_error_message()))
 	multiplayer.server_disconnected.connect(func(): _log("the host left"))
 	for a in OS.get_cmdline_user_args():
 		var kv := a.trim_prefix("--").split("=", true, 1)

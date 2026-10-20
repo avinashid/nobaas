@@ -31,9 +31,10 @@
 //! [`Node::nat_type`]) and puts it in its invites. Give it a [`Signaling`] carrier
 //! ([`Builder::signaling`]) and peers swap addresses over it, so both dial at once
 //! and punch through their NATs: [`Node::join_room`] finds and connects the peers
-//! of a room, and [`Node::connect`] punches too. Where two symmetric NATs can't
-//! punch, a peer connected to both relays. See [`traversal`]. The `nostr` feature
-//! adds `NostrSignaling`, over public Nostr relays.
+//! of a room, and [`Node::connect`] punches too. Where NATs can't punch (a
+//! symmetric one against one that filters by port), a peer connected to both
+//! relays, and [`Node::failure`] says which side was symmetric. See [`traversal`].
+//! The `nostr` feature adds `NostrSignaling`, over public Nostr relays.
 //!
 //! # Privacy
 //!
@@ -61,7 +62,7 @@ pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
-pub use traversal::{Failure, NatType, Privacy, Role};
+pub use traversal::{Failure, NatType, Privacy, Role, Side};
 pub use nobaas_core::{
     Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
 };

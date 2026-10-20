@@ -289,7 +289,8 @@ impl Node {
         self.pump_signals();
     }
 
-    /// Why the last dial to `peer` failed, after an [`Event::ConnectFailed`].
+    /// Why the last dial to `peer` failed, after an [`Event::ConnectFailed`]. Its
+    /// `Display` is a sentence for users, naming the symmetric side if there is one.
     pub fn failure(&self, peer: &PeerId) -> Option<Failure> {
         self.trav.failure(peer)
     }
