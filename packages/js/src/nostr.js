@@ -16,6 +16,7 @@
 import { isPeerId } from './nobaas.js';
 
 const KIND = 25059;
+const MAX_CONTENT = 64 * 1024; // event content we are willing to decode (base64 characters)
 export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
 
 const enc = new TextEncoder();
@@ -90,6 +91,8 @@ export class NostrSignaling {
     this.seen.add(ev.id);
     this.stats.received++;
     const tag = ev.tags.find((t) => t[0] === 'p')?.[1];
+    // Signalling bodies are small; a huge event would only cost us wasm memory.
+    if (typeof ev.content !== 'string' || ev.content.length > MAX_CONTENT) return;
     try {
       if (tag === this.roomTag) {
         const h = JSON.parse(dec.decode(unb64(ev.content)));

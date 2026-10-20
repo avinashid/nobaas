@@ -9,7 +9,7 @@
 // Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
 // messages are JSON-able objects. See BroadcastSignaling below.
 
-import { isPeerId } from './nobaas.js';
+import { isPeerId, MAX_DATAGRAM } from './nobaas.js';
 
 // Removes `host` candidates (LAN, loopback, mDNS .local names) from an SDP, keeping
 // server-reflexive (public, from STUN) and relay ones.
@@ -69,7 +69,10 @@ export class WebRtcTransport {
       this.onPeer(peer, 'open');
     };
     dc.onclose = () => this.onPeer(peer, 'closed');
-    dc.onmessage = (e) => this.ep.receive(h, new Uint8Array(e.data));
+    // Binary datagrams only: a string message would become a length in new Uint8Array(string).
+    dc.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer && e.data.byteLength <= MAX_DATAGRAM) this.ep.receive(h, new Uint8Array(e.data));
+    };
     pc.onicecandidate = (e) => {
       if (!e.candidate || !this.trickle) return;
       if (this.privacy !== 'direct' && / typ host( |$)/.test(e.candidate.candidate)) return;

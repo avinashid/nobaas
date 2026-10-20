@@ -6,7 +6,8 @@
 export const Lane = { Reliable: 0, Unreliable: 1, Urgent: 2 };
 export const EventKind = { Connected: 1, Message: 2, Disconnected: 3, ConnectFailed: 4, PathChanged: 5, AddrObserved: 6 };
 const REASONS = ['timeout', 'closed', 'replaced', 'violation'];
-const MAX_DATAGRAM = 1232;
+// The largest datagram the core sends or accepts; transports drop anything bigger.
+export const MAX_DATAGRAM = 1232;
 
 export async function loadNobaas(source) {
   let bytes;
@@ -222,9 +223,10 @@ export class Endpoint {
     this.schedule();
     return r;
   }
-  // Feed a datagram that arrived on transport handle `addr`.
+  // Feed a datagram that arrived on transport handle `addr`. Over MAX_DATAGRAM is never ours: dropped.
   receive(addr, bytes) {
     bytes = bytesOf(bytes);
+    if (bytes.length > MAX_DATAGRAM) return;
     const p = this.nb.put(bytes);
     this.nb.x.nb_handle_datagram(this.h, nowUs(), addr, p, bytes.length);
     this.nb.free(p, bytes.length);

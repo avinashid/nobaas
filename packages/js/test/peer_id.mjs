@@ -165,7 +165,53 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
   await room.leave();
 }
 
-// 5. The module is still healthy: two fresh endpoints still seal to each other.
+// 5. Datagram sizes (security N21-1): a DataChannel string message would turn into a length in
+// new Uint8Array("100000000"), and nothing over MAX_DATAGRAM may reach wasm memory.
+{
+  const bytes = () => nb.x.memory.buffer.byteLength;
+  const dc = {};
+  class Pc {
+    createDataChannel() { return dc; }
+    close() {}
+  }
+  const e3 = nb.endpoint();
+  const fed = [];
+  const receive = e3.receive.bind(e3);
+  e3.receive = (h, b) => (fed.push(b.length), receive(h, b));
+  const t = new WebRtcTransport(e3, fakeSig(), { RTCPeerConnection: Pc });
+  t.link(other.id);
+  const before = bytes();
+  for (const data of ['100000000', '2147483648', new ArrayBuffer(2000), new Uint8Array(40), new Blob([new Uint8Array(40)])]) dc.onmessage({ data });
+  check(fed.length === 0 && bytes() === before, 'DataChannel drops strings, views, blobs and a 2000-byte buffer; wasm memory did not grow');
+  dc.onmessage({ data: new ArrayBuffer(40) });
+  check(fed.length === 1 && fed[0] === 40, 'DataChannel still passes a 40-byte ArrayBuffer');
+  const rx = e3.stats().rxPackets;
+  receive(0, new Uint8Array(2000));
+  receive(0, new Uint8Array(1 << 20));
+  check(e3.stats().rxPackets === rx && bytes() === before, 'Endpoint.receive drops datagrams over MAX_DATAGRAM without allocating');
+}
+
+// 6. Nostr content size (security N21-2): oversized events are skipped before decoding.
+{
+  const e4 = nb.endpoint();
+  const sig = new NostrSignaling(nb, e4, { room: 'nb021/size', relays: [] });
+  await sig.ready;
+  let opens = 0;
+  const open = e4.open.bind(e4);
+  e4.open = (b) => (opens++, open(b));
+  const hellos = [];
+  sig.onHello = (from) => hellos.push(from);
+  const big = btoa(JSON.stringify({ t: 'hello', from: other.id, meta: { pad: 'x'.repeat(70000) } }));
+  const before = nb.x.memory.buffer.byteLength;
+  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'big1', kind: 25059, pubkey: 'x', tags: [['p', sig.roomTag]], content: big }]));
+  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'big2', kind: 25059, pubkey: 'x', tags: [['p', sig.myTag]], content: 'A'.repeat(1 << 20) }]));
+  check(hellos.length === 0 && opens === 0 && nb.x.memory.buffer.byteLength === before, 'NostrSignaling skips content over 64 KiB (hello and sealed)');
+  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'small', kind: 25059, pubkey: 'x', tags: [['p', sig.myTag]], content: btoa('x'.repeat(200)) }]));
+  check(opens === 1, 'NostrSignaling still opens small sealed content');
+  sig.close();
+}
+
+// 7. The module is still healthy: two fresh endpoints still seal to each other.
 const x = nb.endpoint();
 const y = nb.endpoint();
 check(y.open(x.seal(y.id, new Uint8Array([9])))?.from === x.id, 'module still healthy at the end');
