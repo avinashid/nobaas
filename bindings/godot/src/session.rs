@@ -20,7 +20,8 @@
 //! ```
 
 use nobaas::{
-    Event, Failure, Lane, NatType, Node, NostrSignaling, PeerId, PeerStats, Role, SendError, MAX_UNRELIABLE,
+    Event, Failure, Invite, Lane, NatType, Node, NostrSignaling, PeerId, PeerStats, Privacy, Role, SendError,
+    MAX_UNRELIABLE,
 };
 use std::net::SocketAddr;
 use std::collections::{HashMap, VecDeque};
@@ -262,12 +263,14 @@ pub struct NetOptions {
     /// Nostr relays for signaling (`wss://…`, `ws://…`). `None`: the default public
     /// relays; empty: no signaling (rooms can't work, invites don't punch).
     pub relays: Option<Vec<String>>,
+    /// Which addresses the peer gives out (see [`Session::set_privacy`]).
+    pub privacy: Privacy,
 }
 
 impl NetOptions {
     /// Binds a node with these settings.
     pub fn bind(&self, addr: &str) -> io::Result<Node> {
-        let mut b = Node::builder();
+        let mut b = Node::builder().privacy(self.privacy);
         if let Some(stun) = &self.stun {
             b = b.stun_servers(stun.iter().cloned());
         }
@@ -328,21 +331,42 @@ impl Session {
 
     /// Hosts on `node`. Read the invite to hand out with [`invite`](Session::invite).
     pub fn host(node: Node) -> Session {
-        Session::new(node, true)
+        let mut s = Session::new(node, true);
+        s.set_privacy(s.node.privacy());
+        s
     }
 
-    /// Joins the host named in `invite`.
-    pub fn join(mut node: Node, invite: &str) -> Result<Session, JoinError> {
-        let host = node.connect(invite).map_err(|_| JoinError::InvalidInvite)?;
+    /// Joins the host named in `invite`. Under [`Privacy::RelayOnly`] the host is
+    /// the relay.
+    pub fn join(node: Node, invite: &str) -> Result<Session, JoinError> {
+        let inv = Invite::<SocketAddr>::parse(invite).ok_or(JoinError::InvalidInvite)?;
         let mut s = Session::new(node, false);
-        s.host_peer = Some(host);
+        s.host_peer = Some(inv.peer);
+        s.set_privacy(s.node.privacy());
+        s.node.connect(invite).map_err(|_| JoinError::InvalidInvite)?;
         Ok(s)
+    }
+
+    /// Which addresses this peer gives out, from the next offer and invite on;
+    /// links already up are kept. Clients link only with the host, so other
+    /// players never see their addresses whatever the mode. Under
+    /// [`Privacy::RelayOnly`] a joiner gives only its host its public addresses,
+    /// and a host, which every client links to directly, gives out its public
+    /// addresses only (as [`Privacy::PublicOnly`]).
+    pub fn set_privacy(&mut self, privacy: Privacy) {
+        let p = match privacy {
+            Privacy::RelayOnly { .. } if self.host => Privacy::PublicOnly,
+            Privacy::RelayOnly { via: None } => Privacy::RelayOnly { via: self.host_peer },
+            p => p,
+        };
+        self.node.set_privacy(p);
     }
 
     /// Hosts on `node` and announces it in room `room` of application `app_id`, for
     /// [`join_room`](Session::join_room). Only peers that know the room name get in. Needs signaling.
     pub fn host_room(node: Node, app_id: &str, room: &str) -> Session {
         let mut s = Session::new(node, true);
+        s.set_privacy(s.node.privacy());
         s.room = Some((app_id.to_string(), room.to_string()));
         s.announce();
         s
@@ -804,6 +828,29 @@ mod tests {
         assert!(host.peer_ids().is_empty());
         assert_eq!(drain_events(&mut host), vec![]);
         assert_eq!(a.peer_ids(), Vec::<i32>::new());
+    }
+
+    /// NB-034: a host gives out public addresses only (RELAY_ONLY acts as
+    /// PUBLIC_ONLY on it); a relay-only joiner takes its host as the relay, links
+    /// with it directly, and plays as usual.
+    #[test]
+    fn privacy_modes_for_hosts_and_joiners() {
+        let quiet = |p| Node::builder().stun_servers(Vec::<String>::new()).privacy(p).bind("0.0.0.0:0").unwrap();
+        let addrs = |s: &Session| Invite::<SocketAddr>::parse(&s.invite()).unwrap().addrs;
+        let mut host = Session::host(quiet(Privacy::RelayOnly { via: None }));
+        assert_eq!((host.node.privacy(), addrs(&host)), (Privacy::PublicOnly, vec![]), "no LAN or loopback address");
+        host.set_privacy(Privacy::Direct);
+        assert!(addrs(&host).iter().any(|a| a.ip().is_loopback()));
+        let invite = host.invite();
+        let relay_only = Node::builder().privacy(Privacy::RelayOnly { via: None }).bind("127.0.0.1:0").unwrap();
+        let mut a = Session::join(relay_only, &invite).unwrap();
+        assert_eq!(a.node.privacy(), Privacy::RelayOnly { via: Some(host.public_key()) });
+        assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
+        assert!(matches!(a.node.path(&host.public_key()), Some(nobaas::Path::Direct(_))));
+        assert_eq!(addrs(&a), vec![], "a relay-only joiner's invite names no address");
+        a.target = HOST_ID;
+        a.put(b"hi").unwrap();
+        assert!(pump(&mut [&mut host, &mut a], |s| s[0].available() == 1));
     }
 
     #[test]

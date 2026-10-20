@@ -1,5 +1,5 @@
 use crate::session::{Mode, NetOptions, PeerEvent, PutError, Session, Status};
-use nobaas::{Failure, NatType, Node, PeerId};
+use nobaas::{Failure, NatType, Node, PeerId, Privacy};
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
@@ -42,6 +42,48 @@ impl NobaasMultiplayerPeer {
     #[func]
     fn set_signaling_relays(&mut self, relays: PackedStringArray) {
         self.net.relays = Some(strings(&relays));
+    }
+
+    /// Every address: the lowest latency, and LAN play.
+    #[constant]
+    const PRIVACY_DIRECT: i32 = 0;
+    /// Public addresses only: no LAN or loopback address in invites and offers.
+    #[constant]
+    const PRIVACY_PUBLIC_ONLY: i32 = 1;
+    /// A joiner gives its public addresses to the host only, and nothing to anyone
+    /// else; on a host, the same as `PRIVACY_PUBLIC_ONLY`.
+    #[constant]
+    const PRIVACY_RELAY_ONLY: i32 = 2;
+
+    /// Which addresses this peer gives out: `PRIVACY_DIRECT` (default),
+    /// `PRIVACY_PUBLIC_ONLY` or `PRIVACY_RELAY_ONLY`. Applies to the next `host` /
+    /// `join` and to the running session's next invites and offers; links already
+    /// up are kept. Players link only with the host, so they never see each other's
+    /// addresses in any mode; the host sees every player's public address.
+    #[func]
+    fn set_privacy_mode(&mut self, mode: i32) {
+        self.net.privacy = match mode {
+            Self::PRIVACY_PUBLIC_ONLY => Privacy::PublicOnly,
+            Self::PRIVACY_RELAY_ONLY => Privacy::RelayOnly { via: None },
+            Self::PRIVACY_DIRECT => Privacy::Direct,
+            _ => {
+                godot_error!("NobaasMultiplayerPeer.set_privacy_mode: unknown mode {mode}");
+                return;
+            }
+        };
+        if let Some(s) = self.session.as_mut() {
+            s.set_privacy(self.net.privacy);
+        }
+    }
+
+    /// The mode set with `set_privacy_mode`.
+    #[func]
+    fn get_privacy_mode(&self) -> i32 {
+        match self.net.privacy {
+            Privacy::Direct => Self::PRIVACY_DIRECT,
+            Privacy::PublicOnly => Self::PRIVACY_PUBLIC_ONLY,
+            Privacy::RelayOnly { .. } => Self::PRIVACY_RELAY_ONLY,
+        }
     }
 
     /// Hosts on UDP `port` (0: a free one) and announces this game in room `room` of

@@ -54,7 +54,7 @@ pub use nostr::NostrSignaling;
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
 pub use traversal::{Failure, NatType, Privacy, Role};
 pub use nobaas_core::{
-    Config, ConnectError, DisconnectReason, Identity, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
+    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
 };
 
 /// An event from a [`Node`]: a peer connected or left, a message arrived, a link moved.
