@@ -155,8 +155,11 @@ read or changed on the way. Everything Godot does with those bytes is outside th
   - **Rooms.** Relays only see a hash of the room name. Hellos and offers carry an HMAC under a key derived from
     the name, so a peer that doesn't know the name can't join the room or pose as its host. Links from such peers
     are closed unseen.
-  - **Use long random room names for private games.** A guessable name (`"lobby-42"`) is a public lobby: anyone
-    who guesses it is a member, and a member could announce itself as a host.
+  - **Give private games a room name with at least 128 random bits**, for example 22 or more random base64
+    characters, or 32 hex digits from `Crypto.new().generate_random_bytes(16).hex_encode()`. Relays see the topic, an
+    unsalted SHA-256 of the name, so anyone can test guesses against it offline at hash speed. A guessable name
+    (`"lobby-42"`) is a public lobby: anyone who guesses it is a member, and a member could announce itself as a
+    host.
   - **Pin the host where you can.** If joiners can learn the host's `get_public_key()` some other way (a friend
     code, a QR code, your own backend), `join_room_host()` accepts that host only.
   - **Close the door.** Set `refuse_new_connections` once everyone is in (a refusing host also stops announcing
