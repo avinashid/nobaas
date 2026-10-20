@@ -36,6 +36,10 @@ const HELLO_EVERY_MS = 15000;
 const PROOF_MS = 10000;
 // Frames held from one peer while its link proof is checked.
 const MAX_HELD = 256;
+// How long a pagehide handler that said goodbye holds the page. The browser may end
+// the renderer as soon as the handler returns, before its WebRTC thread has put the
+// Bye on the wire; holding the main thread a few ms lets that thread send it.
+const PAGEHIDE_GRACE_MS = 20;
 const NOT_CONNECTED = -1;
 const TOO_LARGE = -2;
 const WOULD_BLOCK = -3;
@@ -154,7 +158,12 @@ export class Room {
     endpoint.onDrain = () => this.outbox.size && this.flush('drain');
     signaling.onHello = (peer, meta) => this.onHello(peer, meta);
     this.helloTimer = setInterval(() => this.hello(), HELLO_EVERY_MS);
-    this.onPageHide = () => this.leave();
+    this.onPageHide = () => {
+      const linked = this.linked.size;
+      this.leave();
+      // A wait that blocks: no timer or promise would run before the page goes.
+      for (const end = performance.now() + PAGEHIDE_GRACE_MS; linked && performance.now() < end;);
+    };
     globalThis.addEventListener?.('pagehide', this.onPageHide);
   }
 
@@ -235,16 +244,22 @@ export class Room {
     return this.endpoint.stats();
   }
 
-  // Says goodbye to every peer, so they see 'peer-leave' at once, then closes.
+  // Says goodbye to every peer, so they see 'peer-leave' at once, then closes. All of it
+  // happens before this returns, with no timer or await, because on pagehide the page
+  // may be gone before either runs. The Bye goes on the unreliable lane, which no full
+  // send window or unacknowledged reliable data holds back, and the core's sealed close
+  // follows it; each is handed to the transport (dc.send) by the pump in the same call.
   async leave() {
     if (this.left) return;
     this.left = true;
     clearInterval(this.helloTimer);
     clearTimeout(this.flushTimer);
     globalThis.removeEventListener?.('pagehide', this.onPageHide);
-    for (const p of this.linked) this.endpoint.send(p, Uint8Array.of(T.Bye), Lane.Reliable);
+    const bye = Uint8Array.of(T.Bye);
+    for (const p of this.linked) this.endpoint.send(p, bye, Lane.Unreliable);
     this.endpoint.pump();
-    await new Promise((r) => setTimeout(r, 50));
+    for (const p of this.linked) this.endpoint.disconnect(p);
+    this.outbox.clear();
     this.transport.close();
     this.endpoint.close();
     this.members.clear();

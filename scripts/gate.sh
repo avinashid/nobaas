@@ -87,6 +87,7 @@ step "node endpoint closed" node packages/js/test/endpoint_closed.mjs
 step "node scratch buffers" node packages/js/test/scratch_buffers.mjs
 step "node room drain" node packages/js/test/room_drain.mjs
 step "node fuzz" node packages/js/test/fuzz.mjs
+step "node room leave" node packages/js/test/room_leave.mjs
 
 if [ $quick = 1 ]; then
   skip "browser" "--quick"
@@ -94,12 +95,14 @@ if [ $quick = 1 ]; then
   skip "readme chat" "--quick"
   skip "poll" "--quick"
   skip "webrtc signals" "--quick"
+  skip "tab close" "--quick"
 else
   step "browser" node packages/js/test/browser.mjs 2
   step "arena" node packages/js/test/arena.mjs 8 10
   step "readme chat" node packages/js/test/readme.mjs
   step "poll" node packages/js/test/poll.mjs 3
   step "webrtc signals" node packages/js/test/webrtc_signals.mjs
+  step "tab close" node packages/js/test/leave.mjs --runs=5 --crash=0
 fi
 if [ $nostr = 1 ]; then
   step "nostr" node packages/js/test/nostr.mjs

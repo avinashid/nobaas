@@ -230,6 +230,14 @@ export class Endpoint {
     this.pump();
     return r;
   }
+  // Ends the session with `peer` and sends it a sealed close at once (this pumps), so it
+  // sees 'disconnected' now rather than after its idle timeout. No local event; does
+  // nothing for a peer not connected, or after close().
+  disconnect(peer) {
+    if (this.closed) return;
+    this.nb.x.nb_disconnect(this.h, this.setPeer(peer));
+    this.pump();
+  }
   stats() {
     if (this.closed) return { ...this.finalStats };
     const x = this.nb.x;

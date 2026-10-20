@@ -86,7 +86,8 @@ export type RoomEvent =
 export interface RoomEvents {
   /** A peer connected and shared its presence. */
   'peer-join': (peer: PeerId, presence: Presence) => void;
-  /** A peer left, timed out or lost its connection. */
+  /** A peer left, timed out or lost its connection. A peer that leaves (`leave()`, or its tab closing) shows
+   * as 'left' or 'closed' at once; one that crashes or loses its network shows as 'timeout' after the idle timeout (30 s). */
   'peer-leave': (peer: PeerId, reason: 'left' | 'closed' | 'failed' | 'timeout' | 'replaced' | 'violation') => void;
   /** A joined peer changed its presence. */
   presence: (peer: PeerId, presence: Presence) => void;
@@ -126,7 +127,8 @@ export declare class Room {
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
-  /** Tells every peer we're going, then closes the links. Also runs on `pagehide`. */
+  /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,
+   * where it also runs): the promise is already settled. */
   leave(): Promise<void>;
 }
 
@@ -208,6 +210,9 @@ export declare class Endpoint {
   connect(addr: number, peer: PeerId | Uint8Array): number;
   /** Throws `Error('connectVia: endpoint closed')` after `close()`. */
   connectVia(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): number;
+  /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
+   * (reason 'closed') now rather than after its idle timeout. No local event; does nothing after `close()`. */
+  disconnect(peer: PeerId | Uint8Array): void;
   /** Relayed links never punch to a direct path, relays forward without our address, and a
    * direct handshake is answered only from a peer we are dialling directly. */
   setRelayOnly(on: boolean): void;

@@ -65,6 +65,7 @@ jobs:
       - run: node packages/js/test/scratch_buffers.mjs
       - run: node packages/js/test/room_drain.mjs
       - run: node packages/js/test/fuzz.mjs
+      - run: node packages/js/test/room_leave.mjs
 
   docker:
     name: docker build
