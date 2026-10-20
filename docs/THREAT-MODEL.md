@@ -183,6 +183,125 @@ checks on the handle and on buffers where `len > 0` as cheap defence in depth.
 
 ---
 
+---
+
+## Invite strings (`nb:`)
+
+An invite (`crates/nobaas-core/src/invite.rs`) is `nb:` + unpadded base64url of
+`version | peer(32) | addrs | relays`. It carries **no secret**: the PeerId is a
+public key and the addresses are routing hints. Security properties:
+
+- **Confidentiality: none, by design.** Anyone who sees an invite learns the
+  PeerId and candidate IP addresses of the inviter. An invite posted publicly is
+  a standing version of SEC-3 (IP disclosure) and SEC-2 (identity disclosure):
+  treat invite links as semi-private, and prefer LAN/relay candidates over a
+  home IP when sharing broadly.
+- **Integrity: not self-authenticating, but safe.** An invite is unsigned, so a
+  carrier can swap the addresses or relays. This does not break authentication:
+  the handshake still runs Noise IK to the PeerId in the invite, so a swapped
+  address only reaches the real peer or fails. A carrier that swaps the *PeerId*
+  produces an invite to a different identity — the recipient connects to whoever
+  the carrier chose, exactly as if the carrier had sent its own invite. Invites
+  therefore inherit the trust of the channel they arrive on; a QR shown in person
+  or a sealed signaling message is trustworthy, a plaintext forum post is not.
+- **Parsing is safe.** `from_bytes` is a bounds-checked reader, caps entries at
+  16, rejects trailing bytes, and validates each PeerId is a real Ed25519 point.
+  Reviewed, no issues; covered going forward by fuzzing (NB-014).
+
+No new finding; the exposure is documented so apps set expectations for where an
+invite may be posted.
+
+## Godot binding (NB-020, planned — security requirements)
+
+The coming `bindings/godot` crate exposes `NobaasMultiplayerPeer`
+(`MultiplayerPeerExtension`) so Godot's high-level multiplayer — `@rpc`,
+`MultiplayerSynchronizer`, `MultiplayerSpawner` — runs over Nobaas. Nobaas
+delivers *authenticated, confidential bytes* to that layer, but everything Godot
+does *above* the `MultiplayerPeer` is outside Nobaas's guarantees. This section
+sets the requirements the binding must meet; they are tracked as SEC-9…SEC-11
+(proposed follow-ups on NB-020, owner @nobaas-backend).
+
+### SEC-9 — Untrusted packets crossing into GDScript (High, design) — NB-029
+
+Godot's high-level multiplayer deserializes incoming packets into Variants and
+dispatches `@rpc` methods by name. Variant decoding of `Object`/`Callable`/
+`RID` from the network is a known remote-code-execution surface (object
+instantiation, resource loading). Because Nobaas is pure P2P, **every connected
+peer is a remote attacker** at this layer.
+
+**Requirements.**
+- The binding must configure the `SceneMultiplayer` with
+  `allow_object_decoding = false` (Godot's default, but assert it) so peers
+  cannot ship encoded `Object`s.
+- Document loudly that `@rpc("any_peer")` methods receive attacker-controlled
+  arguments and must validate them and check `multiplayer.get_remote_sender_id()`.
+- Surface Nobaas's per-lane size caps to the `MultiplayerPeer` so an oversized or
+  malformed Godot packet is rejected at the boundary, not deep in a decoder.
+- A Rust panic in the cdylib must not unwind into Godot: catch/abort at the FFI
+  edge (godot-rust convention), so a malformed packet can't turn a panic into UB.
+
+### SEC-10 — Godot peer-ID spoofing and mapping collisions (High, design) — NB-029
+
+Godot peer IDs are 32-bit ints; Nobaas PeerIds are 256-bit Ed25519 keys. The
+binding derives a stable non-zero Godot ID from each PeerId. A 32-bit space makes
+collisions reachable (birthday bound ~2^16 peers, but an attacker can *grind*
+PeerIds offline to target a specific victim's Godot ID).
+
+**Requirements.**
+- The PeerId → Godot-ID map is authoritative per session and **collisions must be
+  rejected**, not silently merged: a joiner whose derived ID clashes with a live
+  peer is renumbered or refused, never allowed to inherit another peer's ID.
+- `_get_packet_peer()` must return the Godot ID of the *authenticated Nobaas
+  source* of that packet only; it must never be derivable from packet contents an
+  attacker controls.
+- Host is Godot ID 1: the binding must bind ID 1 to the actual host identity and
+  reject any joiner that tries to present as 1.
+- Grinding resistance: either widen the effective namespace (keep the full PeerId
+  as the identity and treat the 32-bit ID as a non-security-bearing handle the app
+  must not use for authorization), or document that `is_multiplayer_authority()`
+  and peer-ID checks are **not** a security boundary — the PeerId is.
+
+### SEC-11 — Host authority over RPCs in a serverless mesh (Medium, design) — NB-029
+
+Godot's model assumes peer 1 is a trusted server/authority. Nobaas has no
+inherent authority: a peer can send any packet to any peer, and
+`MultiplayerSpawner`/`MultiplayerSynchronizer` let an "authority" spawn/despawn
+nodes and set properties on others' scene trees. A malicious peer that the app
+treats as an authority corrupts every client.
+
+**Requirements.**
+- `docs/GODOT.md` must state that Godot's authority model is only as trustworthy
+  as the app's topology; in an open mesh, `@rpc("authority")` is not a security
+  control.
+- Recommend a pattern: designate the host as the only synchronizer/spawner
+  authority and have it validate inputs, or use `nobaas-game`'s deterministic
+  lockstep (where every peer recomputes state and desync is detected) instead of
+  trusting an authority's state pushes.
+- The binding should not auto-relay packets between peers on behalf of the Godot
+  layer unless the app opts in (Nobaas relay is already gated and rate-limited;
+  don't bypass it).
+
+## Relation to the Protocol Zero red-team notes
+
+Nobaas was bootstrapped from the Protocol Zero SDK, whose adversarial notes
+(`p0/protocol-zero/REDTEAM.md`) cover a related dead-drop/signaling stack. The
+mappings that carry over and are already handled in Nobaas:
+
+- **A1 sender forgery → handled.** Nobaas signaling uses the authenticated sealed
+  form (`Noise_X`, sender PeerId bound), the equivalent of P0's
+  `sealAuthenticated`. A forged/anonymous seal fails to open under a claimed
+  identity (`sealed.rs` test).
+- **A8 packet injection/replay → handled.** AEAD per data packet + the 2048 nonce
+  window; nonce recorded only after authentication (SEC/THREAT items above).
+- **A7 stale/replayed signaling → partially: SEC-6.** Nobaas has no in-band
+  signaling-replay guard; carry P0's lesson (bind a fresh session id) into the fix.
+- **A11 metadata / A12 forward secrecy → OPEN here too: SEC-2/3/5 and SEC-7.** The
+  same open problems (relay-visible timing/IP, static-key exposure) apply; Nobaas's
+  per-session Nostr key and rotating-tag ideas mirror P0's mitigations.
+- **A5 spam / A13 Sybil → relevant to the signaling layer**; the half-open cap
+  (SEC-4) and relay rate limiting are the Nobaas analogues. A PoW-gated first
+  contact (as in P0 A5) is a candidate hardening if public rooms are abused.
+
 ## Residual risks accepted for v0.1
 
 - Traffic analysis by a global passive adversary (packet sizes/timing) is not
