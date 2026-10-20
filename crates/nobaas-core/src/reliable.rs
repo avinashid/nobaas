@@ -2,7 +2,7 @@
 
 use crate::time::Instant;
 use crate::wire::{self, FRAGMENT, REL_OVERHEAD};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 const INITIAL_RTO: Duration = Duration::from_millis(300);
@@ -67,6 +67,10 @@ pub(crate) struct RelSend {
     /// (seq, fin, urgent, data)
     queued: VecDeque<(u32, bool, bool, Vec<u8>)>,
     inflight: BTreeMap<u32, Fragment>,
+    /// `(due, seq)` and `(dup_at, seq)` of every in-flight fragment, so the
+    /// earliest is found without walking `inflight` on each packet.
+    by_due: BTreeSet<(Instant, u32)>,
+    by_dup: BTreeSet<(Instant, u32)>,
     buffered: usize,
     srtt: Option<Duration>,
     rttvar: Duration,
@@ -102,6 +106,8 @@ impl RelSend {
             sent_end: 0,
             queued: VecDeque::new(),
             inflight: BTreeMap::new(),
+            by_due: BTreeSet::new(),
+            by_dup: BTreeSet::new(),
             buffered: 0,
             srtt: None,
             rttvar: Duration::ZERO,
@@ -197,6 +203,10 @@ impl RelSend {
         let mut highest = None;
         for s in acked {
             if let Some(f) = self.inflight.remove(&s) {
+                self.by_due.remove(&(f.due, s));
+                if let Some(d) = f.dup_at {
+                    self.by_dup.remove(&(d, s));
+                }
                 self.buffered -= f.data.len();
                 newly += 1;
                 highest = highest.max(Some(s));
@@ -235,7 +245,10 @@ impl RelSend {
                 debug_assert!(s < h);
                 if !f.fast && f.due > now && h >= f.epoch.saturating_add(DUP_THRESHOLD - 1) {
                     f.fast = true;
-                    f.due = f.due.min(now.max(f.sent_at + srtt + reorder));
+                    let due = f.due.min(now.max(f.sent_at + srtt + reorder));
+                    self.by_due.remove(&(f.due, s));
+                    self.by_due.insert((due, s));
+                    f.due = due;
                 }
             }
         }
@@ -279,14 +292,13 @@ impl RelSend {
 
     pub(crate) fn has_sendable(&self, now: Instant, window: usize) -> bool {
         (!self.queued.is_empty() && self.inflight.len() < self.window(window))
-            || self.inflight.values().any(|f| f.due <= now)
+            || earliest(&self.by_due).is_some_and(|d| d <= now)
             || self.probe_at.is_some_and(|p| p <= now)
-            || self.inflight.values().any(|f| f.dup_at.is_some_and(|d| d <= now))
+            || earliest(&self.by_dup).is_some_and(|d| d <= now)
     }
 
     pub(crate) fn next_due(&self) -> Option<Instant> {
-        let dups = self.inflight.values().filter_map(|f| f.dup_at);
-        self.inflight.values().map(|f| f.due).chain(self.probe_at).chain(dups).min()
+        [earliest(&self.by_due), self.probe_at, earliest(&self.by_dup)].into_iter().flatten().min()
     }
 
     /// Appends due retransmissions, then new fragments, while they fit in `max` bytes.
@@ -294,10 +306,8 @@ impl RelSend {
         let mut lost = false;
         let mut resent = false;
         let sent_end = self.sent_end;
-        for (&seq, f) in self.inflight.iter_mut() {
-            if f.due > now {
-                continue;
-            }
+        for seq in due_by_seq(&self.by_due, now) {
+            let f = self.inflight.get_mut(&seq).expect("indexed fragment in flight");
             if out.len() + REL_OVERHEAD + f.data.len() > max {
                 break;
             }
@@ -305,7 +315,13 @@ impl RelSend {
             resent = true;
             f.fast = false;
             f.epoch = sent_end;
+            if let Some(d) = f.dup_at {
+                self.by_dup.remove(&(d, seq));
+            }
             f.dup_at = f.urgent.then_some(now + URGENT_GAP);
+            if let Some(d) = f.dup_at {
+                self.by_dup.insert((d, seq));
+            }
             wire::put_reliable(out, seq, f.fin, &f.data);
             f.tries += 1;
             if f.tries > MAX_TRIES {
@@ -313,19 +329,20 @@ impl RelSend {
             }
             f.sent_at = now;
             let backoff = self.rto.saturating_mul(1 << (f.tries - 1).min(8)).min(MAX_BACKOFF);
+            self.by_due.remove(&(f.due, seq));
             f.due = now + backoff;
+            self.by_due.insert((f.due, seq));
             self.retransmits += 1;
         }
         if lost {
             self.on_loss(now);
         }
-        for (&seq, f) in self.inflight.iter_mut() {
-            if !f.dup_at.is_some_and(|d| d <= now) {
-                continue;
-            }
+        for seq in due_by_seq(&self.by_dup, now) {
+            let f = self.inflight.get_mut(&seq).expect("indexed fragment in flight");
             if out.len() + REL_OVERHEAD + f.data.len() > max {
                 break;
             }
+            self.by_dup.remove(&(f.dup_at.expect("indexed duplicate"), seq));
             wire::put_reliable(out, seq, f.fin, &f.data);
             // Still timed from the first copy: at most URGENT_GAP off, whereas no
             // samples at all would leave an urgent-only link's RTO stale and fire
@@ -333,7 +350,7 @@ impl RelSend {
             f.dup_at = None;
             self.urgent_copies += 1;
         }
-        if self.inflight.values().any(|f| f.due <= now) {
+        if earliest(&self.by_due).is_some_and(|d| d <= now) {
             return; // retransmissions first
         }
         let window = self.window(window);
@@ -362,6 +379,10 @@ impl RelSend {
             let (seq, fin, urgent, data) = self.queued.pop_front().unwrap();
             wire::put_reliable(out, seq, fin, &data);
             let dup_at = urgent.then_some(now + URGENT_GAP);
+            self.by_due.insert((now + self.rto, seq));
+            if let Some(d) = dup_at {
+                self.by_dup.insert((d, seq));
+            }
             self.inflight.insert(
                 seq,
                 Fragment {
@@ -385,6 +406,21 @@ impl RelSend {
             self.arm_probe(now);
         }
     }
+}
+
+fn earliest(index: &BTreeSet<(Instant, u32)>) -> Option<Instant> {
+    index.first().map(|&(t, _)| t)
+}
+
+/// Sequence numbers indexed at or before `now`, in sequence order (the order
+/// fragments go out in), without walking the rest of the flight.
+fn due_by_seq(index: &BTreeSet<(Instant, u32)>, now: Instant) -> Vec<u32> {
+    if earliest(index).is_none_or(|t| t > now) {
+        return Vec::new();
+    }
+    let mut seqs: Vec<u32> = index.range(..=(now, u32::MAX)).map(|&(_, s)| s).collect();
+    seqs.sort_unstable();
+    seqs
 }
 
 pub(crate) struct RelRecv {
@@ -552,6 +588,21 @@ mod tests {
     }
 
     #[test]
+    fn retransmissions_go_out_in_sequence_order() {
+        let mut tx = RelSend::new();
+        tx.push_message(b"a", 1 << 20, 1 << 20, false).ok().unwrap();
+        assert_eq!(drain(&mut tx, Instant::ZERO).len(), 1);
+        tx.push_message(b"b", 1 << 20, 1 << 20, false).ok().unwrap();
+        // 0 times out and backs off past 1, which is sent new at the same time.
+        let t = Instant::ZERO + INITIAL_RTO;
+        let seqs = |f: Vec<(u32, bool, Vec<u8>)>| f.into_iter().map(|f| f.0).collect::<Vec<_>>();
+        assert_eq!(seqs(drain(&mut tx, t)), vec![0, 1]);
+        assert_eq!(tx.next_due(), Some(t + INITIAL_RTO));
+        // Both due: sequence order, not due order.
+        assert_eq!(seqs(drain(&mut tx, t + INITIAL_RTO * 2)), vec![0, 1]);
+    }
+
+    #[test]
     fn tail_probe_beats_rto() {
         let mut tx = RelSend::new();
         tx.seed_rtt(Duration::from_millis(40));
@@ -583,6 +634,101 @@ mod tests {
         tx.on_ack(Instant::from_millis(30), 1, 0);
         assert_eq!(tx.next_due(), None);
         assert_eq!(tx.srtt(), Some(Duration::from_millis(30)));
+    }
+
+    /// The indexes match the fragments, and the lookups agree with the full
+    /// scans they replace.
+    fn check(tx: &RelSend, now: Instant, window: usize) {
+        let due: BTreeSet<_> = tx.inflight.iter().map(|(&s, f)| (f.due, s)).collect();
+        let dup: BTreeSet<_> = tx.inflight.iter().filter_map(|(&s, f)| f.dup_at.map(|d| (d, s))).collect();
+        assert_eq!(tx.by_due, due);
+        assert_eq!(tx.by_dup, dup);
+        let sendable = (!tx.queued.is_empty() && tx.inflight.len() < tx.window(window))
+            || tx.inflight.values().any(|f| f.due <= now)
+            || tx.probe_at.is_some_and(|p| p <= now)
+            || tx.inflight.values().any(|f| f.dup_at.is_some_and(|d| d <= now));
+        assert_eq!(tx.has_sendable(now, window), sendable);
+        let dups = tx.inflight.values().filter_map(|f| f.dup_at);
+        let next = tx.inflight.values().map(|f| f.due).chain(tx.probe_at).chain(dups).min();
+        assert_eq!(tx.next_due(), next);
+    }
+
+    #[test]
+    fn due_indexes_match_a_full_scan() {
+        for seed in 1..=24u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut rand = move |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            let (mut tx, mut rx) = (RelSend::new(), RelRecv::new());
+            let window = 64;
+            // One-way delay: a LAN (a retransmission can go out while its
+            // urgent copy is pending) or a WAN.
+            let base = if seed % 2 == 0 { 20_000 } else { 400 };
+            let mut now = Instant::ZERO;
+            // (arrival, frame) on a lossy link that reorders, and ACKs back.
+            let mut to_rx: Vec<(Instant, u32, bool, Vec<u8>)> = Vec::new();
+            let mut to_tx: Vec<(Instant, u32, u64)> = Vec::new();
+            let mut delivered = Vec::new();
+            for _ in 0..1500 {
+                now = now + Duration::from_micros(rand(base * 2 / 5));
+                if rand(4) == 0 {
+                    let len = rand(4000) as usize;
+                    let _ = tx.push_message(&vec![7; len], 1 << 16, 1 << 20, rand(5) == 0);
+                    check(&tx, now, window);
+                }
+                // Retransmissions go first, in sequence order, as the scan sent them.
+                let due: Vec<u32> = tx.inflight.iter().filter(|(_, f)| f.due <= now).map(|(&s, _)| s).collect();
+                let (retx, probes) = (tx.retransmits, tx.probes);
+                let mut out = Vec::new();
+                tx.write_frames(now, window, &mut out, 1200 + rand(3000) as usize);
+                check(&tx, now, window);
+                let resent = (tx.retransmits - retx - (tx.probes - probes)) as usize;
+                let sent: Vec<u32> = frames(&out)
+                    .take(resent)
+                    .map(|f| match f.unwrap() {
+                        Frame::Reliable { seq, .. } => seq,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                assert_eq!(sent, due[..resent]);
+                for f in frames(&out) {
+                    let Frame::Reliable { seq, fin, data } = f.unwrap() else { unreachable!() };
+                    if rand(10) != 0 {
+                        let at = now + Duration::from_micros(base + rand(base * 3 / 4));
+                        to_rx.push((at, seq, fin, data.to_vec()));
+                    }
+                }
+                to_rx.retain(|(at, seq, fin, data)| {
+                    let keep = *at > now;
+                    if !keep {
+                        rx.on_fragment(*seq, *fin, data, 1 << 20, &mut delivered).unwrap();
+                    }
+                    keep
+                });
+                if rx.ack_pending && rand(3) != 0 {
+                    rx.ack_pending = false;
+                    let (cum, bits) = rx.ack();
+                    to_tx.push((now + Duration::from_micros(base + rand(base / 2)), cum, bits));
+                }
+                let mut i = 0;
+                while i < to_tx.len() {
+                    if to_tx[i].0 <= now {
+                        let (_, cum, bits) = to_tx.swap_remove(i);
+                        tx.on_ack(now, cum, bits);
+                        check(&tx, now, window);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // On the LAN an urgent fragment is mostly acknowledged before its copy.
+            assert!(tx.retransmits > 0 && !delivered.is_empty(), "seed {seed}");
+            assert!(tx.urgent_copies > 0 || base < 1000, "seed {seed}");
+        }
     }
 
     #[test]
