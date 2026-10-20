@@ -1,0 +1,11 @@
+; Points at the workspace build: run `cargo build --release -p nobaas-godot` first.
+
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.3
+reloadable = true
+
+[libraries]
+linux = "res://../../target/release/libnobaas_godot.so"
+windows = "res://../../target/release/nobaas_godot.dll"
+macos = "res://../../target/release/libnobaas_godot.dylib"
