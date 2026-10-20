@@ -352,7 +352,8 @@ impl<A: Address> Traversal<A> {
                 (Some(_), None) => self.remotes.get(&from).is_some_and(|r| r.invited),
                 (None, Some(_)) => false,
             };
-            if let Some(offer) = Offer::decode(body).filter(|_| welcome) {
+            // A room offer too short to carry a proof is not a room offer.
+            if let Some(offer) = Offer::decode(body).filter(|o| welcome && o.room == proof.is_some()) {
                 self.on_offer(now, ep, from, offer);
             }
         }
@@ -868,6 +869,26 @@ mod tests {
         t.handle_signal(now, &mut ep, Topic::peer(&me), &offer_from(&id(2), &me, None, 1, Role::Peer, vec![there]));
         assert_eq!(dials(&mut ep, now), vec![there]);
         assert!(t.admits(&id(2).peer_id()) && t.room_role(&id(2).peer_id()).is_none());
+    }
+
+    /// A v2 (room) offer short enough to have no proof, from an invited peer, is
+    /// dropped: it must not give that peer a room role such as Host.
+    #[test]
+    fn short_room_offer_without_proof_is_dropped() {
+        let me = id(1).peer_id();
+        let (mut t, mut ep) = in_room(Role::Client, None, "10.0.0.1:7000".parse().unwrap());
+        let now = Instant::from_millis(10);
+        t.introduce(now, &ep, id(2).peer_id());
+        while t.poll_signal().is_some() {}
+        let o = Offer::<SocketAddr> {
+            room: true, reply: true, role: Role::Host, nat: NatType::Cone, ts: 0, nonce: 1, addrs: vec![], relays: vec![],
+        };
+        let body = o.encode();
+        assert!(body.len() <= PROOF_LEN, "short enough to skip the proof split");
+        let sealed = sealed::seal(&id(2), &me, [7; 32], &body).unwrap();
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed);
+        assert_eq!(t.room_role(&id(2).peer_id()), None);
+        assert_eq!(published(&mut t), 0);
     }
 
     /// NB-032: forged hellos cost nothing, and hellos, offers and each sender
