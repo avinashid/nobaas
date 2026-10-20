@@ -4,7 +4,7 @@
 multiplayer games, collaborative whiteboards, video meetings and chat without running servers or paying for relays.
 
 > **Status: early development (v0.1).** The transport core is working and tested; the higher-level
-> building blocks (sync, rooms, media) are in progress. See [`tasks/ROADMAP.md`](tasks/ROADMAP.md).
+> building blocks (sync, rooms, media) are in progress.
 
 ```
             your app (game · whiteboard · meet · chat)
@@ -76,7 +76,6 @@ ep.send(peerId, Lane.Reliable, new TextEncoder().encode('hello'));
 | `packages/js` | JavaScript package: wasm glue, WebRTC transport, Nostr signaling, demos |
 | `examples/` | Live examples: chat, whiteboard, game, meet (in progress) |
 | `docs/` | Architecture, performance model, comparison with other libraries |
-| `tasks/` | Project management: objectives, roadmap, team, task files |
 
 ## Documentation
 
