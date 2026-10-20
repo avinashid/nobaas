@@ -80,6 +80,7 @@ step "node room" node packages/js/test/room_node.mjs
 step "node peer ids" node packages/js/test/peer_id.mjs
 step "node room proof" node packages/js/test/room_proof.mjs
 step "node pump re-arm" node packages/js/test/pump_rearm.mjs
+step "node endpoint closed" node packages/js/test/endpoint_closed.mjs
 
 if [ $quick = 1 ]; then
   skip "browser" "--quick"

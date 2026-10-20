@@ -169,6 +169,8 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.
+- `node packages/js/test/endpoint_closed.mjs`: after `close()` no `Endpoint` method calls
+  into wasm: a late datagram is dropped, `send`/`connect*` throw, queries return null.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
