@@ -294,6 +294,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "nobaas"
+version = "0.1.0"
+dependencies = [
+ "nobaas-core",
+ "rand_core",
+]
+
+[[package]]
 name = "nobaas-core"
 version = "0.1.0"
 dependencies = [

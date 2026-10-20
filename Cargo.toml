@@ -5,6 +5,7 @@ members = [
     "crates/nobaas-sim",
     "crates/nobaas-ffi",
     "crates/nobaas-game",
+    "crates/nobaas",
 ]
 
 [workspace.package]

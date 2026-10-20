@@ -1,0 +1,15 @@
+[package]
+name = "nobaas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Nobaas: peer-to-peer nodes over UDP, with no server"
+
+[dependencies]
+nobaas-core = { path = "../nobaas-core" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[[example]]
+name = "echo"
+path = "../../examples/rust/echo.rs"

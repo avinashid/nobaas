@@ -33,7 +33,7 @@ mod wire;
 
 pub use addr::{Address, Path, MAX_ADDR_LEN};
 pub use endpoint::{
-    Config, ConnectError, DisconnectReason, Endpoint, Event, Lane, SendError, Stats, Transmit,
+    Config, ConnectError, DisconnectReason, Endpoint, Event, Lane, PeerStats, SendError, Stats, Transmit,
 };
 pub use identity::{Identity, PeerId};
 pub use invite::Invite;
