@@ -145,7 +145,7 @@ fn args() -> Args {
 /// Deterministic input policy: change direction now and then, dash sometimes.
 fn input_bits(player: usize, tick: u32) -> u16 {
     let phase = (tick + player as u32 * 7) / 30;
-    let h = (player as u64 * 0x9E37_79B9_7F4A_7C15) ^ (phase as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let h = (player as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (phase as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     let h = h ^ (h >> 29);
     let dir = [0x01, 0x02, 0x04, 0x08, 0x05, 0x09, 0x06, 0x0a][(h % 8) as usize];
     dir | if (h >> 8).is_multiple_of(5) { 0x10 } else { 0 }
