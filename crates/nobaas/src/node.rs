@@ -206,10 +206,9 @@ impl Node {
         self.ep.connect_with(now, inv.peer, &targets).map_err(Error::Connect)?;
         if !self.ep.is_connected(&inv.peer) {
             self.status.insert(inv.peer, Status::Connecting);
-            if self.signaling.is_some() {
-                self.trav.introduce(now, &self.ep, inv.peer);
-                self.pump_signals();
-            }
+            // Also marks the peer as welcome while in a room (the offer is dropped with no carrier).
+            self.trav.introduce(now, &self.ep, inv.peer);
+            self.pump_signals();
         }
         Ok(inv.peer)
     }
@@ -218,6 +217,11 @@ impl Node {
     /// [`Role::Peer`]: this node connects to every other peer in it, and keeps
     /// announcing itself for those that join later. Leaves any other room. Needs a
     /// [`signaling`](Builder::signaling) carrier; without one nobody hears it.
+    ///
+    /// The room's name is its password: only peers that know it can link in it
+    /// (relays see just a hash). While in a room, this node closes links from
+    /// anyone else, except peers it dialled itself with [`connect`](Node::connect).
+    /// A name others can guess makes a public lobby.
     pub fn join_room(&mut self, app_id: &str, room: &str) {
         self.join_room_as(app_id, room, Role::Peer);
     }
@@ -225,9 +229,20 @@ impl Node {
     /// [`join_room`](Node::join_room) with a role: a [`Role::Host`] links with clients
     /// and peers, a [`Role::Client`] with hosts only (a star, as a game server).
     pub fn join_room_as(&mut self, app_id: &str, room: &str, role: Role) {
+        self.join_room_with(app_id, room, role, None);
+    }
+
+    /// [`join_room_as`](Node::join_room_as), linking with `host` only when given: a
+    /// client that knows its host's key can't be taken in by another room member.
+    pub fn join_room_with(&mut self, app_id: &str, room: &str, role: Role, host: Option<PeerId>) {
         let now = self.now();
-        self.trav.join_room(now, app_id, room, role);
+        self.trav.join_room(now, app_id, room, role, host);
         self.pump_signals();
+    }
+
+    /// The role `peer` proved it holds in the current room (by knowing its name).
+    pub fn room_role(&self, peer: &PeerId) -> Option<Role> {
+        self.trav.room_role(peer)
     }
 
     /// Leaves the room: stops announcing and dialling. Links stay up.
@@ -326,6 +341,21 @@ impl Node {
             self.trav.handle_timeout(now, &mut self.ep);
         }
         while let Some(e) = self.ep.poll_event() {
+            let about = match &e {
+                Event::Connected { peer, .. }
+                | Event::Message { peer, .. }
+                | Event::Disconnected { peer, .. }
+                | Event::PathChanged { peer, .. } => Some(*peer),
+                Event::AddrObserved { by, .. } => Some(*by),
+                Event::ConnectFailed { .. } => None,
+            };
+            if let Some(peer) = about.filter(|p| self.status(p) != Status::Connected && !self.trav.admits(p)) {
+                // In a room, a link from a peer that never proved the room key: closed unseen.
+                if matches!(e, Event::Connected { .. }) {
+                    self.ep.disconnect(&peer);
+                }
+                continue;
+            }
             self.trav.handle_event(now, &mut self.ep, &e);
             self.track(&e);
             self.events.push_back(e);

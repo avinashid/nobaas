@@ -340,7 +340,7 @@ impl Session {
     }
 
     /// Hosts on `node` and announces it in room `room` of application `app_id`, for
-    /// [`join_room`](Session::join_room). Invites work too. Needs signaling.
+    /// [`join_room`](Session::join_room). Only peers that know the room name get in. Needs signaling.
     pub fn host_room(node: Node, app_id: &str, room: &str) -> Session {
         let mut s = Session::new(node, true);
         s.room = Some((app_id.to_string(), room.to_string()));
@@ -348,10 +348,12 @@ impl Session {
         s
     }
 
-    /// Joins whichever host announces itself in the room: connecting until one
-    /// answers and assigns this peer its id. Needs signaling.
-    pub fn join_room(mut node: Node, app_id: &str, room: &str) -> Session {
-        node.join_room_as(app_id, room, Role::Client);
+    /// Joins whichever host announces itself in the room (or only `host`, when its
+    /// key is known): connecting until one answers and assigns this peer its id.
+    /// Only a peer that proves it knows the room's name counts as a host. Needs
+    /// signaling.
+    pub fn join_room(mut node: Node, app_id: &str, room: &str, host: Option<PeerId>) -> Session {
+        node.join_room_with(app_id, room, Role::Client, host);
         let mut s = Session::new(node, false);
         s.room = Some((app_id.to_string(), room.to_string()));
         s
@@ -459,8 +461,8 @@ impl Session {
         match e {
             Event::Connected { peer, .. } => {
                 if !self.host {
-                    if self.host_peer.is_none() && self.room.is_some() {
-                        // A room client dials hosts only: the first to link is ours.
+                    if self.host_peer.is_none() && self.room.is_some() && self.node.room_role(&peer) == Some(Role::Host) {
+                        // The first peer to link that proved it hosts this room is ours.
                         self.host_peer = Some(peer);
                         self.node.leave_room();
                     } else if Some(peer) != self.host_peer {
@@ -814,9 +816,9 @@ mod tests {
         let hub = MemoryHub::new();
         let node = || Node::builder().signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
         let mut host = Session::host_room(node(), "nb-test", "godot-room");
-        let mut a = Session::join_room(node(), "nb-test", "godot-room");
-        let mut b = Session::join_room(node(), "nb-test", "godot-room");
-        let mut stranger = Session::join_room(node(), "nb-test", "another room");
+        let mut a = Session::join_room(node(), "nb-test", "godot-room", None);
+        let mut b = Session::join_room(node(), "nb-test", "godot-room", None);
+        let mut stranger = Session::join_room(node(), "nb-test", "another room", None);
         assert_eq!(a.status(), Status::Connecting);
         assert!(pump(&mut [&mut host, &mut a, &mut b, &mut stranger], |s| {
             s[0].peer_ids().len() == 2 && s[1].status() == Status::Connected && s[2].status() == Status::Connected
@@ -831,8 +833,43 @@ mod tests {
 
         // A refusing host is not announced: a newcomer finds nobody.
         host.set_refuse_new_connections(true);
-        let mut late = Session::join_room(node(), "nb-test", "godot-room");
+        let mut late = Session::join_room(node(), "nb-test", "godot-room", None);
         let found = pump(&mut [&mut host, &mut late], |s| s[1].status() == Status::Connected);
         assert!(!found);
+    }
+
+    /// NB-031: a peer that knows the room topic (what relays see) but not its name
+    /// can't pose as the host, by hello or by dialling the client straight; with a
+    /// host key, the client takes that host only.
+    #[test]
+    fn room_clients_take_only_a_proven_host() {
+        use nobaas::{Signaling, Topic};
+        let hub = MemoryHub::new();
+        let node = || Node::builder().signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
+        let mut a = Session::join_room(node(), "nb-test", "secret-room", None);
+        let mut impostor = node();
+        let mut side = hub.connect();
+        let hex: String = impostor.peer_id().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let forged = format!(r#"{{"t":"hello","from":"{hex}","meta":{{"nb":1,"role":"host","p":"{}"}}}}"#, "00".repeat(32));
+        side.publish(Topic::room("nb-test", "secret-room"), forged.as_bytes());
+        impostor.connect(&a.invite()).unwrap();
+        let end = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < end {
+            a.poll();
+            impostor.poll();
+            while impostor.try_recv_event().is_some() {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!((a.status(), a.peer_ids()), (Status::Connecting, vec![]));
+
+        // The real host: found. Another host, when the client names one: ignored.
+        let mut host = Session::host_room(node(), "nb-test", "secret-room");
+        assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
+        assert_eq!(a.peer_key(HOST_ID), Some(host.public_key()));
+        let mut other = Session::host_room(node(), "nb-test", "secret-room");
+        let mut c = Session::join_room(node(), "nb-test", "secret-room", Some(other.public_key()));
+        assert!(pump(&mut [&mut host, &mut other, &mut c], |s| s[2].status() == Status::Connected));
+        assert_eq!(c.peer_key(HOST_ID), Some(other.public_key()));
+        assert_eq!(host.peer_ids().len(), 1, "only a");
     }
 }

@@ -98,7 +98,7 @@ impl World {
 
     fn join(&mut self, p: usize, room: &str, role: Role) {
         let now = self.sim.now;
-        self.peers[p].trav.join_room(now, "nb-sim", room, role);
+        self.peers[p].trav.join_room(now, "nb-sim", room, role, None);
     }
 
     /// One host-loop iteration per peer, as `Node::poll` does, then `TICK` of network.

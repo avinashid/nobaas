@@ -1,5 +1,5 @@
 use crate::session::{Mode, NetOptions, PeerEvent, PutError, Session, Status};
-use nobaas::{Failure, NatType, Node};
+use nobaas::{Failure, NatType, Node, PeerId};
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
@@ -45,8 +45,9 @@ impl NobaasMultiplayerPeer {
     }
 
     /// Hosts on UDP `port` (0: a free one) and announces this game in room `room` of
-    /// application `app_id`, for `join_room`. Returns the invite (it works as well),
-    /// or `""` if the port can't be bound.
+    /// application `app_id`, for `join_room`. Only peers that know the room name get
+    /// in: while announcing, the host turns away invite joins. Returns the invite, or
+    /// `""` if the port can't be bound.
     #[func]
     fn host_room(&mut self, app_id: GString, room: GString, #[opt(default = 0)] port: i32) -> GString {
         let (app, room) = (app_id.to_string(), room.to_string());
@@ -56,12 +57,31 @@ impl NobaasMultiplayerPeer {
     /// Joins the host announced in room `room` of `app_id`. The peer is connecting
     /// until a host answers and assigns this peer its id; then
     /// `connected_to_server` fires. It waits for a host as long as it takes.
+    ///
+    /// The room name is the password: only a peer that knows it can be taken for
+    /// the host (relays see a hash). Use a long random name for a private game; a
+    /// guessable one is a public lobby.
     #[func]
     fn join_room(&mut self, app_id: GString, room: GString) -> Error {
+        self.join_room_of(app_id, room, None)
+    }
+
+    /// `join_room`, taking only the host whose `get_public_key()` is `host_key`
+    /// (32 bytes): another peer in the room can't pose as it.
+    #[func]
+    fn join_room_host(&mut self, app_id: GString, room: GString, host_key: PackedByteArray) -> Error {
+        let Ok(key) = <[u8; 32]>::try_from(host_key.as_slice()) else {
+            godot_error!("NobaasMultiplayerPeer.join_room_host: host_key must be 32 bytes");
+            return Error::ERR_INVALID_PARAMETER;
+        };
+        self.join_room_of(app_id, room, Some(PeerId(key)))
+    }
+
+    fn join_room_of(&mut self, app_id: GString, room: GString, host: Option<PeerId>) -> Error {
         self.close();
         match self.net.bind("0.0.0.0:0") {
             Ok(node) => {
-                self.install(Session::join_room(node, &app_id.to_string(), &room.to_string()));
+                self.install(Session::join_room(node, &app_id.to_string(), &room.to_string(), host));
                 Error::OK
             }
             Err(e) => {

@@ -13,6 +13,8 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 rand_chacha = "0.3"
 # SHA-256 for signaling topics, as nostr.js computes them (already in the tree through k256).
 sha2 = "0.10"
+# HMAC-SHA256 room proofs on hellos and room offers (RustCrypto, same family as sha2).
+hmac = "0.12"
 # Optional async host; the sync Node needs no runtime.
 tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "macros", "rt"] }
 # Nostr signaling (feature `nostr`): websocket client, TLS, BIP-340 signatures, relay JSON.
