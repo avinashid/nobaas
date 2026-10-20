@@ -15,14 +15,21 @@ rand_chacha = "0.3"
 sha2 = "0.10"
 # Optional async host; the sync Node needs no runtime.
 tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "macros", "rt"] }
+# Nostr signaling (feature `nostr`): websocket client, TLS, BIP-340 signatures, relay JSON.
+tungstenite = { version = "0.24", optional = true, default-features = false, features = ["handshake"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "1", optional = true }
+k256 = { version = "0.13", optional = true, default-features = false, features = ["schnorr", "arithmetic"] }
+serde_json = { version = "1", optional = true }
 
 [features]
 tokio = ["dep:tokio"]
+nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json"]
 
 [dev-dependencies]
 nobaas-core = { path = "../nobaas-core" }
-# Tests and examples cover the async host too.
-nobaas = { path = ".", features = ["tokio"] }
+# Tests and examples cover the async host and Nostr signaling too.
+nobaas = { path = ".", features = ["tokio", "nostr"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
 
 [[example]]
@@ -33,3 +40,8 @@ path = "../../examples/rust/echo.rs"
 name = "echo_async"
 path = "../../examples/rust/echo_async.rs"
 required-features = ["tokio"]
+
+[[example]]
+name = "nostr_relay"
+path = "../../examples/rust/nostr_relay.rs"
+required-features = ["nostr"]

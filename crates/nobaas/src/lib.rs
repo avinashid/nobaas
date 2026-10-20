@@ -32,7 +32,8 @@
 //! ([`Builder::signaling`]) and peers swap addresses over it, so both dial at once
 //! and punch through their NATs: [`Node::join_room`] finds and connects the peers
 //! of a room, and [`Node::connect`] punches too. Where two symmetric NATs can't
-//! punch, a peer connected to both relays. See [`traversal`].
+//! punch, a peer connected to both relays. See [`traversal`]. The `nostr` feature
+//! adds `NostrSignaling`, over public Nostr relays.
 //!
 //! With the `tokio` feature, [`AsyncNode`] wraps a `Node` and waits on the socket
 //! and timers itself: `node.next_event().await`.
@@ -40,12 +41,16 @@
 #[cfg(feature = "tokio")]
 mod async_node;
 mod node;
+#[cfg(feature = "nostr")]
+pub mod nostr;
 mod signaling;
 pub mod traversal;
 
 #[cfg(feature = "tokio")]
 pub use async_node::AsyncNode;
 pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
+#[cfg(feature = "nostr")]
+pub use nostr::NostrSignaling;
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
 pub use traversal::{Failure, NatType, Role};
 pub use nobaas_core::{
