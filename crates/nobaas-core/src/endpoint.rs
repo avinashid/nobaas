@@ -40,7 +40,8 @@ pub struct Config {
     /// Cap on half-open responder handshakes (flood protection).
     pub max_pending_handshakes: usize,
     pub max_message: usize,
-    /// Per-link cap on reliable bytes queued or unacknowledged.
+    /// Per-link cap on bytes queued or unacknowledged, for `Reliable` and for
+    /// `Urgent` each, so a full reliable buffer never refuses an urgent message.
     pub max_send_buffer: usize,
     /// Reliable fragments in flight per link.
     pub reliable_window: usize,
@@ -102,10 +103,11 @@ pub enum Lane {
     Reliable,
     /// Delivered at most once, possibly out of order. Messages up to [`MAX_UNRELIABLE`].
     Unreliable,
-    /// Reliable and ordered together with `Reliable`, but each fragment is sent
-    /// twice a few ms apart, so a single loss costs nothing instead of a
-    /// retransmission round trip. For small, latency-critical events; arrives
-    /// as `Lane::Reliable`.
+    /// Delivered exactly once, in order with other `Urgent` messages but not
+    /// with `Reliable` ones: it has its own sequence, goes out ahead of queued
+    /// `Reliable` data, and each fragment is sent twice a few ms apart, so a
+    /// single loss costs nothing instead of a retransmission round trip. For
+    /// small, latency-critical events; arrives as `Lane::Reliable`.
     Urgent,
 }
 
@@ -234,11 +236,13 @@ pub struct PeerStats {
     pub min_rtt: Option<Duration>,
     /// Reliable and urgent fragments sent for the first time.
     pub fragments_sent: u64,
-    /// Reliable fragments sent again (timeouts, fast retransmits, tail probes).
+    /// Reliable and urgent fragments sent again (timeouts, fast retransmits, tail probes).
     pub retransmits: u64,
-    /// Congestion window, in fragments (before the `reliable_window` cap).
+    /// Congestion window, in fragments (before the `reliable_window` cap),
+    /// shared by `Reliable` and `Urgent`.
     pub cwnd: u32,
-    /// Reliable fragments sent and not yet acknowledged.
+    /// Window slots in use: reliable fragments in flight, and urgent ones by
+    /// wire size (a small urgent message takes a fraction of a slot).
     pub inflight: u32,
     /// Window reductions caused by queueing delay rather than loss.
     pub delay_backoffs: u64,
@@ -301,6 +305,8 @@ struct Link {
     ping_pending: bool,
     tx: RelSend,
     rx: RelRecv,
+    /// The urgent stream's receiver: its own sequence space.
+    urx: RelRecv,
     unrel: VecDeque<Vec<u8>>,
     /// Encoded FWD/RELAYED frames carried for other links.
     relay_q: VecDeque<Vec<u8>>,
@@ -329,6 +335,7 @@ impl Link {
             ping_pending: false,
             tx: RelSend::new(),
             rx: RelRecv::new(),
+            urx: RelRecv::new(),
             unrel: VecDeque::new(),
             relay_q: VecDeque::new(),
             relay_tokens: burst,
@@ -340,6 +347,7 @@ impl Link {
     fn has_output(&self, now: Instant, window: usize) -> bool {
         self.ping_pending
             || self.rx.ack_pending
+            || self.urx.ack_pending
             || !self.unrel.is_empty()
             || !self.relay_q.is_empty()
             || self.tx.has_sendable(now, window)
@@ -462,7 +470,7 @@ impl<A: Address> Endpoint<A> {
         let mut s = self.stats.clone();
         for sess in self.sessions.values() {
             if let State::Live(l) = &sess.state {
-                s.retransmits += l.tx.retransmits;
+                s.retransmits += l.tx.retransmits();
             }
         }
         s
@@ -510,8 +518,8 @@ impl<A: Address> Endpoint<A> {
             State::Live(l) => Some(PeerStats {
                 rtt: l.tx.srtt(),
                 min_rtt: l.tx.path_min_rtt(),
-                fragments_sent: l.tx.fragments_sent,
-                retransmits: l.tx.retransmits,
+                fragments_sent: l.tx.fragments_sent(),
+                retransmits: l.tx.retransmits(),
                 cwnd: l.tx.cwnd(),
                 inflight: l.tx.inflight(),
                 delay_backoffs: l.tx.delay_backoffs,
@@ -1007,9 +1015,10 @@ impl<A: Address> Endpoint<A> {
             match f {
                 // Answered with an ACK, so a silent-side probe gets a reply.
                 Ok(Frame::Ping) => link.rx.ack_pending = true,
-                Ok(Frame::Ack { cum, bits }) => link.tx.on_ack(now, cum, bits),
-                Ok(Frame::Reliable { seq, fin, data }) => {
-                    if link.rx.on_fragment(seq, fin, data, self.config.max_message, &mut reliable).is_err() {
+                Ok(Frame::Ack { cum, bits, urgent }) => link.tx.on_ack(now, cum, bits, urgent),
+                Ok(Frame::Reliable { seq, fin, data, urgent }) => {
+                    let rx = if urgent { &mut link.urx } else { &mut link.rx };
+                    if rx.on_fragment(seq, fin, data, self.config.max_message, &mut reliable).is_err() {
                         violation = true;
                     }
                 }
@@ -1359,10 +1368,12 @@ impl<A: Address> Endpoint<A> {
             let direct = matches!(sess.path, Path::Direct(_));
             let cap = if direct { MAX_PLAINTEXT } else { RELAYED_PLAINTEXT };
             let mut pt = Vec::with_capacity(cap);
-            if link.rx.ack_pending {
-                let (cum, bits) = link.rx.ack();
-                wire::put_ack(&mut pt, cum, bits);
-                link.rx.ack_pending = false;
+            for (rx, urgent) in [(&mut link.rx, false), (&mut link.urx, true)] {
+                if rx.ack_pending {
+                    let (cum, bits) = rx.ack();
+                    wire::put_ack(&mut pt, cum, bits, urgent);
+                    rx.ack_pending = false;
+                }
             }
             if link.ping_pending {
                 wire::put_ping(&mut pt);

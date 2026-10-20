@@ -37,8 +37,8 @@ fn put_frame(out: &mut Vec<u8>, f: &Frame<'_>) {
     match *f {
         Frame::Ping => wire::put_ping(out),
         Frame::Close => wire::put_close(out),
-        Frame::Ack { cum, bits } => wire::put_ack(out, cum, bits),
-        Frame::Reliable { seq, fin, data } => wire::put_reliable(out, seq, fin, data),
+        Frame::Ack { cum, bits, urgent } => wire::put_ack(out, cum, bits, urgent),
+        Frame::Reliable { seq, fin, data, urgent } => wire::put_reliable(out, seq, fin, data, urgent),
         Frame::Unreliable(d) => wire::put_unreliable(out, d),
         Frame::Observed(a) => wire::put_observed(out, a),
         Frame::Fwd { to, packet, tag } => wire::put_fwd(out, &to, packet, tag),
@@ -80,7 +80,7 @@ fn random_frames(rng: &mut Rng, max_data: usize, peers: &[PeerId], packets: &[Ve
         };
         match rng.below(10) {
             0 => wire::put_ping(&mut b),
-            1 => wire::put_ack(&mut b, rng.edgy_u32(), rng.u64() >> rng.below(64)),
+            1 => wire::put_ack(&mut b, rng.edgy_u32(), rng.u64() >> rng.below(64), rng.one_in(2)),
             2 => {
                 let seq = match rng.below(3) {
                     0 => rng.below(70) as u32,
@@ -88,7 +88,7 @@ fn random_frames(rng: &mut Rng, max_data: usize, peers: &[PeerId], packets: &[Ve
                     _ => rng.edgy_u32(),
                 };
                 let d = data(rng);
-                wire::put_reliable(&mut b, seq, rng.one_in(2), &d)
+                wire::put_reliable(&mut b, seq, rng.one_in(2), &d, rng.one_in(2))
             }
             3 => {
                 let d = data(rng);

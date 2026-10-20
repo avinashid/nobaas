@@ -7,8 +7,8 @@
 //! byte arrives.
 //!
 //! Measured: throughput, peak congestion window and fragments in flight, delay
-//! backoffs and retransmits, and how long the urgent messages took (they share
-//! the reliable queue, so they wait behind the bulk data already queued). With
+//! backoffs and retransmits, and how long the urgent messages took (they have
+//! their own sequence, so they go ahead of the bulk data already queued). With
 //! `--cpu`, the wall-clock time spent in each endpoint (not deterministic).
 //!
 //! cargo run --release -p nobaas-sim --example bulk                  # the three variants

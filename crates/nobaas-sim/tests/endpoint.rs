@@ -481,3 +481,109 @@ fn bulk_transfer_keeps_the_queue_short_for_game_traffic() {
     assert!(p(0.95) < 100, "queueing delay stays bounded: p95 {} ms", p(0.95));
     assert!(secs < 15.0, "and the link is still used: {secs:.1} s");
 }
+
+/// Tags a numbered message with its lane: both arrive as `Lane::Reliable`.
+fn tagged(tag: u8, n: u32, len: usize) -> Vec<u8> {
+    let mut m = vec![tag; len.max(5)];
+    m[1..5].copy_from_slice(&n.to_le_bytes());
+    m
+}
+
+#[test]
+fn urgent_overtakes_queued_reliable_and_each_lane_stays_in_order() {
+    // 2 MiB of reliable data queued on a 2 Mbit/s uplink takes about 8 s to
+    // drain; urgent messages sent meanwhile must not wait for it. 2% loss
+    // exercises retransmission on both streams.
+    let mut sim = pair(NetConfig { loss: 0.02, ..NetConfig::default() }, 22);
+    sim.nodes[0].uplink_bps = Some(2_000_000);
+    for n in 0..32 {
+        sim.send(0, 1, Lane::Reliable, &tagged(b'R', n, 64 << 10)).unwrap();
+    }
+    let (mut sent_at, mut delays, mut order) = (Vec::new(), Vec::new(), (Vec::new(), Vec::new()));
+    for tick in 0..1500u32 {
+        if tick < 100 {
+            sim.send(0, 1, Lane::Urgent, &tagged(b'U', tick, 200)).unwrap();
+            sent_at.push(sim.now);
+        }
+        sim.run_for(Duration::from_millis(10));
+        for (at, e) in sim.take_timed_events(1) {
+            if let Event::Message { lane: Lane::Reliable, data, .. } = e {
+                let n = u32::from_le_bytes(data[1..5].try_into().unwrap());
+                if data[0] == b'U' {
+                    delays.push((at - sent_at[n as usize]).as_millis());
+                    order.1.push(n);
+                } else {
+                    order.0.push(n);
+                }
+            }
+        }
+        if order.0.len() == 32 && order.1.len() == 100 {
+            break;
+        }
+    }
+    assert_eq!(order.0, (0..32).collect::<Vec<_>>(), "reliable: all, in order");
+    assert_eq!(order.1, (0..100).collect::<Vec<_>>(), "urgent: all, in order");
+    // The first goes in the first packet, ahead of the initial window of reliable fragments
+    // (200 B: it fits only if it goes first).
+    let first = delays[0];
+    delays.sort();
+    let p99 = delays[98];
+    println!("urgent one-way delay: first {first} ms, p50 {} ms, p99 {p99} ms (20 ms base)", delays[50]);
+    assert!(first < 40, "urgent goes first in the packet: {first} ms");
+    assert!(p99 < 250, "urgent doesn't wait behind 2 MiB of reliable data: p99 {p99} ms");
+}
+
+#[test]
+fn urgent_stream_repairs_loss_on_its_own() {
+    // Only urgent traffic: its retransmission timer and ACKs must work without
+    // reliable traffic to wake the link.
+    let mut sim = pair(NetConfig::default(), 24);
+    sim.send(0, 1, Lane::Urgent, b"warm").unwrap();
+    sim.run_for(Duration::from_secs(1));
+    sim.take_events(1);
+    let before = sim.nodes[0].endpoint.stats().retransmits;
+    sim.hook = Some(Box::new(|_, _, _| false)); // both copies are lost
+    sim.send(0, 1, Lane::Urgent, b"hit").unwrap();
+    let start = sim.now;
+    sim.run_for(Duration::from_millis(30));
+    sim.hook = None;
+    let delivered = |s: &mut Sim| s.take_events(1).iter().any(|e| matches!(e, Event::Message { .. }));
+    assert!(sim.run_until(Duration::from_secs(5), delivered));
+    let took = (sim.now - start).as_millis();
+    sim.run_for(Duration::from_secs(5));
+    let resent = sim.nodes[0].endpoint.stats().retransmits - before;
+    println!("repaired after {took} ms; {resent} retransmissions");
+    assert!(took < 300, "repaired within an RTO, not a keepalive: {took} ms");
+    assert!(resent <= 2, "and acknowledged, so nothing more is sent: {resent}");
+}
+
+#[test]
+fn urgent_flood_does_not_starve_reliable() {
+    // Both lanes always have data queued on a 2 Mbit/s uplink: each stream has
+    // its own congestion window, so they share the link.
+    let mut sim = pair(NetConfig::default(), 23);
+    sim.nodes[0].uplink_bps = Some(2_000_000);
+    let (mut next, mut got) = ([0u32; 2], [0usize; 2]);
+    let start = sim.now;
+    while sim.now < start + Duration::from_secs(10) {
+        for (i, (tag, lane)) in [(b'R', Lane::Reliable), (b'U', Lane::Urgent)].into_iter().enumerate() {
+            while sim.send(0, 1, lane, &tagged(tag, next[i], 1000)).is_ok() {
+                next[i] += 1;
+            }
+        }
+        sim.run_for(Duration::from_millis(10));
+        for e in sim.take_events(1) {
+            if let Event::Message { data, .. } = e {
+                got[(data[0] == b'U') as usize] += data.len();
+            }
+        }
+    }
+    let share = got[0] as f64 / (got[0] + got[1]) as f64;
+    println!(
+        "10 s: reliable {} kB, urgent {} kB delivered ({:.0}% reliable)",
+        got[0] / 1000,
+        got[1] / 1000,
+        share * 100.0
+    );
+    assert!(share > 0.25, "reliable keeps a fair share under an urgent flood: {:.0}%", share * 100.0);
+}

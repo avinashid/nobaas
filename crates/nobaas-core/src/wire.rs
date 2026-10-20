@@ -59,6 +59,9 @@ const F_RELAYED: u8 = 8;
 const F_PUNCH: u8 = 9;
 const F_PUNCH_ACK: u8 = 10;
 const F_FWD_QUIET: u8 = 11;
+/// The urgent stream: same layout as F_REL / F_ACK, in its own sequence space.
+const F_UREL: u8 = 12;
+const F_UACK: u8 = 13;
 
 pub(crate) const ACK_LEN: usize = 13;
 pub(crate) const REL_OVERHEAD: usize = 8;
@@ -124,14 +127,18 @@ pub(crate) fn encode_data_header(receiver: u32, nonce: u64, out: &mut Vec<u8>) {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Frame<'a> {
     Ping,
+    /// `urgent`: for the urgent stream, which is sequenced apart from the
+    /// reliable one so its messages never wait behind queued reliable data.
     Ack {
         cum: u32,
         bits: u64,
+        urgent: bool,
     },
     Reliable {
         seq: u32,
         fin: bool,
         data: &'a [u8],
+        urgent: bool,
     },
     Unreliable(&'a [u8]),
     Close,
@@ -172,15 +179,18 @@ impl<'a> Iterator for Frames<'a> {
         let (frame, used) = match b[0] {
             F_PING => (Frame::Ping, 1),
             F_CLOSE => (Frame::Close, 1),
-            F_ACK if b.len() >= ACK_LEN => (Frame::Ack { cum: u32le(&b[1..]), bits: u64le(&b[5..]) }, ACK_LEN),
-            F_REL if b.len() >= REL_OVERHEAD => {
+            F_ACK | F_UACK if b.len() >= ACK_LEN => {
+                (Frame::Ack { cum: u32le(&b[1..]), bits: u64le(&b[5..]), urgent: b[0] == F_UACK }, ACK_LEN)
+            }
+            F_REL | F_UREL if b.len() >= REL_OVERHEAD => {
                 let len = u16::from_le_bytes([b[6], b[7]]) as usize;
                 if b.len() < REL_OVERHEAD + len || b[5] & !1 != 0 {
                     self.failed = true;
                     return Some(Err(()));
                 }
                 let data = &b[REL_OVERHEAD..REL_OVERHEAD + len];
-                (Frame::Reliable { seq: u32le(&b[1..]), fin: b[5] & 1 == 1, data }, REL_OVERHEAD + len)
+                let (seq, fin, urgent) = (u32le(&b[1..]), b[5] & 1 == 1, b[0] == F_UREL);
+                (Frame::Reliable { seq, fin, data, urgent }, REL_OVERHEAD + len)
             }
             F_UNREL if b.len() >= UNREL_OVERHEAD => {
                 let len = u16::from_le_bytes([b[1], b[2]]) as usize;
@@ -234,14 +244,14 @@ pub(crate) fn put_close(out: &mut Vec<u8>) {
     out.push(F_CLOSE);
 }
 
-pub(crate) fn put_ack(out: &mut Vec<u8>, cum: u32, bits: u64) {
-    out.push(F_ACK);
+pub(crate) fn put_ack(out: &mut Vec<u8>, cum: u32, bits: u64, urgent: bool) {
+    out.push(if urgent { F_UACK } else { F_ACK });
     out.extend_from_slice(&cum.to_le_bytes());
     out.extend_from_slice(&bits.to_le_bytes());
 }
 
-pub(crate) fn put_reliable(out: &mut Vec<u8>, seq: u32, fin: bool, data: &[u8]) {
-    out.push(F_REL);
+pub(crate) fn put_reliable(out: &mut Vec<u8>, seq: u32, fin: bool, data: &[u8], urgent: bool) {
+    out.push(if urgent { F_UREL } else { F_REL });
     out.extend_from_slice(&seq.to_le_bytes());
     out.push(fin as u8);
     out.extend_from_slice(&(data.len() as u16).to_le_bytes());
@@ -287,9 +297,11 @@ mod tests {
     #[test]
     fn frames_roundtrip() {
         let mut b = Vec::new();
-        put_ack(&mut b, 7, 0b101);
+        put_ack(&mut b, 7, 0b101, false);
+        put_ack(&mut b, 8, 1 << 63, true);
         put_ping(&mut b);
-        put_reliable(&mut b, 9, true, b"abc");
+        put_reliable(&mut b, 9, true, b"abc", false);
+        put_reliable(&mut b, 10, false, b"de", true);
         put_unreliable(&mut b, b"xy");
         put_close(&mut b);
         put_observed(&mut b, b"addr");
@@ -303,9 +315,11 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                Frame::Ack { cum: 7, bits: 5 },
+                Frame::Ack { cum: 7, bits: 5, urgent: false },
+                Frame::Ack { cum: 8, bits: 1 << 63, urgent: true },
                 Frame::Ping,
-                Frame::Reliable { seq: 9, fin: true, data: b"abc" },
+                Frame::Reliable { seq: 9, fin: true, data: b"abc", urgent: false },
+                Frame::Reliable { seq: 10, fin: false, data: b"de", urgent: true },
                 Frame::Unreliable(b"xy"),
                 Frame::Close,
                 Frame::Observed(b"addr"),
@@ -321,13 +335,15 @@ mod tests {
 
     #[test]
     fn truncated_frames_fail_once() {
-        let mut cases: Vec<Vec<u8>> = vec![Vec::new(); 6];
-        put_reliable(&mut cases[0], 1, false, b"hello");
+        let mut cases: Vec<Vec<u8>> = vec![Vec::new(); 8];
+        put_reliable(&mut cases[0], 1, false, b"hello", false);
         put_observed(&mut cases[1], b"addr");
         put_fwd(&mut cases[2], &PeerId([1; 32]), b"pkt", true);
         put_relayed(&mut cases[3], b"ab", b"pkt");
         put_punch(&mut cases[4], true, 3);
         put_fwd(&mut cases[5], &PeerId([1; 32]), b"pkt", false);
+        put_reliable(&mut cases[6], 1, true, b"hi", true);
+        put_ack(&mut cases[7], 1, 2, true);
         for b in cases {
             for cut in 1..b.len() {
                 let r: Vec<_> = frames(&b[..cut]).collect();
@@ -351,7 +367,7 @@ mod tests {
             let len = (next() % 64) as usize;
             let mut b: Vec<u8> = (0..len).map(|_| next() as u8).collect();
             if let Some(f) = b.first_mut() {
-                *f = 1 + *f % 11; // mostly valid frame types
+                *f = 1 + *f % 13; // mostly valid frame types
             }
             for f in frames(&b) {
                 if f.is_err() {

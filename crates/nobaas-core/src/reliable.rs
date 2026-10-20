@@ -67,32 +67,78 @@ struct Fragment {
     epoch: u32,
     /// Sent again as a tail probe: its ACK can't be timed (Karn's rule).
     probed: bool,
-    /// Every transmission (first and retransmissions) is sent twice.
-    urgent: bool,
-    /// When to send the duplicate copy of the latest transmission.
+    /// When to send the duplicate copy of the latest transmission (urgent only).
     dup_at: Option<Instant>,
 }
 
-pub(crate) struct RelSend {
+/// Index of the reliable and the urgent stream in `RelSend::streams`.
+const REL: usize = 0;
+const URG: usize = 1;
+
+/// One sequence space: reliable or urgent messages, each delivered in order.
+struct Stream {
     next_seq: u32,
     /// One past the newest fragment sent so far.
     sent_end: u32,
-    /// (seq, fin, urgent, data)
-    queued: VecDeque<(u32, bool, bool, Vec<u8>)>,
+    /// (seq, fin, data)
+    queued: VecDeque<(u32, bool, Vec<u8>)>,
     inflight: BTreeMap<u32, Fragment>,
     /// `(due, seq)` and `(dup_at, seq)` of every in-flight fragment, so the
     /// earliest is found without walking `inflight` on each packet.
     by_due: BTreeSet<(Instant, u32)>,
     by_dup: BTreeSet<(Instant, u32)>,
     buffered: usize,
+    /// Wire bytes of one copy of each fragment in flight (data and frame header).
+    inflight_bytes: usize,
+    /// When to send a tail-loss probe; one per flight, re-armed on ACK progress.
+    probe_at: Option<Instant>,
+    probe_used: bool,
+    retransmits: u64,
+    /// Fragments sent for the first time.
+    fragments_sent: u64,
+    probes: u64,
+}
+
+impl Stream {
+    fn new() -> Self {
+        Stream {
+            next_seq: 0,
+            sent_end: 0,
+            queued: VecDeque::new(),
+            inflight: BTreeMap::new(),
+            by_due: BTreeSet::new(),
+            by_dup: BTreeSet::new(),
+            buffered: 0,
+            inflight_bytes: 0,
+            probe_at: None,
+            probe_used: false,
+            retransmits: 0,
+            fragments_sent: 0,
+            probes: 0,
+        }
+    }
+
+    fn has_due(&self, now: Instant) -> bool {
+        earliest(&self.by_due).is_some_and(|d| d <= now)
+            || self.probe_at.is_some_and(|p| p <= now)
+            || earliest(&self.by_dup).is_some_and(|d| d <= now)
+    }
+}
+
+/// The sending side of a link's reliable and urgent streams. They have their
+/// own sequence numbers, so an urgent message never waits for reliable data
+/// queued before it, but one RTT estimate and one congestion window: urgent
+/// fragments take free window slots first, up to half the window while
+/// reliable data is waiting, so neither can starve the other. Urgent fragments
+/// fill the window by wire bytes (both copies), as they are mostly small: 200
+/// inputs a second take a few slots, not 20 per round trip at 100 ms.
+pub(crate) struct RelSend {
+    streams: [Stream; 2],
     srtt: Option<Duration>,
     rttvar: Duration,
     rto: Duration,
-    pub(crate) retransmits: u64,
-    /// Fragments sent for the first time.
-    pub(crate) fragments_sent: u64,
     pub(crate) failed: bool,
-    /// AIMD congestion window in fragments (NewReno-style), capped by the link window.
+    /// AIMD congestion window in slots (NewReno-style), for both streams.
     cwnd: f64,
     ssthresh: f64,
     /// No second reduction until this time (one per round trip).
@@ -102,10 +148,6 @@ pub(crate) struct RelSend {
     /// Queueing delay of the latest RTT sample (sample − min_rtt); none before the first.
     queue_delay: Option<Duration>,
     pub(crate) delay_backoffs: u64,
-    /// When to send a tail-loss probe; one per flight, re-armed on ACK progress.
-    probe_at: Option<Instant>,
-    probe_used: bool,
-    pub(crate) probes: u64,
     pub(crate) urgent_copies: u64,
 }
 
@@ -117,18 +159,10 @@ pub(crate) enum PushError {
 impl RelSend {
     pub(crate) fn new() -> Self {
         RelSend {
-            next_seq: 0,
-            sent_end: 0,
-            queued: VecDeque::new(),
-            inflight: BTreeMap::new(),
-            by_due: BTreeSet::new(),
-            by_dup: BTreeSet::new(),
-            buffered: 0,
+            streams: [Stream::new(), Stream::new()],
             srtt: None,
             rttvar: Duration::ZERO,
             rto: INITIAL_RTO,
-            retransmits: 0,
-            fragments_sent: 0,
             failed: false,
             cwnd: INITIAL_CWND,
             ssthresh: f64::INFINITY,
@@ -137,15 +171,35 @@ impl RelSend {
             path_min_rtt: None,
             queue_delay: None,
             delay_backoffs: 0,
-            probe_at: None,
-            probe_used: false,
-            probes: 0,
             urgent_copies: 0,
         }
     }
 
-    fn window(&self, max: usize) -> usize {
-        (self.cwnd as usize).clamp(MIN_CWND as usize, max.max(1))
+    /// The congestion window, in slots, for both streams together.
+    fn window(&self) -> usize {
+        (self.cwnd as usize).max(MIN_CWND as usize)
+    }
+
+    /// Window slots the urgent fragments in flight take: a slot is a full fragment on the wire.
+    fn urgent_slots(&self) -> usize {
+        (2 * self.streams[URG].inflight_bytes).div_ceil(REL_OVERHEAD + FRAGMENT)
+    }
+
+    /// Window slots in use: reliable fragments, and urgent ones by size.
+    fn slots(&self) -> usize {
+        self.streams[REL].inflight.len() + self.urgent_slots()
+    }
+
+    /// Whether stream `u` may send a new fragment: the congestion window is
+    /// shared, and urgent fragments fill at most half of it while reliable data
+    /// waits. Each stream also stays within `max` fragments, the receiver's window.
+    fn may_send_new(&self, u: usize, max: usize) -> bool {
+        let w = self.window();
+        let st = &self.streams[u];
+        !st.queued.is_empty()
+            && st.inflight.len() < max.max(1)
+            && self.slots() < w
+            && (u == REL || self.streams[REL].queued.is_empty() || self.urgent_slots() < w.div_ceil(2))
     }
 
     /// Cuts the window to `keep` of the fragments in flight, at most once per round trip.
@@ -153,14 +207,15 @@ impl RelSend {
         if now < self.recover_until {
             return;
         }
-        self.ssthresh = (self.inflight.len() as f64 * keep).max(MIN_CWND);
+        self.ssthresh = (self.slots() as f64 * keep).max(MIN_CWND);
         self.cwnd = self.ssthresh;
         self.recover_until = now + self.srtt.unwrap_or(self.rto);
     }
 
-    fn arm_probe(&mut self, now: Instant) {
-        self.probe_at = match self.srtt {
-            Some(srtt) if !self.probe_used && !self.inflight.is_empty() => {
+    fn arm_probe(&mut self, u: usize, now: Instant) {
+        let st = &mut self.streams[u];
+        st.probe_at = match self.srtt {
+            Some(srtt) if !st.probe_used && !st.inflight.is_empty() => {
                 Some(now + srtt + (self.rttvar * 2).max(Duration::from_millis(1)) + PROBE_SLACK)
             }
             _ => None,
@@ -175,10 +230,23 @@ impl RelSend {
         self.cwnd as u32
     }
 
+    /// Window slots in use, comparable with `cwnd`: see `slots`.
     pub(crate) fn inflight(&self) -> u32 {
-        self.inflight.len() as u32
+        self.slots() as u32
     }
 
+    /// Fragments sent for the first time, both streams.
+    pub(crate) fn fragments_sent(&self) -> u64 {
+        self.streams.iter().map(|s| s.fragments_sent).sum()
+    }
+
+    /// Fragments sent again (timeouts, fast retransmits, tail probes), both streams.
+    pub(crate) fn retransmits(&self) -> u64 {
+        self.streams.iter().map(|s| s.retransmits).sum()
+    }
+
+    /// Queues a message on the urgent or the reliable stream; each has its own
+    /// `max_buffer`, so a full reliable buffer never refuses an urgent message.
     pub(crate) fn push_message(
         &mut self,
         data: &[u8],
@@ -186,28 +254,31 @@ impl RelSend {
         max_message: usize,
         urgent: bool,
     ) -> Result<(), PushError> {
+        let st = &mut self.streams[urgent as usize];
         if data.len() > max_message {
             return Err(PushError::TooLarge);
         }
-        if self.buffered + data.len() > max_buffer {
+        if st.buffered + data.len() > max_buffer {
             return Err(PushError::BufferFull);
         }
         let count = data.len().div_ceil(FRAGMENT).max(1);
-        if self.next_seq.checked_add(count as u32).is_none() {
+        if st.next_seq.checked_add(count as u32).is_none() {
             return Err(PushError::BufferFull);
         }
         for i in 0..count {
             let chunk = &data[(i * FRAGMENT).min(data.len())..((i + 1) * FRAGMENT).min(data.len())];
-            self.queued.push_back((self.next_seq, i + 1 == count, urgent, chunk.to_vec()));
-            self.next_seq += 1;
+            st.queued.push_back((st.next_seq, i + 1 == count, chunk.to_vec()));
+            st.next_seq += 1;
         }
-        self.buffered += data.len();
+        st.buffered += data.len();
         Ok(())
     }
 
-    pub(crate) fn on_ack(&mut self, now: Instant, cum: u32, bits: u64) {
+    pub(crate) fn on_ack(&mut self, now: Instant, cum: u32, bits: u64, urgent: bool) {
+        let u = urgent as usize;
+        let st = &mut self.streams[u];
         let mut sample = None;
-        let mut acked: Vec<u32> = self.inflight.range(..cum).map(|(&s, _)| s).collect();
+        let mut acked: Vec<u32> = st.inflight.range(..cum).map(|(&s, _)| s).collect();
         for i in 0..64u32 {
             if bits >> i & 1 == 1 {
                 if let Some(s) = cum.checked_add(1 + i) {
@@ -216,15 +287,22 @@ impl RelSend {
             }
         }
         let mut newly = 0usize;
+        // Window slots acknowledged: the window grows by what the fragments took.
+        let mut slots = 0.0;
         let mut highest = None;
         for s in acked {
-            if let Some(f) = self.inflight.remove(&s) {
-                self.by_due.remove(&(f.due, s));
+            if let Some(f) = st.inflight.remove(&s) {
+                st.by_due.remove(&(f.due, s));
                 if let Some(d) = f.dup_at {
-                    self.by_dup.remove(&(d, s));
+                    st.by_dup.remove(&(d, s));
                 }
-                self.buffered -= f.data.len();
+                st.buffered -= f.data.len();
+                st.inflight_bytes -= REL_OVERHEAD + f.data.len();
                 newly += 1;
+                slots += match urgent {
+                    true => (2 * (REL_OVERHEAD + f.data.len())) as f64 / (REL_OVERHEAD + FRAGMENT) as f64,
+                    false => 1.0,
+                };
                 highest = highest.max(Some(s));
                 if f.tries == 1 && !f.probed {
                     sample = Some(now - f.sent_at);
@@ -247,9 +325,9 @@ impl RelSend {
             }
         } else if newly > 0 {
             if self.cwnd < self.ssthresh {
-                self.cwnd += newly as f64;
+                self.cwnd += slots;
             } else {
-                self.cwnd += newly as f64 / self.cwnd;
+                self.cwnd += slots / self.cwnd;
             }
             self.cwnd = self.cwnd.min(65536.0);
         }
@@ -258,20 +336,21 @@ impl RelSend {
         if let Some(h) = highest {
             let srtt = self.srtt.unwrap_or(self.rto);
             let reorder = self.min_rtt.unwrap_or(srtt) / 4;
-            for (&s, f) in self.inflight.range_mut(..h.saturating_sub(DUP_THRESHOLD - 1)) {
+            let st = &mut self.streams[u];
+            for (&s, f) in st.inflight.range_mut(..h.saturating_sub(DUP_THRESHOLD - 1)) {
                 debug_assert!(s < h);
                 if !f.fast && f.due > now && h >= f.epoch.saturating_add(DUP_THRESHOLD - 1) {
                     f.fast = true;
                     let due = f.due.min(now.max(f.sent_at + srtt + reorder));
-                    self.by_due.remove(&(f.due, s));
-                    self.by_due.insert((due, s));
+                    st.by_due.remove(&(f.due, s));
+                    st.by_due.insert((due, s));
                     f.due = due;
                 }
             }
         }
         if newly > 0 {
-            self.probe_used = false;
-            self.arm_probe(now);
+            self.streams[u].probe_used = false;
+            self.arm_probe(u, now);
         }
     }
 
@@ -308,24 +387,31 @@ impl RelSend {
     }
 
     pub(crate) fn has_sendable(&self, now: Instant, window: usize) -> bool {
-        (!self.queued.is_empty() && self.inflight.len() < self.window(window))
-            || earliest(&self.by_due).is_some_and(|d| d <= now)
-            || self.probe_at.is_some_and(|p| p <= now)
-            || earliest(&self.by_dup).is_some_and(|d| d <= now)
+        (0..2).any(|u| self.may_send_new(u, window) || self.streams[u].has_due(now))
     }
 
     pub(crate) fn next_due(&self) -> Option<Instant> {
-        [earliest(&self.by_due), self.probe_at, earliest(&self.by_dup)].into_iter().flatten().min()
+        let due = |s: &Stream| [earliest(&s.by_due), s.probe_at, earliest(&s.by_dup)];
+        self.streams.iter().flat_map(due).flatten().min()
     }
 
-    /// Appends due retransmissions, then new fragments, while they fit in `max` bytes.
+    /// Appends the urgent stream's frames, then the reliable stream's, while they fit in `max` bytes.
     pub(crate) fn write_frames(&mut self, now: Instant, window: usize, out: &mut Vec<u8>, max: usize) {
+        for u in [URG, REL] {
+            self.write_stream(u, now, window, out, max);
+        }
+    }
+
+    /// Appends due retransmissions, then new fragments, of stream `u`.
+    fn write_stream(&mut self, u: usize, now: Instant, window: usize, out: &mut Vec<u8>, max: usize) {
+        let urgent = u == URG;
         let mut lost = false;
         let mut timed_out = false;
         let mut resent = false;
-        let sent_end = self.sent_end;
-        for seq in due_by_seq(&self.by_due, now) {
-            let f = self.inflight.get_mut(&seq).expect("indexed fragment in flight");
+        let st = &mut self.streams[u];
+        let sent_end = st.sent_end;
+        for seq in due_by_seq(&st.by_due, now) {
+            let f = st.inflight.get_mut(&seq).expect("indexed fragment in flight");
             if out.len() + REL_OVERHEAD + f.data.len() > max {
                 break;
             }
@@ -335,75 +421,78 @@ impl RelSend {
             f.fast = false;
             f.epoch = sent_end;
             if let Some(d) = f.dup_at {
-                self.by_dup.remove(&(d, seq));
+                st.by_dup.remove(&(d, seq));
             }
-            f.dup_at = f.urgent.then_some(now + URGENT_GAP);
+            f.dup_at = urgent.then_some(now + URGENT_GAP);
             if let Some(d) = f.dup_at {
-                self.by_dup.insert((d, seq));
+                st.by_dup.insert((d, seq));
             }
-            wire::put_reliable(out, seq, f.fin, &f.data);
+            wire::put_reliable(out, seq, f.fin, &f.data, urgent);
             f.tries += 1;
             if f.tries > MAX_TRIES {
                 self.failed = true;
             }
             f.sent_at = now;
             let backoff = self.rto.saturating_mul(1 << (f.tries - 1).min(8)).min(MAX_BACKOFF);
-            self.by_due.remove(&(f.due, seq));
+            st.by_due.remove(&(f.due, seq));
             f.due = now + backoff;
-            self.by_due.insert((f.due, seq));
-            self.retransmits += 1;
+            st.by_due.insert((f.due, seq));
+            st.retransmits += 1;
         }
         if lost {
             let random = !timed_out && self.queue_delay.is_some_and(|q| q < RANDOM_LOSS_QUEUE);
             self.back_off(now, if random { RANDOM_LOSS_CUT } else { LOSS_CUT });
         }
-        for seq in due_by_seq(&self.by_dup, now) {
-            let f = self.inflight.get_mut(&seq).expect("indexed fragment in flight");
+        let st = &mut self.streams[u];
+        for seq in due_by_seq(&st.by_dup, now) {
+            let f = st.inflight.get_mut(&seq).expect("indexed fragment in flight");
             if out.len() + REL_OVERHEAD + f.data.len() > max {
                 break;
             }
-            self.by_dup.remove(&(f.dup_at.expect("indexed duplicate"), seq));
-            wire::put_reliable(out, seq, f.fin, &f.data);
+            st.by_dup.remove(&(f.dup_at.expect("indexed duplicate"), seq));
+            wire::put_reliable(out, seq, f.fin, &f.data, urgent);
             // Still timed from the first copy: at most URGENT_GAP off, whereas no
             // samples at all would leave an urgent-only link's RTO stale and fire
             // it on every queued message once the sender's uplink backs up.
             f.dup_at = None;
             self.urgent_copies += 1;
         }
-        if earliest(&self.by_due).is_some_and(|d| d <= now) {
+        if earliest(&st.by_due).is_some_and(|d| d <= now) {
             return; // retransmissions first
         }
-        let window = self.window(window);
-        let can_send_new = !self.queued.is_empty() && self.inflight.len() < window;
-        if self.probe_at.is_some_and(|p| p <= now) {
-            self.probe_at = None;
+        let can_send_new = self.may_send_new(u, window);
+        let st = &mut self.streams[u];
+        if st.probe_at.is_some_and(|p| p <= now) {
+            st.probe_at = None;
             // New data or a retransmission probes just as well.
             if !can_send_new && !resent {
-                if let Some((&seq, f)) = self.inflight.iter_mut().next_back() {
+                if let Some((&seq, f)) = st.inflight.iter_mut().next_back() {
                     if out.len() + REL_OVERHEAD + f.data.len() <= max {
-                        wire::put_reliable(out, seq, f.fin, &f.data);
+                        wire::put_reliable(out, seq, f.fin, &f.data, urgent);
                         f.probed = true;
-                        self.probe_used = true;
-                        self.probes += 1;
-                        self.retransmits += 1;
+                        st.probe_used = true;
+                        st.probes += 1;
+                        st.retransmits += 1;
                     }
                 }
             }
         }
         let mut sent_new = false;
-        while self.inflight.len() < window {
-            let Some((_, _, _, data)) = self.queued.front() else { break };
+        while self.may_send_new(u, window) {
+            let st = &mut self.streams[u];
+            let Some((_, _, data)) = st.queued.front() else { break };
             if out.len() + REL_OVERHEAD + data.len() > max {
                 break;
             }
-            let (seq, fin, urgent, data) = self.queued.pop_front().unwrap();
-            wire::put_reliable(out, seq, fin, &data);
+            let (seq, fin, data) = st.queued.pop_front().unwrap();
+            wire::put_reliable(out, seq, fin, &data, urgent);
             let dup_at = urgent.then_some(now + URGENT_GAP);
-            self.by_due.insert((now + self.rto, seq));
+            st.by_due.insert((now + self.rto, seq));
+            st.inflight_bytes += REL_OVERHEAD + data.len();
             if let Some(d) = dup_at {
-                self.by_dup.insert((d, seq));
+                st.by_dup.insert((d, seq));
             }
-            self.inflight.insert(
+            st.inflight.insert(
                 seq,
                 Fragment {
                     fin,
@@ -414,16 +503,16 @@ impl RelSend {
                     fast: false,
                     epoch: seq + 1,
                     probed: false,
-                    urgent,
                     dup_at,
                 },
             );
             sent_new = true;
-            self.sent_end = seq + 1;
-            self.fragments_sent += 1;
+            st.sent_end = seq + 1;
+            st.fragments_sent += 1;
         }
-        if sent_new || (self.probe_at.is_none() && !self.probe_used) {
-            self.arm_probe(now);
+        let st = &self.streams[u];
+        if sent_new || (st.probe_at.is_none() && !st.probe_used) {
+            self.arm_probe(u, now);
         }
     }
 }
@@ -502,7 +591,7 @@ mod tests {
         tx.write_frames(now, 256, &mut out, 100_000);
         frames(&out)
             .map(|f| match f.unwrap() {
-                Frame::Reliable { seq, fin, data } => (seq, fin, data.to_vec()),
+                Frame::Reliable { seq, fin, data, .. } => (seq, fin, data.to_vec()),
                 _ => unreachable!(),
             })
             .collect()
@@ -533,13 +622,13 @@ mod tests {
         }
         assert_eq!(drain(&mut tx, Instant::ZERO).len(), 3);
         // seq 0 lost, 1 and 2 arrived: cum=0, bits for 1 and 2
-        tx.on_ack(Instant::from_millis(50), 0, 0b11);
+        tx.on_ack(Instant::from_millis(50), 0, 0b11, false);
         assert!(drain(&mut tx, Instant::from_millis(100)).is_empty());
         let re = drain(&mut tx, Instant::from_millis(400));
         assert_eq!(re, vec![(0, true, vec![0])]);
-        assert_eq!(tx.retransmits, 1);
-        assert_eq!(tx.fragments_sent, 3, "a retransmission is not a new fragment");
-        tx.on_ack(Instant::from_millis(450), 3, 0);
+        assert_eq!(tx.retransmits(), 1);
+        assert_eq!(tx.fragments_sent(), 3, "a retransmission is not a new fragment");
+        tx.on_ack(Instant::from_millis(450), 3, 0, false);
         assert_eq!(tx.next_due(), None);
     }
 
@@ -559,7 +648,7 @@ mod tests {
         let mut resent = 0;
         let mut t = Instant::from_millis(130);
         for k in 1..16u32 {
-            tx.on_ack(t, 0, (1u64 << k) - 1);
+            tx.on_ack(t, 0, (1u64 << k) - 1, false);
             resent += resends_of_0(&drain(&mut tx, t));
             t = t + Duration::from_millis(20);
         }
@@ -569,7 +658,7 @@ mod tests {
         // it goes once more (at the ACK for 22, three past the 20 sent after
         // it), and only once while those later fragments are acknowledged.
         for k in 16..32u32 {
-            tx.on_ack(t, 0, (1u64 << k) - 1);
+            tx.on_ack(t, 0, (1u64 << k) - 1, false);
             resent += resends_of_0(&drain(&mut tx, t));
             t = t + Duration::from_millis(10);
         }
@@ -588,11 +677,11 @@ mod tests {
         // Seq 0 is overtaken by 1..8: it is resent only if still missing a
         // quarter RTT after its ACK was due.
         let t = Instant::from_millis(100);
-        tx.on_ack(t, 0, 0xff);
+        tx.on_ack(t, 0, 0xff, false);
         assert!(drain(&mut tx, t).iter().all(|f| f.0 != 0));
         assert_eq!(tx.next_due(), Some(Instant::from_millis(125)));
-        tx.on_ack(Instant::from_millis(110), 16, 0);
-        assert_eq!(tx.retransmits, 0);
+        tx.on_ack(Instant::from_millis(110), 16, 0, false);
+        assert_eq!(tx.retransmits(), 0);
         assert!(tx.cwnd() > INITIAL_CWND as u32, "no window cut: {}", tx.cwnd());
         // Still missing after the window: resent, and the window is cut then.
         let mut tx = RelSend::new();
@@ -601,7 +690,7 @@ mod tests {
             tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
         }
         drain(&mut tx, Instant::ZERO);
-        tx.on_ack(t, 0, 0xff);
+        tx.on_ack(t, 0, 0xff, false);
         let cwnd = tx.cwnd();
         assert_eq!(drain(&mut tx, Instant::from_millis(125)), vec![(0, true, vec![0])]);
         assert!(tx.cwnd() < cwnd);
@@ -626,17 +715,17 @@ mod tests {
         };
         // 1 and 2 set the minimum RTT; 3..8 come back 5 ms later; 0 is lost.
         let mut tx = sent();
-        tx.on_ack(Instant::from_millis(100), 0, 0b11);
-        tx.on_ack(Instant::from_millis(100) + RANDOM_LOSS_QUEUE, 0, 0xff);
+        tx.on_ack(Instant::from_millis(100), 0, 0b11, false);
+        tx.on_ack(Instant::from_millis(100) + RANDOM_LOSS_QUEUE, 0, 0xff, false);
         assert_eq!(tx.delay_backoffs, 0);
         assert_eq!(drain(&mut tx, Instant::from_millis(200)), vec![(0, true, vec![0])]);
         assert_eq!(tx.ssthresh, 8.0 * LOSS_CUT);
         // No queueing, but 15 time out (0 was acknowledged): halved too.
         let mut tx = sent();
-        tx.on_ack(Instant::from_millis(100), 1, 0);
-        let due = earliest(&tx.by_due).unwrap();
+        tx.on_ack(Instant::from_millis(100), 1, 0, false);
+        let due = earliest(&tx.streams[REL].by_due).unwrap();
         assert_eq!(drain(&mut tx, due).len(), 15);
-        assert_eq!(tx.retransmits, 15);
+        assert_eq!(tx.retransmits(), 15);
         assert_eq!(tx.ssthresh, 15.0 * LOSS_CUT);
     }
 
@@ -649,15 +738,15 @@ mod tests {
         }
         assert_eq!(drain(&mut tx, Instant::ZERO).len(), 16);
         // Seq 0 sets the minimum RTT; seq 1 comes back 30 ms later, over QUEUE_TARGET.
-        tx.on_ack(Instant::from_millis(100), 1, 0);
+        tx.on_ack(Instant::from_millis(100), 1, 0, false);
         assert_eq!(tx.delay_backoffs, 0);
-        tx.on_ack(Instant::from_millis(130), 2, 0);
+        tx.on_ack(Instant::from_millis(130), 2, 0, false);
         assert_eq!(tx.delay_backoffs, 1);
-        assert_eq!(tx.retransmits, 0);
+        assert_eq!(tx.retransmits(), 0);
         assert_eq!(tx.ssthresh, 14.0 * DELAY_CUT);
         assert_eq!(tx.cwnd(), 11, "14 in flight: 85% kept, not halved");
         // Only one cut per round trip.
-        tx.on_ack(Instant::from_millis(140), 3, 0);
+        tx.on_ack(Instant::from_millis(140), 3, 0, false);
         assert_eq!(tx.delay_backoffs, 1);
     }
 
@@ -687,11 +776,11 @@ mod tests {
         assert!(probe < Instant::ZERO + tx.rto, "{probe:?} vs rto {:?}", tx.rto);
         assert!(drain(&mut tx, Instant::from_micros(probe.as_micros() - 1000)).is_empty());
         assert_eq!(drain(&mut tx, probe), vec![(0, true, b"a".to_vec())]);
-        assert_eq!(tx.probes, 1);
+        assert_eq!(tx.streams[REL].probes, 1);
         // Only one probe per flight; the probed copy's ACK gives no RTT sample.
         assert_eq!(tx.next_due(), Some(Instant::ZERO + tx.rto));
         let srtt = tx.srtt();
-        tx.on_ack(probe + Duration::from_millis(40), 1, 0);
+        tx.on_ack(probe + Duration::from_millis(40), 1, 0, false);
         assert_eq!(tx.srtt(), srtt);
         assert_eq!(tx.next_due(), None);
     }
@@ -705,25 +794,127 @@ mod tests {
         assert_eq!(drain(&mut tx, Instant::ZERO + URGENT_GAP), vec![(0, true, b"u".to_vec())]);
         assert_eq!(tx.urgent_copies, 1);
         // Acknowledged: nothing more goes out, and the first copy is timed.
-        tx.on_ack(Instant::from_millis(30), 1, 0);
+        tx.on_ack(Instant::from_millis(30), 1, 0, true);
         assert_eq!(tx.next_due(), None);
         assert_eq!(tx.srtt(), Some(Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn urgent_goes_ahead_of_queued_reliable() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        for i in 0..64u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(drain(&mut tx, Instant::ZERO).len(), 16, "the window is full");
+        tx.push_message(b"u", 1 << 20, 1 << 20, true).ok().unwrap();
+        assert!(drain(&mut tx, Instant::from_millis(1)).is_empty(), "urgent stays within the window");
+        // An ACK frees two slots: the urgent fragment takes the first, in its
+        // own sequence space, and goes first in the packet.
+        tx.on_ack(Instant::from_millis(100), 1, 0, false);
+        let mut out = Vec::new();
+        tx.write_frames(Instant::from_millis(100), 256, &mut out, 100_000);
+        let got: Vec<_> = frames(&out).map(|f| f.unwrap()).collect();
+        assert_eq!(got[0], Frame::Reliable { seq: 0, fin: true, data: b"u", urgent: true });
+        assert!(matches!(got[1], Frame::Reliable { seq: 16, urgent: false, .. }), "{got:?}");
+    }
+
+    #[test]
+    fn urgent_takes_at_most_half_the_window_while_reliable_waits() {
+        // 1000 B urgent fragments, sent twice, take about two slots each.
+        let mut tx = RelSend::new();
+        for i in 0..64u8 {
+            tx.push_message(&[i; 1000], 1 << 20, 1 << 20, true).ok().unwrap();
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        drain(&mut tx, Instant::ZERO);
+        assert_eq!([tx.urgent_slots(), tx.slots()], [8, 16]);
+        assert_eq!([tx.streams[URG].inflight.len(), tx.streams[REL].inflight.len()], [4, 8]);
+        // With nothing else to send, urgent may fill the window (15 slots used
+        // before the last fragment, like a reliable one sent at 15 of 16).
+        let mut tx = RelSend::new();
+        for i in 0..64u8 {
+            tx.push_message(&[i; 1000], 1 << 20, 1 << 20, true).ok().unwrap();
+        }
+        drain(&mut tx, Instant::ZERO);
+        assert_eq!(tx.streams[URG].inflight.len(), 9);
+        // Small inputs barely dent the window: 64 of 8 B, sent twice, take 2 slots.
+        let mut tx = RelSend::new();
+        for i in 0..64u8 {
+            tx.push_message(&[i; 8], 1 << 20, 1 << 20, true).ok().unwrap();
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        drain(&mut tx, Instant::ZERO);
+        assert_eq!([tx.streams[URG].inflight.len(), tx.streams[REL].inflight.len()], [64, 14]);
+    }
+
+    #[test]
+    fn the_window_grows_by_the_slots_acknowledged() {
+        // Sixteen 8 B urgent fragments take half a slot between them, so their
+        // ACKs grow the window by that much, not by sixteen fragments.
+        let mut tx = RelSend::new();
+        for i in 0..16u8 {
+            tx.push_message(&[i; 8], 1 << 20, 1 << 20, true).ok().unwrap();
+        }
+        drain(&mut tx, Instant::ZERO);
+        tx.on_ack(Instant::from_millis(50), 16, 0, true);
+        assert_eq!(tx.cwnd(), 16);
+        // A reliable fragment is a whole slot.
+        tx.push_message(b"r", 1 << 20, 1 << 20, false).ok().unwrap();
+        drain(&mut tx, Instant::from_millis(50));
+        tx.on_ack(Instant::from_millis(100), 1, 0, false);
+        assert_eq!(tx.cwnd(), 17);
+    }
+
+    #[test]
+    fn each_stream_stays_within_the_receivers_window() {
+        // Small urgent fragments take a fraction of a slot each, but the
+        // receiver buffers at most `max` fragments of each stream.
+        let mut tx = RelSend::new();
+        for i in 0..64u8 {
+            tx.push_message(&[i; 8], 1 << 20, 1 << 20, true).ok().unwrap();
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        tx.write_frames(Instant::ZERO, 8, &mut Vec::new(), 100_000);
+        assert_eq!([tx.streams[URG].inflight.len(), tx.streams[REL].inflight.len()], [8, 8]);
+    }
+
+    #[test]
+    fn each_stream_has_its_own_buffer() {
+        let mut tx = RelSend::new();
+        assert!(tx.push_message(&[0; 600], 1000, 1 << 20, false).is_ok());
+        assert!(tx.push_message(&[0; 600], 1000, 1 << 20, false).is_err());
+        assert!(tx.push_message(&[0; 600], 1000, 1 << 20, true).is_ok());
     }
 
     /// The indexes match the fragments, and the lookups agree with the full
     /// scans they replace.
     fn check(tx: &RelSend, now: Instant, window: usize) {
-        let due: BTreeSet<_> = tx.inflight.iter().map(|(&s, f)| (f.due, s)).collect();
-        let dup: BTreeSet<_> = tx.inflight.iter().filter_map(|(&s, f)| f.dup_at.map(|d| (d, s))).collect();
-        assert_eq!(tx.by_due, due);
-        assert_eq!(tx.by_dup, dup);
-        let sendable = (!tx.queued.is_empty() && tx.inflight.len() < tx.window(window))
-            || tx.inflight.values().any(|f| f.due <= now)
-            || tx.probe_at.is_some_and(|p| p <= now)
-            || tx.inflight.values().any(|f| f.dup_at.is_some_and(|d| d <= now));
+        let w = tx.window();
+        let wire = |st: &Stream| st.inflight.values().map(|f| REL_OVERHEAD + f.data.len()).sum::<usize>();
+        let urgent_slots = (2 * wire(&tx.streams[URG])).div_ceil(REL_OVERHEAD + FRAGMENT);
+        let slots = tx.streams[REL].inflight.len() + urgent_slots;
+        let mut sendable = false;
+        for (u, st) in tx.streams.iter().enumerate() {
+            assert_eq!(st.inflight_bytes, wire(st));
+            let due: BTreeSet<_> = st.inflight.iter().map(|(&s, f)| (f.due, s)).collect();
+            let dup: BTreeSet<_> = st.inflight.iter().filter_map(|(&s, f)| f.dup_at.map(|d| (d, s))).collect();
+            assert_eq!(st.by_due, due);
+            assert_eq!(st.by_dup, dup);
+            let urgent_room = tx.streams[REL].queued.is_empty() || urgent_slots < w.div_ceil(2);
+            let room = st.inflight.len() < window && slots < w && (u == REL || urgent_room);
+            sendable |= (!st.queued.is_empty() && room)
+                || st.inflight.values().any(|f| f.due <= now)
+                || st.probe_at.is_some_and(|p| p <= now)
+                || st.inflight.values().any(|f| f.dup_at.is_some_and(|d| d <= now));
+        }
         assert_eq!(tx.has_sendable(now, window), sendable);
-        let dups = tx.inflight.values().filter_map(|f| f.dup_at);
-        let next = tx.inflight.values().map(|f| f.due).chain(tx.probe_at).chain(dups).min();
+        let next = tx
+            .streams
+            .iter()
+            .flat_map(|st| st.inflight.values().flat_map(|f| [Some(f.due), f.dup_at]).chain([st.probe_at]))
+            .flatten()
+            .min();
         assert_eq!(tx.next_due(), next);
     }
 
@@ -737,15 +928,15 @@ mod tests {
                 x ^= x << 17;
                 x % n
             };
-            let (mut tx, mut rx) = (RelSend::new(), RelRecv::new());
+            let (mut tx, mut rx) = (RelSend::new(), [RelRecv::new(), RelRecv::new()]);
             let window = 64;
             // One-way delay: a LAN (a retransmission can go out while its
             // urgent copy is pending) or a WAN.
             let base = if seed % 2 == 0 { 20_000 } else { 400 };
             let mut now = Instant::ZERO;
-            // (arrival, frame) on a lossy link that reorders, and ACKs back.
-            let mut to_rx: Vec<(Instant, u32, bool, Vec<u8>)> = Vec::new();
-            let mut to_tx: Vec<(Instant, u32, u64)> = Vec::new();
+            // (arrival, stream, frame) on a lossy link that reorders, and ACKs back.
+            let mut to_rx: Vec<(Instant, usize, u32, bool, Vec<u8>)> = Vec::new();
+            let mut to_tx: Vec<(Instant, usize, u32, u64)> = Vec::new();
             let mut delivered = Vec::new();
             for _ in 0..1500 {
                 now = now + Duration::from_micros(rand(base * 2 / 5));
@@ -754,45 +945,51 @@ mod tests {
                     let _ = tx.push_message(&vec![7; len], 1 << 16, 1 << 20, rand(5) == 0);
                     check(&tx, now, window);
                 }
-                // Retransmissions go first, in sequence order, as the scan sent them.
-                let due: Vec<u32> = tx.inflight.iter().filter(|(_, f)| f.due <= now).map(|(&s, _)| s).collect();
-                let (retx, probes) = (tx.retransmits, tx.probes);
+                // Retransmissions go first in each stream, in sequence order, as the scan sent them.
+                let due: Vec<Vec<u32>> = (0..2)
+                    .map(|u| tx.streams[u].inflight.iter().filter(|(_, f)| f.due <= now).map(|(&s, _)| s).collect())
+                    .collect();
+                let before: Vec<u64> = tx.streams.iter().map(|s| s.retransmits - s.probes).collect();
                 let mut out = Vec::new();
                 tx.write_frames(now, window, &mut out, 1200 + rand(3000) as usize);
                 check(&tx, now, window);
-                let resent = (tx.retransmits - retx - (tx.probes - probes)) as usize;
-                let sent: Vec<u32> = frames(&out)
-                    .take(resent)
-                    .map(|f| match f.unwrap() {
-                        Frame::Reliable { seq, .. } => seq,
-                        _ => unreachable!(),
-                    })
-                    .collect();
-                assert_eq!(sent, due[..resent]);
+                for u in 0..2 {
+                    let resent = (tx.streams[u].retransmits - tx.streams[u].probes - before[u]) as usize;
+                    let sent: Vec<u32> = frames(&out)
+                        .filter_map(|f| match f.unwrap() {
+                            Frame::Reliable { seq, urgent, .. } => (urgent == (u == URG)).then_some(seq),
+                            _ => unreachable!(),
+                        })
+                        .take(resent)
+                        .collect();
+                    assert_eq!(sent, due[u][..resent]);
+                }
                 for f in frames(&out) {
-                    let Frame::Reliable { seq, fin, data } = f.unwrap() else { unreachable!() };
+                    let Frame::Reliable { seq, fin, data, urgent } = f.unwrap() else { unreachable!() };
                     if rand(10) != 0 {
                         let at = now + Duration::from_micros(base + rand(base * 3 / 4));
-                        to_rx.push((at, seq, fin, data.to_vec()));
+                        to_rx.push((at, urgent as usize, seq, fin, data.to_vec()));
                     }
                 }
-                to_rx.retain(|(at, seq, fin, data)| {
+                to_rx.retain(|(at, u, seq, fin, data)| {
                     let keep = *at > now;
                     if !keep {
-                        rx.on_fragment(*seq, *fin, data, 1 << 20, &mut delivered).unwrap();
+                        rx[*u].on_fragment(*seq, *fin, data, 1 << 20, &mut delivered).unwrap();
                     }
                     keep
                 });
-                if rx.ack_pending && rand(3) != 0 {
-                    rx.ack_pending = false;
-                    let (cum, bits) = rx.ack();
-                    to_tx.push((now + Duration::from_micros(base + rand(base / 2)), cum, bits));
+                for (u, rx) in rx.iter_mut().enumerate() {
+                    if rx.ack_pending && rand(3) != 0 {
+                        rx.ack_pending = false;
+                        let (cum, bits) = rx.ack();
+                        to_tx.push((now + Duration::from_micros(base + rand(base / 2)), u, cum, bits));
+                    }
                 }
                 let mut i = 0;
                 while i < to_tx.len() {
                     if to_tx[i].0 <= now {
-                        let (_, cum, bits) = to_tx.swap_remove(i);
-                        tx.on_ack(now, cum, bits);
+                        let (_, u, cum, bits) = to_tx.swap_remove(i);
+                        tx.on_ack(now, cum, bits, u == URG);
                         check(&tx, now, window);
                     } else {
                         i += 1;
@@ -800,7 +997,7 @@ mod tests {
                 }
             }
             // On the LAN an urgent fragment is mostly acknowledged before its copy.
-            assert!(tx.retransmits > 0 && !delivered.is_empty(), "seed {seed}");
+            assert!(tx.retransmits() > 0 && !delivered.is_empty(), "seed {seed}");
             assert!(tx.urgent_copies > 0 || base < 1000, "seed {seed}");
         }
     }
