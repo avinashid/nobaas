@@ -35,13 +35,11 @@ node.join_room("my-game", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4"); // the room name 
 
 ## Highlights
 
-| | |
-|---|---|
-| **Zero backend** | Peers find each other over pluggable, untrusted signaling: an invite link or QR code, public Nostr relays, or in-process and LAN carriers. STUN learns the public address, and both sides dial at once to punch through. When two NATs can't be punched, any peer connected to both relays the traffic, so no TURN server is needed. |
-| **Encrypted, key-addressed** | A `PeerId` *is* an Ed25519 public key. Every link is a `Noise_IK_25519_ChaChaPoly_BLAKE2s` session, so dialling an ID authenticates whoever answers. Signaling relays, peer relays and NATs in the path can't read or forge traffic. |
-| **Real-time lanes** | Each link has three lanes. *Unreliable* is for state. *Reliable* is ordered and carries up to 1 MiB, for events. *Urgent* is reliable and sends every fragment twice, 4 ms apart, for inputs and hits. Selective ACKs, tail-loss probes and delay-based congestion control keep p99 latency low under loss. |
-| **One core, every platform** | `nobaas-core` never touches sockets, threads or clocks. The same deterministic state machine is driven by a native UDP socket, tokio, a browser WebRTC DataChannel, a C caller or Godot, and replayed exactly by the network simulator. |
-| **Scales past the mesh** | The game layer splits players into islands of up to 12 along a Hilbert curve. Super-peers bundle each island's traffic, with failover and overload control. 512 players were simulated at a p99 lag of 79 ms. |
+- **Zero backend.** Peers find each other over pluggable, untrusted signaling: an invite link or QR code, public Nostr relays, or in-process and LAN carriers. STUN learns the public address, and both sides dial at once to punch through. When two NATs can't be punched, any peer connected to both relays the traffic, so no TURN server is needed.
+- **Encrypted, key-addressed.** A `PeerId` *is* an Ed25519 public key. Every link is a `Noise_IK_25519_ChaChaPoly_BLAKE2s` session, so dialling an ID authenticates whoever answers. Signaling relays, peer relays and NATs in the path can't read or forge traffic.
+- **Real-time lanes.** Each link has three lanes. *Unreliable* is for state. *Reliable* is ordered and carries up to 1 MiB, for events. *Urgent* is reliable and sends every fragment twice, 4 ms apart, for inputs and hits. Selective ACKs, tail-loss probes and delay-based congestion control keep p99 latency low under loss.
+- **One core, every platform.** `nobaas-core` never touches sockets, threads or clocks. The same deterministic state machine is driven by a native UDP socket, tokio, a browser WebRTC DataChannel, a C caller or Godot, and replayed exactly by the network simulator.
+- **Scales past the mesh.** The game layer splits players into islands of up to 12 along a Hilbert curve. Super-peers bundle each island's traffic, with failover and overload control. 512 players were simulated at a p99 lag of 79 ms.
 
 ## Project status
 
@@ -123,9 +121,9 @@ Run the bundled examples:
 
 ```sh
 cargo run --release -p nobaas --example echo                 # prints an nb: invite
-cargo run --release -p nobaas --example echo -- nb:...       # in a second terminal: joins and echoes
+cargo run --release -p nobaas --example echo -- nb:...       # second terminal: join, echo
 cargo run --release -p nobaas --example echo_async --features tokio
-cargo run --release -p nobaas-core --example udp_pair        # raw core over UDP loopback, with a throughput figure
+cargo run --release -p nobaas-core --example udp_pair        # core alone, UDP loopback
 cargo run --release -p nobaas-sim --example arena -- --players 512 --supers 8
 ```
 
@@ -147,7 +145,7 @@ full API and the demo project in [`examples/godot`](examples/godot).
 ### Browser and JavaScript
 
 ```sh
-./packages/js/build.sh                       # -> packages/js/pkg/nobaas_ffi.wasm (~300 KB, no imports)
+./packages/js/build.sh                       # -> packages/js/pkg/nobaas_ffi.wasm
 python3 -m http.server -d packages/js 8000   # open http://localhost:8000/demo/ in two tabs
 ```
 
@@ -206,22 +204,22 @@ sequenceDiagram
 
 ```
  ┌───────────────────────────────── your app ─────────────────────────────────┐
- │  game · whiteboard · meeting · chat                                         │
- ├──────────────────────────── building blocks ────────────────────────────────┤
- │  nobaas-game: fixed-point maths, Hilbert islands, desync detection, lockstep│
- │  nobaas-sync · nobaas-media · nobaas-store                       (planned)  │
- ├────────────────────────────── hosts / facades ──────────────────────────────┤
- │  nobaas::Node / AsyncNode      UDP socket, STUN, rooms, traversal (Rust)    │
- │  nobaas-godot                  NobaasMultiplayerPeer (GDExtension)          │
- │  nobaas-ffi                    C ABI → wasm (browser, Node) / native libs   │
- │  nobaas-sim                    deterministic network + NAT simulator        │
- ├──────────────────────────── nobaas-core (sans-IO) ──────────────────────────┤
- │  Endpoint: sessions · Noise IK · lanes · ACK + congestion control ·         │
- │  tail-loss probe · keepalive · roaming · peer relay · hole punch · invites  │
- ├────────────────────────────── signaling (untrusted) ────────────────────────┤
- │  invite / QR · MemoryHub · Nostr relays · BroadcastChannel (JS) ·           │
- │  mDNS, DHT (planned)                                                        │
- └─────────────────────────────────────────────────────────────────────────────┘
+ │ game · whiteboard · meeting · chat                                         │
+ ├───────────────────────────── building blocks ──────────────────────────────┤
+ │ nobaas-game     fixed-point maths, Hilbert islands, desync detection       │
+ │ nobaas-sync · nobaas-media · nobaas-store                    (planned)     │
+ ├───────────────────────────── hosts / facades ──────────────────────────────┤
+ │ nobaas::Node    UDP socket, STUN, rooms, traversal (+ AsyncNode, tokio)    │
+ │ nobaas-godot    NobaasMultiplayerPeer (GDExtension)                        │
+ │ nobaas-ffi      C ABI → wasm (browsers, Node) and native libraries         │
+ │ nobaas-sim      deterministic network and NAT simulator                    │
+ ├────────────────────────── nobaas-core (sans-IO) ───────────────────────────┤
+ │ Endpoint: sessions · Noise IK · lanes · ACK + congestion control ·         │
+ │ tail-loss probe · keepalive · roaming · peer relay · hole punch · invites  │
+ ├────────────────────────── signaling (untrusted) ───────────────────────────┤
+ │ invite / QR · MemoryHub · Nostr relays · BroadcastChannel (JS) ·           │
+ │ mDNS, DHT (planned)                                                        │
+ └────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### The sans-IO core
@@ -230,12 +228,15 @@ sequenceDiagram
 clock or RNG of its own (the RNG is seeded once at construction). A host drives it with five calls:
 
 ```text
-           ┌──────────── host loop (Node, AsyncNode, FFI/JS, Godot, simulator) ────────────┐
- datagram ─┼─► handle_datagram(now, from, bytes)                                          │
- timer    ─┼─► handle_timeout(now)                 poll_transmit(now) ─► (dst, bytes) ────┼─► socket
-           │                                       poll_event()       ─► Event        ────┼─► app
-           │   sleep until poll_timeout()                                                  │
-           └───────────────────────────────────────────────────────────────────────────────┘
+  incoming                                     outgoing
+  ────────                                     ────────
+  datagram ─► handle_datagram(now, from, bytes)
+  timer    ─► handle_timeout(now)
+                 poll_transmit(now) ─► (dst, bytes) ─► socket
+                 poll_event()       ─► Event        ─► app
+                 poll_timeout()     ─► when to wake up next
+
+  The host loop is Node, AsyncNode, the FFI / JS glue, Godot or the simulator.
 ```
 
 Because time and I/O come from outside:
