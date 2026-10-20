@@ -114,9 +114,11 @@ impl Builder {
         self
     }
 
-    /// Port mapping through a given PCP/NAT-PMP server and SSDP address.
-    #[cfg(test)]
-    pub(crate) fn port_mapping_at(mut self, gateway: SocketAddr, ssdp: SocketAddr) -> Self {
+    /// Port mapping through a given PCP/NAT-PMP server and SSDP address, for
+    /// tests against a fake gateway (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn port_mapping_at(mut self, gateway: SocketAddr, ssdp: SocketAddr) -> Self {
         (self.port_mapping, self.portmap_at) = (true, Some((gateway, ssdp)));
         self
     }

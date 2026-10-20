@@ -20,8 +20,8 @@
 //! ```
 
 use nobaas::{
-    Event, Failure, Invite, Lane, NatType, Node, NostrSignaling, PeerId, PeerStats, Privacy, Role, SendError,
-    MAX_UNRELIABLE,
+    Event, Failure, Invite, Lane, MapProtocol, NatType, Node, NostrSignaling, PeerId, PeerStats, PortMapping, Privacy,
+    Role, SendError, MAX_UNRELIABLE,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -268,12 +268,21 @@ pub struct NetOptions {
     pub relays: Option<Vec<String>>,
     /// Which addresses the peer gives out (see [`Session::set_privacy`]).
     pub privacy: Privacy,
+    /// Ask the router to forward a port (PCP, NAT-PMP, UPnP). Default: off.
+    pub port_mapping: bool,
+    /// Tests: map through this fake gateway and SSDP address instead.
+    #[cfg(test)]
+    pub portmap_at: Option<(SocketAddr, SocketAddr)>,
 }
 
 impl NetOptions {
     /// Binds a node with these settings.
     pub fn bind(&self, addr: &str) -> io::Result<Node> {
-        let mut b = Node::builder().privacy(self.privacy);
+        let mut b = Node::builder().privacy(self.privacy).port_mapping(self.port_mapping);
+        #[cfg(test)]
+        if let Some((gateway, ssdp)) = self.portmap_at {
+            b = b.port_mapping_at(gateway, ssdp);
+        }
         if let Some(stun) = &self.stun {
             b = b.stun_servers(stun.iter().cloned());
         }
@@ -475,6 +484,11 @@ impl Session {
         self.node.nat_type()
     }
 
+    /// How router port mapping ([`NetOptions::port_mapping`]) stands.
+    pub fn port_mapping(&self) -> PortMapping {
+        self.node.port_mapping()
+    }
+
     /// Joiner: why the dial to the host failed, once it has.
     pub fn connect_failure(&self) -> Option<Failure> {
         self.node.failure(&self.host_peer?)
@@ -646,6 +660,24 @@ impl Session {
         self.inbox_bytes = 0;
         self.events.clear();
         self.status = Status::Disconnected;
+    }
+}
+
+/// `port_mapping` as Godot shows it: state (`"off"`, `"trying"`, `"mapped"`,
+/// `"not_public"` or `"unavailable"`), the router's `ip:port` (`""` if none) and
+/// protocol (`"pcp"`, `"natpmp"`, `"upnp"` or `""`).
+pub fn port_mapping_info(m: PortMapping) -> (&'static str, String, &'static str) {
+    let protocol = |p| match p {
+        MapProtocol::Pcp => "pcp",
+        MapProtocol::NatPmp => "natpmp",
+        MapProtocol::Upnp => "upnp",
+    };
+    match m {
+        PortMapping::Off => ("off", String::new(), ""),
+        PortMapping::Trying => ("trying", String::new(), ""),
+        PortMapping::Unavailable => ("unavailable", String::new(), ""),
+        PortMapping::Mapped { addr, protocol: p } => ("mapped", addr.to_string(), protocol(p)),
+        PortMapping::NotPublic { addr, protocol: p } => ("not_public", addr.to_string(), protocol(p)),
     }
 }
 
@@ -1011,5 +1043,65 @@ mod tests {
         assert!(pump(&mut [&mut host, &mut other, &mut c], |s| s[2].status() == Status::Connected));
         assert_eq!(c.peer_key(HOST_ID), Some(other.public_key()));
         assert_eq!(host.peer_ids().len(), 1, "only a");
+    }
+
+    /// A PCP gateway on loopback that maps any port at 203.0.113.7:41000; keeps
+    /// the lifetimes it was asked for (0: a delete).
+    fn fake_pcp_gateway() -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<u32>>>) {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let at = sock.local_addr().unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                let req = &buf[..n];
+                if n < 60 || req[..2] != [2, 1] {
+                    continue;
+                }
+                let lifetime = u32::from_be_bytes(req[4..8].try_into().unwrap());
+                log.lock().unwrap().push(lifetime);
+                let mut b = vec![2, 0x81, 0, 0];
+                b.extend_from_slice(&lifetime.to_be_bytes());
+                b.extend_from_slice(&[0; 16]); // epoch, reserved
+                b.extend_from_slice(&req[24..42]); // nonce, protocol, internal port
+                b.extend_from_slice(&41000u16.to_be_bytes());
+                b.extend_from_slice(&std::net::Ipv4Addr::new(203, 0, 113, 7).to_ipv6_mapped().octets());
+                let _ = sock.send_to(&b, from);
+            }
+        });
+        (at, asked)
+    }
+
+    /// The Godot switch reaches the node: off by default, unavailable on loopback
+    /// (no router), and through a fake gateway mapped, offered in the invite and
+    /// deleted when the session goes.
+    #[test]
+    fn port_mapping_switch_reaches_the_node() {
+        let quiet = NetOptions { stun: Some(vec![]), relays: Some(vec![]), ..NetOptions::default() };
+        let off = Session::host(quiet.bind("127.0.0.1:0").unwrap());
+        assert_eq!(port_mapping_info(off.port_mapping()), ("off", String::new(), ""));
+        let on = NetOptions { port_mapping: true, ..quiet.clone() };
+        let s = Session::host(on.bind("127.0.0.1:0").unwrap());
+        assert_eq!(port_mapping_info(s.port_mapping()).0, "unavailable", "no router behind loopback");
+
+        let (gw, asked) = fake_pcp_gateway();
+        let at = NetOptions { portmap_at: Some((gw, "127.0.0.1:9".parse().unwrap())), ..on };
+        let mut s = Session::host(at.bind("127.0.0.1:0").unwrap());
+        assert_eq!(port_mapping_info(s.port_mapping()).0, "trying");
+        let end = Instant::now() + Duration::from_secs(5);
+        while s.port_mapping().addr().is_none() && Instant::now() < end {
+            s.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(port_mapping_info(s.port_mapping()), ("mapped", "203.0.113.7:41000".into(), "pcp"));
+        let inv = Invite::<SocketAddr>::parse(&s.invite()).unwrap();
+        assert!(inv.addrs.contains(&"203.0.113.7:41000".parse().unwrap()));
+        drop(s);
+        let end = Instant::now() + Duration::from_secs(2);
+        while asked.lock().unwrap().last() != Some(&0) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(asked.lock().unwrap().last(), Some(&0), "deleted on drop");
     }
 }

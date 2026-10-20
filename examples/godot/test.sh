@@ -34,6 +34,7 @@ run() {
     "$GODOT" --headless --path . -- "$@" >"$tmp/$name-join.log" 2>&1 || st=$?
     wait $host || st=$?
     host=
+    grep -q "^port mapping: off$" "$tmp/$name-host.log" || { echo "$name: no 'port mapping: off' line"; st=1; }
     echo "--- $name: host";   cat "$tmp/$name-host.log"
     echo "--- $name: joiner"; cat "$tmp/$name-join.log"
     [ $st -eq 0 ] && echo "$name: PASS" || echo "$name: FAIL"

@@ -27,6 +27,8 @@ serde_json = { version = "1", optional = true }
 [features]
 tokio = ["dep:tokio"]
 nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json"]
+# Test hooks for bindings (Builder::port_mapping_at, a fake gateway's address). Not for apps.
+testing = []
 
 [dev-dependencies]
 nobaas-core = { path = "../nobaas-core" }

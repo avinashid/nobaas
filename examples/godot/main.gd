@@ -7,7 +7,8 @@ extends Node2D
 ## `-- --join=FILE` reads it; `-- --host-room=ROOM` / `-- --join-room=ROOM` meet by
 ## room instead. `--stun=a:3478,b:3478` and `--relay=wss://…,…` set the STUN servers
 ## and Nostr relays (`none` turns either off); `--privacy=public-only|relay-only`
-## which addresses this peer gives out. Both move by themselves, chat, and
+## which addresses this peer gives out; `--port-mapping` asks the router to forward
+## a port (off by default; the state line shows how it went). Both move by themselves, chat, and
 ## quit with 0 once they have seen another peer's square move and its chat line,
 ## or 1 on timeout.
 
@@ -60,6 +61,9 @@ func _ready() -> void:
 		peer.set_privacy_mode(modes[args["privacy"]])
 		assert(peer.get_privacy_mode() == modes[args["privacy"]])
 		_log("privacy: %s" % args["privacy"])
+	if args.has("port-mapping"):
+		peer.set_port_mapping(true)
+	peer.port_mapping_changed.connect(func(info: Dictionary): _log("port mapping: %s" % _mapping_line(info)))
 	headless = args.has("host") or args.has("join") or args.has("host-room") or args.has("join-room")
 	if args.has("host"):
 		_host()
@@ -115,7 +119,15 @@ func _start_hosting(invite: String, message: String) -> void:
 		f.store_string(invite)
 		f.close()
 	_log(message)
+	_log("port mapping: %s" % _mapping_line(peer.get_port_mapping()))
 	spawner.spawn(1)
+
+
+## "off", "trying", "mapped 203.0.113.7:41000 (upnp)", "not_public …" or "unavailable".
+func _mapping_line(info: Dictionary) -> String:
+	if info["address"].is_empty():
+		return info["state"]
+	return "%s %s (%s)" % [info["state"], info["address"], info["protocol"]]
 
 
 func _join() -> void:

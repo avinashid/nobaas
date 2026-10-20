@@ -1,9 +1,9 @@
-use crate::session::{Mode, NetOptions, PeerEvent, PutError, Session, Status, DEFAULT_MAX_PEERS};
+use crate::session::{port_mapping_info, Mode, NetOptions, PeerEvent, PutError, Session, Status, DEFAULT_MAX_PEERS};
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
 use godot::prelude::*;
-use nobaas::{Failure, NatType, Node, PeerId, Privacy};
+use nobaas::{Failure, NatType, Node, PeerId, PortMapping, Privacy};
 
 /// A `MultiplayerPeer` over Nobaas: Godot's `@rpc`, `MultiplayerSynchronizer` and
 /// `MultiplayerSpawner` with no server. One instance hosts (peer 1); the others
@@ -26,6 +26,8 @@ pub struct NobaasMultiplayerPeer {
     refuse: bool,
     max_peers: i32,
     net: NetOptions,
+    /// The port-mapping state last signalled.
+    mapping: PortMapping,
 }
 
 #[godot_api]
@@ -102,6 +104,31 @@ impl NobaasMultiplayerPeer {
             Privacy::RelayOnly { .. } => Self::PRIVACY_RELAY_ONLY,
         }
     }
+
+    /// Asks the router to forward this peer's UDP port (PCP, NAT-PMP or UPnP), from
+    /// the next `host` / `join`; off by default. A mapped port is offered to peers
+    /// like a public address, so a host behind a symmetric NAT on a home router
+    /// can be reached. It opens a port on the player's router while the session
+    /// lives; `close()` (or freeing the peer) removes it. See `get_port_mapping()`.
+    #[func]
+    fn set_port_mapping(&mut self, on: bool) {
+        self.net.port_mapping = on;
+    }
+
+    /// `{state, address, protocol}`: `state` is `"off"`, `"trying"`, `"mapped"`,
+    /// `"not_public"` (the router is itself behind a carrier NAT, so nothing is
+    /// offered) or `"unavailable"` (no router answered, or all refused; asked
+    /// again every 5 minutes). `address` is the router's `ip:port` and `protocol`
+    /// `"pcp"`, `"natpmp"` or `"upnp"`, both `""` until there is one.
+    /// `port_mapping_changed` fires when it changes.
+    #[func]
+    fn get_port_mapping(&self) -> VarDictionary {
+        mapping_dict(self.session.as_ref().map_or(PortMapping::Off, Session::port_mapping))
+    }
+
+    /// The `get_port_mapping()` state changed (`info` is the new one).
+    #[signal]
+    fn port_mapping_changed(info: VarDictionary);
 
     /// Hosts on UDP `port` (0: a free one) and announces this game in room `room` of
     /// application `app_id`, for `join_room`. Only peers that know the room name get
@@ -292,12 +319,18 @@ impl NobaasMultiplayerPeer {
         s.channel = self.channel;
         s.set_refuse_new_connections(self.refuse);
         s.set_max_peers(self.max_peers.max(0) as usize);
+        self.mapping = s.port_mapping();
         self.session = Some(s);
     }
 
     fn stats(&self, id: i32) -> Option<nobaas::PeerStats> {
         self.session.as_ref()?.peer_stats(id)
     }
+}
+
+fn mapping_dict(m: PortMapping) -> VarDictionary {
+    let (state, address, protocol) = port_mapping_info(m);
+    vdict! { "state" => state, "address" => address.as_str(), "protocol" => protocol }
 }
 
 fn strings(a: &PackedStringArray) -> Vec<String> {
@@ -334,6 +367,7 @@ impl IMultiplayerPeerExtension for NobaasMultiplayerPeer {
             refuse: false,
             max_peers: DEFAULT_MAX_PEERS as i32,
             net: NetOptions::default(),
+            mapping: PortMapping::Off,
         }
     }
 
@@ -411,7 +445,12 @@ impl IMultiplayerPeerExtension for NobaasMultiplayerPeer {
         let Some(s) = self.session.as_mut() else { return };
         s.poll();
         let events: Vec<PeerEvent> = std::iter::from_fn(|| s.next_event()).collect();
+        let mapping = s.port_mapping();
         // Signal handlers call back into this peer; base_mut() allows that.
+        if mapping != self.mapping {
+            self.mapping = mapping;
+            self.base_mut().emit_signal("port_mapping_changed", &[mapping_dict(mapping).to_variant()]);
+        }
         for e in events {
             let (signal, id) = match e {
                 PeerEvent::Connected(id) => ("peer_connected", id),
