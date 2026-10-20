@@ -40,7 +40,8 @@ data of its own:
   carries a fresh invite key each start, so hand out the new one after a restart.
 - It accepts links from anyone who knows its peer id and address (both are in the invite), up to `NOBAAS_MAX_PEERS`;
   links over that are closed and counted. The invite key gates only signaling offers, and the peer uses no signaling
-  yet. Messages sent to it are dropped. It forwards packets between two peers linked to it when one asks (the core's peer relay).
+  yet. Messages sent to it are dropped. It forwards packets between two peers linked to it when one asks (the core's
+  peer relay).
 - `nobaas-peer check [FILE]` links to the invite in `FILE` (default `$NOBAAS_DATA/invite`) from `127.0.0.1` and exits
   0 when the handshake completes within 5 s. It is the image's `HEALTHCHECK`.
 - It logs a line per link and unlink, and one stats line per `NOBAAS_STATS_SECS`: links, refused links, packets,
