@@ -55,7 +55,7 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of `ccc3b79`.**
+**Status as of `a65873c`, with `4cffbf9` (NPM-1) on review.**
 
 | Finding | Status |
 |---|---|
@@ -65,6 +65,10 @@ that needs a change is tracked as an NB card.
 | SEC-4…SEC-8 | Open (NB-024…NB-028) |
 | SEC-9…SEC-11 | Requirements met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 open |
 | SEC-12 (Info) | Accepted, no card |
+| N38-1…N38-3 (port mapping) | **Fixed** in NB-038 (`71d83b2`) and NB-041 (`0dfdbc9`) |
+| NPM-1 (Low) | **Fixed** by `4cffbf9`: no port mapping under `RelayOnly` |
+| NPM-2 (Low) | **Fixed** in `docs/GODOT.md` (`9be92d5`); the flood risk itself is SEC-4 |
+| NPM-3 (Low) | Open: a map request in flight at stop isn't deleted |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
 
@@ -247,6 +251,50 @@ offer acted on, under the offer rate limits; each guess answers only "linked to 
 or not" and enumerates nothing; and X must actually relay to the holder, so X has
 to be linked to it. No fix planned; a stronger design (naming only links that
 agreed to relay) would be a separate card.
+
+### Router port mapping (NB-038, Godot switch) — N38-1…N38-3, NPM-1…NPM-3
+
+`Builder::port_mapping(true)` (Godot: `set_port_mapping(true)`), off by default,
+asks the LAN gateway (PCP, then NAT-PMP, then UPnP-IGD) to forward the node's UDP
+port. The mapped address is offered like a public one. This changes the attack
+surface in three ways:
+
+- **Unsolicited reachability.** While mapped, anyone on the internet can send to
+  the port, with no NAT filtering in front. It reaches only the Noise endpoint,
+  but that endpoint has no handshake-flood cookies yet, so SEC-4 applies directly.
+  It also shows up in port scans. `docs/GODOT.md` says this and advises asking
+  the player first (NPM-2).
+- **The gateway and the LAN are trusted for the address only.** Any device on the
+  LAN can answer the requests. A rogue responder can report a false address,
+  which peers would then dial. It can't get into a session: no one finishes a
+  handshake without the peer's key. Accepted residual.
+- **Leftover mappings.** After a crash the router keeps the mapping until its
+  lease ends (2 h), or until someone deletes it if the router only allows
+  permanent UPnP leases. Documented.
+
+Findings:
+
+- **N38-1 (fixed, NB-038 `5b52eb5`).** A dripping or stalled UPnP gateway could
+  hold the mapping thread and the delete on drop. Now each HTTP exchange has one
+  3 s deadline, and drop waits at most 7 s.
+- **N38-2 (fixed, NB-038 `5b52eb5`).** A PCP or NAT-PMP answer with lifetime 0
+  was taken as a permanent mapping; it is now a refusal.
+- **N38-3 (fixed, NB-041 `bf769e9`).** A UPnP chain stopped half-way kept
+  sending; the worker now checks stop before each HTTP exchange.
+- **NPM-1 (Low, fixed by `4cffbf9`).** Under `Privacy::RelayOnly` the mapped
+  address is never given out, yet the port was still opened. Now a relay-only
+  node asks the router nothing (state `RelayOnly`). Switching to relay-only
+  deletes the mapping without blocking, and switching out maps again after the
+  old delete has gone out. A Godot relay-only host still maps, because it gives
+  out its public addresses as under `PublicOnly`.
+- **NPM-2 (Low, fixed in `docs/GODOT.md`, `9be92d5`).** The doc said the port
+  "reaches only the Noise endpoint" without the SEC-4 flood caveat.
+- **NPM-3 (Low, open).** `Mapper::stop()` deletes only a lease it holds. A PCP or
+  NAT-PMP map request still unanswered when the worker stops (drop right after
+  bind, or `set_privacy(RelayOnly)` right after a map request) gets no delete, so
+  the router's late grant stays open for its lease (2 h). **Fix:** on stop with a
+  request outstanding, send one lifetime-0 delete for the requested port (PCP
+  with the same nonce).
 
 ---
 
