@@ -44,6 +44,11 @@ path = "../../examples/rust/echo_async.rs"
 required-features = ["tokio"]
 
 [[example]]
+name = "natcheck"
+path = "../../examples/rust/natcheck.rs"
+required-features = ["nostr"]
+
+[[example]]
 name = "nostr_relay"
 path = "../../examples/rust/nostr_relay.rs"
 required-features = ["nostr"]
