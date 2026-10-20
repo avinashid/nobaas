@@ -1,7 +1,7 @@
 name: CI
 
 # Runs every step of scripts/gate.sh --strict except the browser tests and the public-relay Nostr tests.
-# Linux only, two jobs, cached builds, superseded runs cancelled.
+# Linux only, three jobs (rust, wasm + node, docker build without push), cached builds, superseded runs cancelled.
 on:
   push:
     branches: [main]
@@ -61,5 +61,16 @@ jobs:
       - run: node packages/js/test/pump_rearm.mjs
       - run: node packages/js/test/endpoint_closed.mjs
       - run: node packages/js/test/scratch_buffers.mjs
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet
+      # Build only, never pushed. The second build reuses the shared build stage from the first.
+      - run: docker build --target peer -t nobaas-peer:ci .
+      - run: docker build --target examples -t nobaas-examples:ci .
 
   # Next: a `godot` job building the GDExtension (NB-020) goes here, Linux only to start.
