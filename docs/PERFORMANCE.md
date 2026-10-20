@@ -77,8 +77,12 @@ Assume a stroke update of 64 B sent 20 times a second while someone draws.
   - In practice browsers cap at roughly 50–100 RTCPeerConnections, so the mesh limit is **~50 peers**.
   - Most peers are idle at any moment, which helps further.
 - **Beyond ~50 peers:** a super-peer fans updates out, so each client keeps one link.
-  - A super-peer with 20 Mbit/s up and 2 Mbit/s of incoming edits relays to ~10 viewers per Mbit/s of edits.
-  - That is roughly **500+ viewers** of a busy board, more with the tree fan-out in §6.
+  - Each tick it sends every viewer one packet holding all active drawers' updates, so per viewer it costs
+    `20 Hz × (125 + 64 × D) × 8` bits/s, where `D` is the number of people drawing at that moment.
+  - Viewers per super-peer ≈ `0.8 × uplink / that`. With 20 Mbit/s up: **~530** viewers with 1 drawer,
+    **~225** with 5, **~70** with 20.
+  - The super-peer should be a desktop or native peer, not a browser tab, because of the connection cap above.
+    For more viewers, use the tree fan-out in §6.
 - **Sync latency:** one network hop (RTT/2), plus one tick if updates are batched (≤ 50 ms at 20 Hz).
 
 ## 5. Chat (theoretical)
