@@ -75,6 +75,7 @@ fi
 step "wasm build" ./packages/js/build.sh
 step "wasm size+imports" wasm_check
 step "node glue" node packages/js/test/node_pair.mjs
+step "node privacy" node packages/js/test/privacy.mjs
 
 if [ $quick = 1 ]; then
   skip "browser" "--quick"

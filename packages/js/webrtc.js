@@ -9,12 +9,30 @@
 // Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
 // messages are JSON-able objects. See BroadcastSignaling below.
 
+// Removes `host` candidates (LAN, loopback, mDNS .local names) from an SDP, keeping
+// server-reflexive (public, from STUN) and relay ones.
+export function withoutHostCandidates(sdp) {
+  return sdp.split('\r\n').filter((l) => !(l.startsWith('a=candidate:') && / typ host( |$)/.test(l))).join('\r\n');
+}
+
 export class WebRtcTransport {
   // `loss` drops that fraction of outgoing datagrams, for testing.
   // `trickle: false` sends one offer/answer with every candidate once ICE
   // gathering finishes (fewer signalling messages, for relays like Nostr).
-  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true } = {}) {
+  // `privacy`: which addresses peers are given in ICE candidates.
+  //   'direct' (default): all of them.
+  //   'public-only': no `host` candidates (LAN, loopback): only what STUN sees.
+  //   'relay-only': a WebRTC link to `relay` (a peer id, public-only) and to no one
+  //     else; reach others with endpoint.connectVia(relay, peer), which stays
+  //     relayed. Browsers have no relay but a peer: with no TURN server there is
+  //     no relay-only path to a peer that isn't linked to `relay`.
+  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null } = {}) {
+    if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
+    if (privacy === 'relay-only' && !relay) throw new Error("privacy 'relay-only' needs a relay peer id");
     this.ep = endpoint;
+    this.privacy = privacy;
+    this.relay = relay;
+    if (privacy === 'relay-only') endpoint.setRelayOnly(true);
     this.trickle = trickle;
     this.dropped = 0;
     this.sig = signaling;
@@ -49,30 +67,45 @@ export class WebRtcTransport {
     dc.onclose = () => this.onPeer(peer, 'closed');
     dc.onmessage = (e) => this.ep.receive(h, new Uint8Array(e.data));
     pc.onicecandidate = (e) => {
-      if (e.candidate && this.trickle) this.sig.send(peer, { kind: 'ice', candidate: e.candidate.toJSON() });
+      if (!e.candidate || !this.trickle) return;
+      if (this.privacy !== 'direct' && / typ host( |$)/.test(e.candidate.candidate)) return;
+      this.sig.send(peer, { kind: 'ice', candidate: e.candidate.toJSON() });
     };
     this.links.set(h, l);
     this.byPeer.set(peer, h);
     return l;
   }
 
+  // Whether WebRTC (which hands the peer our addresses) may run with `peer`.
+  allowed(peer) {
+    return this.privacy !== 'relay-only' || peer === this.relay;
+  }
+
+  // The local description to send, with host candidates left out unless 'direct'.
+  description(pc) {
+    const d = pc.localDescription.toJSON();
+    return this.privacy === 'direct' ? d : { type: d.type, sdp: withoutHostCandidates(d.sdp) };
+  }
+
   // Opens a DataChannel to `peer` and, once open, runs the Nobaas handshake.
   async dial(peer) {
+    if (!this.allowed(peer)) throw new Error('relay-only: reach this peer with endpoint.connectVia(relay, peer)');
     if (this.byPeer.has(peer)) return;
     const l = this.link(peer);
     l.dialer = true;
     await l.pc.setLocalDescription(await l.pc.createOffer());
     await this.gathered(l.pc);
-    this.sig.send(peer, { kind: 'offer', sdp: l.pc.localDescription.toJSON() });
+    this.sig.send(peer, { kind: 'offer', sdp: this.description(l.pc) });
   }
 
   async onSignal(from, msg) {
+    if (!this.allowed(from)) return;
     if (msg.kind === 'offer') {
       const l = this.link(from);
       await l.pc.setRemoteDescription(msg.sdp);
       await l.pc.setLocalDescription(await l.pc.createAnswer());
       await this.gathered(l.pc);
-      this.sig.send(from, { kind: 'answer', sdp: l.pc.localDescription.toJSON() });
+      this.sig.send(from, { kind: 'answer', sdp: this.description(l.pc) });
     } else if (msg.kind === 'answer') {
       const l = this.link(from);
       await l.pc.setRemoteDescription(msg.sdp);

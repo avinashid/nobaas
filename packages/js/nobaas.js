@@ -68,9 +68,12 @@ class Nobaas {
     this.free(out, 64);
     return sig;
   }
-  // Creates an endpoint. `secret` (32 bytes) restores an identity.
-  endpoint({ secret = null, shareAddresses = false } = {}) {
-    return new Endpoint(this, secret, shareAddresses);
+  // Creates an endpoint. `secret` (32 bytes) restores an identity. `relayOnly`:
+  // see Endpoint.setRelayOnly.
+  endpoint({ secret = null, shareAddresses = false, relayOnly = false } = {}) {
+    const ep = new Endpoint(this, secret, shareAddresses);
+    if (relayOnly) ep.setRelayOnly(true);
+    return ep;
   }
 }
 
@@ -115,6 +118,12 @@ export class Endpoint {
     const r = this.nb.x.nb_connect(this.h, nowUs(), addr, this.setPeer(peer));
     this.pump();
     return r;
+  }
+  // Relay-only: links made through a relay (connectVia) stay relayed and never
+  // punch to a direct path, relays forward our packets without our address, and
+  // a direct handshake is answered only from a peer we are dialling directly.
+  setRelayOnly(on) {
+    this.nb.x.nb_set_relay_only(this.h, on ? 1 : 0);
   }
   connectVia(relay, peer) {
     const x = this.nb.x;
