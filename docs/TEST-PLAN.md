@@ -171,7 +171,7 @@ regression test.
 | Packets, frames | `nobaas-core` `fuzz::fuzz_packet_parse`, `fuzz_frames` | an accepted packet re-encodes to the same bytes and a well-formed one is never rejected; frames yielded re-encode to exactly the bytes consumed, a malformed tail yields one `Err` |
 | Addresses | `fuzz_addresses`, `nobaas-sim` `fuzz_sim_addresses` | `SocketAddr`/`u32`/`u64`/`SimAddr` decoding accepts canonical encodings only |
 | STUN | `fuzz_stun` | requests and responses (extra attributes too); STUN never parses as a Nobaas packet |
-| Invites | `fuzz_invites` | bytes and `nb:` links: whatever parses survives its own round trip, ≤ 16 entries |
+| Invites | `fuzz_invites` | bytes and `nb:` links: whatever parses survives its own round trip, ≤ 16 entries, and is the one encoding of what it decodes to (`to_link(parse(s)) == s`) |
 | Sealed | `fuzz_sealed` | only an untouched message sealed to us opens, naming its real sender |
 | Hostile peer | `fuzz_hostile_peer` | an authenticated peer sends sealed random frames, garbage, FWD to a bystander and RELAYED nested 12 deep, roaming and jumping time: no panic, a violation drops it and it may reconnect, half-open sessions stay bounded, and the bystander and the peer still exchange messages after |
 | Hellos, offers | `nobaas` `traversal::fuzz_hello_and_offer_parsers` | round trips; candidates, relays and the prediction window stay within their limits |
@@ -187,13 +187,14 @@ regression test.
 Found and fixed, each with a regression test: a gateway's `Content-Length` near `usize::MAX` overflowed
 `portmap::http_complete` (`huge_content_length_is_not_complete`); a relay message `null` threw out of
 `NostrSignaling.onRelay` (`nostr_bounds.mjs` 3c); a malformed SDP in an offer or answer became an unhandled
-rejection, ending a Node host, and left a dead link (`webrtc_signals.mjs`).
+rejection, ending a Node host, and left a dead link (`webrtc_signals.mjs`). Invite links were malleable: base64url
+ignored the unused bits of the last symbol, and a count of 17–255 was clamped to 16, so several strings parsed to one
+invite; decoding is now canonical (`b64::rejects_non_canonical_tails`, `invite::tests::one_link_per_invite`).
 
 ## Known gaps
 
 | Gap | Test | Owner |
 |---|---|---|
-| Invite links are malleable: base64url trailing bits are not checked, and a count over 16 is accepted when 16 entries follow, so several strings parse to one invite (`fuzz_invites` counts them) | — | security (decide) |
 | Fuzzing is not coverage-guided (cargo-fuzz needs nightly) | — | qa, if the toolchain is approved |
 | `browser.mjs` reports round trips and throughput but asserts only that the mesh forms and data arrives | — | qa |
 | Planned crates (facade, sync, media, store, Godot binding) have no tests yet; each lands with its own, per the plans above | — | backend |

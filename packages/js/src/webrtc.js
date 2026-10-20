@@ -48,6 +48,7 @@ export class WebRtcTransport {
     this.trickle = trickle;
     this.dropped = 0; // datagrams dropped by the simulated `loss`
     this.congested = 0; // datagrams dropped because the DataChannel was full or refused them
+    this.badSignals = 0; // signals refused as malformed or unproven (see onSignal)
     this.sig = signaling;
     this.iceServers = iceServers;
     this.onPeer = onPeer;
@@ -72,7 +73,7 @@ export class WebRtcTransport {
     };
     // Signals are untrusted: one that fails must not become an unhandled rejection
     // (which ends a Node process).
-    signaling.onMessage((from, msg) => void this.onSignal(from, msg).catch(() => {}));
+    signaling.onMessage((from, msg) => void this.onSignal(from, msg).catch(() => void this.badSignals++));
   }
 
   link(peer) {
@@ -128,7 +129,8 @@ export class WebRtcTransport {
 
   async onSignal(from, msg) {
     // Signalling is untrusted: a `from` that isn't a PeerId never gets a link.
-    if (!isPeerId(from) || !msg || !this.allowed(from)) return;
+    if (!isPeerId(from) || !msg) return void this.badSignals++;
+    if (!this.allowed(from)) return;
     const held = this.checking.get(from);
     if (held) return void held.push(msg);
     if (msg.kind === 'offer' && this.offerProof && !this.byPeer.has(from)) {
@@ -137,7 +139,7 @@ export class WebRtcTransport {
       const ok = await this.offerProof.check(from, msg.p).catch(() => false);
       const rest = this.checking.get(from) ?? [];
       this.checking.delete(from);
-      if (!ok) return;
+      if (!ok) return void this.badSignals++;
       await this.apply(from, msg);
       for (const m of rest) await this.onSignal(from, m);
       return;
@@ -157,7 +159,7 @@ export class WebRtcTransport {
       } catch {
         // A malformed offer: the link it opened is dropped, so it can't block a later one.
         if (fresh && this.links.get(l.handle) === l) this.drop(from);
-        return;
+        return void this.badSignals++;
       }
       await this.gathered(l.pc);
       this.sig.send(from, { kind: 'answer', sdp: this.description(l.pc) });

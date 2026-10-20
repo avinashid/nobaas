@@ -6,7 +6,9 @@
 // - a fuzz of random signals (mutated real SDP, junk candidates, junk messages)
 //   from several peers throws nothing, rejects nothing unhandled, leaves only
 //   links that took a remote description, and a new peer's real offer is still
-//   answered.
+//   answered;
+// - refused signals (bad `from`, empty message, malformed offer) are counted in
+//   `badSignals`; a real offer is not.
 //
 //   node packages/js/test/webrtc_signals.mjs [cases=300]
 import { spawn } from 'node:child_process';
@@ -60,9 +62,14 @@ try {
     await settle();
     ok(unhandled.length === 0, `malformed offers reject nothing unhandled (${unhandled.join(' | ')})`);
     ok(!t.has(P) && !t.has(Q), 'malformed offers leave no link behind');
+    sig.fn('not a peer', { kind: 'offer', sdp: await realOffer() });
+    sig.fn(P, null);
+    await settle();
+    ok(t.badSignals === 4, `2 malformed offers, a bad from and an empty message are counted (badSignals ${t.badSignals})`);
     sig.fn(P, { kind: 'offer', sdp: await realOffer() });
     await settle();
     ok(answered(P) && t.has(P), 'a real offer from the same peer is answered afterwards');
+    ok(t.badSignals === 4, `a real offer is not counted (badSignals ${t.badSignals})`);
 
     // Fuzz.
     let s = seed >>> 0;
@@ -90,6 +97,7 @@ try {
     ])();
     const peers = [3, 4, 5, 6, 7, 8].map(id);
     let threw = 0;
+    const badBefore = t.badSignals;
     for (let i = 0; i < cases; i++) {
       const msg = pick([
         () => ({ kind: 'offer', sdp: sdp() }),
@@ -109,6 +117,7 @@ try {
     ok(unhandled.length === 0, `${cases} random signals: no unhandled rejection (${unhandled.slice(0, 3).join(' | ')})`);
     const links = [...t.links.values()];
     ok(links.every((l) => l.pc.remoteDescription), `every link left (${links.length}) took a remote description`);
+    ok(t.badSignals > badBefore, `random signals are counted (badSignals +${t.badSignals - badBefore} of ${cases})`);
     const R = id(9);
     sig.fn(R, { kind: 'offer', sdp: await realOffer() });
     await settle();
