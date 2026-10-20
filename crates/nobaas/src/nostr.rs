@@ -17,9 +17,10 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::Message;
 
 /// Ephemeral event kind used by Nobaas signaling.
@@ -34,6 +35,10 @@ const READ_SLICE: Duration = Duration::from_millis(20);
 const MAX_QUEUED: usize = 64;
 /// Event ids remembered to drop the copy each relay delivers.
 const MAX_SEEN: usize = 4096;
+/// Events received but not yet polled; past this, relays' events are dropped.
+const MAX_INBOX: usize = 1024;
+/// Largest websocket message or frame taken from a relay (tungstenite's default is 64 MiB).
+const MAX_MESSAGE: usize = 128 << 10;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Counters for a [`NostrSignaling`] carrier.
@@ -102,7 +107,7 @@ impl NostrSignaling {
         let pubkey = hex(&key.verifying_key().to_bytes());
         let mut sub = [0u8; 8];
         OsRng.fill_bytes(&mut sub);
-        let (tx, inbox) = channel();
+        let (tx, inbox) = sync_channel(MAX_INBOX);
         let shared = Arc::new(Shared::default());
         let relays = relays
             .into_iter()
@@ -223,7 +228,7 @@ impl<T: Read + Write + Send> Stream for T {}
 type Ws = tungstenite::WebSocket<Box<dyn Stream>>;
 
 /// One relay: connect, keep the subscription, forward events both ways, reconnect.
-fn relay_loop(url: String, cmds: Receiver<Cmd>, out: Sender<Incoming>, shared: Arc<Shared>) {
+fn relay_loop(url: String, cmds: Receiver<Cmd>, out: SyncSender<Incoming>, shared: Arc<Shared>) {
     let mut req: Option<String> = None;
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
@@ -262,7 +267,7 @@ fn relay_loop(url: String, cmds: Receiver<Cmd>, out: Sender<Incoming>, shared: A
 fn session(
     ws: &mut Ws,
     cmds: &Receiver<Cmd>,
-    out: &Sender<Incoming>,
+    out: &SyncSender<Incoming>,
     shared: &Shared,
     req: &mut Option<String>,
     queue: &mut VecDeque<String>,
@@ -316,7 +321,7 @@ fn req_sub(req: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-fn on_relay_message(text: &str, out: &Sender<Incoming>, shared: &Shared) {
+fn on_relay_message(text: &str, out: &SyncSender<Incoming>, shared: &Shared) {
     let Ok(Value::Array(m)) = serde_json::from_str::<Value>(text) else { return };
     match m.first().and_then(Value::as_str) {
         Some("EVENT") => {
@@ -325,16 +330,28 @@ fn on_relay_message(text: &str, out: &Sender<Incoming>, shared: &Shared) {
                 return;
             }
             let field = |k: &str| ev.get(k).and_then(Value::as_str).map(str::to_string);
-            let tag = ev.get("tags").and_then(Value::as_array).and_then(|tags| {
+            let tags = ev.get("tags").and_then(Value::as_array);
+            let tag = tags.and_then(|tags| {
                 tags.iter().find_map(|t| match t.as_array()?.as_slice() {
                     [k, v, ..] if k.as_str() == Some("p") => v.as_str().map(str::to_string),
                     _ => None,
                 })
             });
-            if let (Some(id), Some(pubkey), Some(tag), Some(content)) = (field("id"), field("pubkey"), tag, field("content")) {
-                shared.received.fetch_add(1, Ordering::Relaxed);
-                let _ = out.send(Incoming { id, pubkey, tag, content });
+            let created_at = ev.get("created_at").and_then(Value::as_u64);
+            let (Some(id), Some(pubkey), Some(tag), Some(content), Some(created_at)) =
+                (field("id"), field("pubkey"), tag, field("content"), created_at)
+            else {
+                return;
+            };
+            // The id must be the NIP-01 hash of the event, so a relay can't dress one
+            // event up as many (copies are dropped by id). Signatures aren't checked:
+            // offers are sealed and authenticate themselves.
+            let ser = json!([0, pubkey, created_at, KIND, tags, content]).to_string();
+            if hex(&Sha256::digest(ser)) != id {
+                return;
             }
+            shared.received.fetch_add(1, Ordering::Relaxed);
+            let _ = out.try_send(Incoming { id, pubkey, tag, content }); // full: dropped, as a relay may drop
         }
         Some("OK") if m.get(2) == Some(&Value::Bool(false)) => {
             shared.rejected.fetch_add(1, Ordering::Relaxed);
@@ -382,7 +399,8 @@ fn connect(url: &str) -> io::Result<Ws> {
     } else {
         Box::new(tcp.try_clone()?)
     };
-    let (ws, _) = tungstenite::client(url, stream).map_err(|e| io::Error::other(e.to_string()))?;
+    let config = WebSocketConfig { max_message_size: Some(MAX_MESSAGE), max_frame_size: Some(MAX_MESSAGE), ..Default::default() };
+    let (ws, _) = tungstenite::client::client_with_config(url, stream, Some(config)).map_err(|e| io::Error::other(e.to_string()))?;
     tcp.set_read_timeout(Some(READ_SLICE))?;
     Ok(ws)
 }
@@ -480,16 +498,56 @@ mod tests {
 
     #[test]
     fn relay_messages_are_parsed_defensively() {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(4);
         let shared = Shared::default();
         for junk in ["", "{}", "[]", r#"["EVENT"]"#, r#"["EVENT","s",{"kind":1}]"#, r#"["EVENT","s",{"kind":25059,"tags":[["e","x"]]}]"#] {
             on_relay_message(junk, &tx, &shared);
         }
+        // An id that isn't the event's hash: dropped.
+        on_relay_message(r#"["EVENT","s",{"id":"i","pubkey":"p","created_at":1,"kind":25059,"tags":[["p","t"]],"content":"c"}]"#, &tx, &shared);
         assert!(rx.try_recv().is_err());
-        on_relay_message(r#"["EVENT","s",{"id":"i","pubkey":"p","kind":25059,"tags":[["p","t"]],"content":"c"}]"#, &tx, &shared);
+        let key = SigningKey::from_bytes(&[7u8; 32]).unwrap();
+        let pubkey = hex(&key.verifying_key().to_bytes());
+        let ev = sign_event(&key, &pubkey, 1_700_000_000, "t", "c");
+        on_relay_message(&json!(["EVENT", "s", ev]).to_string(), &tx, &shared);
         let m = rx.try_recv().unwrap();
-        assert_eq!((m.id.as_str(), m.tag.as_str(), m.content.as_str()), ("i", "t", "c"));
+        assert_eq!((m.id, m.tag.as_str(), m.content.as_str()), (ev["id"].as_str().unwrap().to_string(), "t", "c"));
+        // The same id with other content (a relay replaying it as new): dropped.
+        let mut forged = ev.clone();
+        forged["content"] = json!("d");
+        on_relay_message(&json!(["EVENT", "s", forged]).to_string(), &tx, &shared);
+        assert!(rx.try_recv().is_err());
+        // A full inbox drops events rather than growing or blocking the relay thread.
+        for i in 0..10 {
+            let ev = sign_event(&key, &pubkey, 1_700_000_000 + i, "t", "c");
+            on_relay_message(&json!(["EVENT", "s", ev]).to_string(), &tx, &shared);
+        }
+        assert_eq!(rx.try_iter().count(), 4);
         on_relay_message(r#"["OK","i",false,"blocked"]"#, &tx, &shared);
         assert_eq!(shared.rejected.load(Ordering::Relaxed), 1);
+    }
+
+    /// A local server sends one 200 KiB message: the client drops the connection
+    /// instead of buffering it (NB-032(d)).
+    #[test]
+    fn oversized_relay_messages_close_the_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            let _ = ws.send(Message::Text("x".repeat(200 << 10)));
+            let _ = ws.read(); // until the client goes
+        });
+        let mut ws = connect(&url).unwrap();
+        let err = loop {
+            match ws.read() {
+                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+                other => break other,
+            }
+        };
+        assert!(matches!(err, Err(tungstenite::Error::Capacity(_))), "{err:?}");
+        drop(ws);
+        server.join().unwrap();
     }
 }
