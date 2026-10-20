@@ -139,8 +139,6 @@ synchronizer updates, then both exit 0 within a timeout. It runs on loopback onl
 
 | Gap | Test | Owner |
 |---|---|---|
-| `q16_mul` and `q16_div` wrap on overflow while `q16_add`/`q16_sub` saturate: `q16_mul(i32::MAX, 2.0) == -2` | `fixed_point::mul_saturates_on_overflow` (ignored) | backend |
-| `AabbObstacleQ16::blocks_segment` samples 17 points, so a wall thinner than `length / 16` is missed on long sight lines (a fog-of-war leak) | `fixed_point::thin_wall_blocks_long_segment` (ignored) | backend |
 | No property tests yet for `nobaas-core` codecs (wire, invite, STUN) beyond the garbage-input tests | — | qa (with NB-014 fuzzing) |
 | `browser.mjs` reports round trips and throughput but asserts only that the mesh forms and data arrives | — | qa |
 | No rustfmt on the dev host, so formatting is only checked in CI | — | ops (NB-002) |
