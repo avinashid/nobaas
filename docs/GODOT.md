@@ -69,7 +69,7 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `set_privacy_mode(mode: int)` | Which addresses this peer gives out: `PRIVACY_DIRECT` (default), `PRIVACY_PUBLIC_ONLY`, `PRIVACY_RELAY_ONLY`. From the next host/join, and for the running session's next invites and offers; links already up are kept. See [Privacy](#privacy) |
 | `get_privacy_mode() -> int` | The mode set |
 | `set_port_mapping(on: bool)` | Ask the router to forward this peer's UDP port (PCP, NAT-PMP or UPnP), from the next host/join. **Off by default**; it opens a port on the player's router. See [Router port mapping](#router-port-mapping) |
-| `get_port_mapping() -> Dictionary` | `{state, address, protocol}`: `state` is `off`, `trying`, `mapped`, `not_public` or `unavailable`; `address` (`ip:port`) and `protocol` (`pcp`, `natpmp`, `upnp`) are `""` until the router names them. Signal `port_mapping_changed(info)` fires on each change |
+| `get_port_mapping() -> Dictionary` | `{state, address, protocol}`: `state` is `off`, `trying`, `mapped`, `not_public`, `unavailable` or `relay_only`; `address` (`ip:port`) and `protocol` (`pcp`, `natpmp`, `upnp`) are `""` until the router names them. Signal `port_mapping_changed(info)` fires on each change |
 | `get_peer_key(id) -> PackedByteArray` | The 32-byte Ed25519 key that authenticated peer `id`'s link (empty if not directly connected) |
 | `set_max_peers(max: int)` / `get_max_peers()` | Host: the most joiners it keeps (default 32). Past it, a newcomer is disconnected before `peer_connected`, as with `refuse_new_connections`. Applies at once; links already up stay |
 | `get_public_key() -> PackedByteArray` | This peer's own key |
@@ -130,8 +130,10 @@ peer.host_room("my-game", room)
   - **Routers with UPnP and NAT-PMP/PCP off**, and most mobile hotspots. The state goes to `unavailable`, and the
     router is asked again every 5 minutes.
   - **IPv6** isn't mapped.
-  - **`PRIVACY_RELAY_ONLY`:** the mapped address is never given out, yet the router port is still opened. Leave
-    port mapping off with it.
+  - **`PRIVACY_RELAY_ONLY`:** port mapping is skipped under relay-only. A relay-only joiner gives out no
+    address, so the router isn't asked and the state is `relay_only`. A relay-only host still maps: it gives out
+    its public addresses, as under `PRIVACY_PUBLIC_ONLY`. Switching a running joiner to relay-only deletes its
+    mapping; switching it back asks the router again.
 - **What it does to the player's network:** while the session runs, the router forwards one UDP port to the
   player's machine from anyone on the internet, not only from peers. Anyone who finds the port reaches only the
   Noise endpoint, the same one peers dial, but it shows up in port scans. Until handshake cookies land (SEC-4 in
@@ -293,7 +295,8 @@ binary:
 - a host with two joiners over loopback: id assignment, broadcast, exclude-one targeting, kick, close;
 - refusing new connections;
 - the port-mapping switch: off by default, `unavailable` on loopback, and through a fake PCP gateway on loopback
-  `mapped`, offered in the invite and deleted when the session goes;
+  `mapped`, offered in the invite and deleted when the session goes; a relay-only joiner asks the router nothing
+  (`relay_only`) while a relay-only host still maps;
 - a room host found by two clients (and not by a client of another room) through in-process signaling; clients
   link to the host only, and a refusing host stops being found.
 

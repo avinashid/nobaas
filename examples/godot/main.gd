@@ -123,7 +123,7 @@ func _start_hosting(invite: String, message: String) -> void:
 	spawner.spawn(1)
 
 
-## "off", "trying", "mapped 203.0.113.7:41000 (upnp)", "not_public …" or "unavailable".
+## "off", "trying", "mapped 203.0.113.7:41000 (upnp)", "not_public …", "unavailable" or "relay_only".
 func _mapping_line(info: Dictionary) -> String:
 	if info["address"].is_empty():
 		return info["state"]

@@ -117,8 +117,9 @@ impl NobaasMultiplayerPeer {
 
     /// `{state, address, protocol}`: `state` is `"off"`, `"trying"`, `"mapped"`,
     /// `"not_public"` (the router is itself behind a carrier NAT, so nothing is
-    /// offered) or `"unavailable"` (no router answered, or all refused; asked
-    /// again every 5 minutes). `address` is the router's `ip:port` and `protocol`
+    /// offered), `"unavailable"` (no router answered, or all refused; asked
+    /// again every 5 minutes) or `"relay_only"` (a relay-only joiner gives out
+    /// no address, so the router isn't asked). `address` is the router's `ip:port` and `protocol`
     /// `"pcp"`, `"natpmp"` or `"upnp"`, both `""` until there is one.
     /// `port_mapping_changed` fires when it changes.
     #[func]

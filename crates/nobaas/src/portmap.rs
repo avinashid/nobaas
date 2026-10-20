@@ -72,6 +72,11 @@ pub enum PortMapping {
     NotPublic { addr: SocketAddr, protocol: MapProtocol },
     /// No gateway answered, or each protocol was refused. Asked again every 5 minutes.
     Unavailable,
+    /// Asked for, but not run while the node is under
+    /// [`Privacy::RelayOnly`](crate::Privacy::RelayOnly): it gives out no address,
+    /// so a mapped port would only be open for nothing. Any mapping is removed;
+    /// leaving relay-only asks the router again.
+    RelayOnly,
 }
 
 impl PortMapping {
@@ -688,13 +693,18 @@ impl Worker {
 }
 
 impl Worker {
-    /// Stops the thread, which deletes the mapping first. Whether it finished
-    /// within [`STOP_WAIT`].
-    fn shut_down(&mut self) -> bool {
+    /// Tells the thread to delete the mapping and end, without waiting for it.
+    pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
         if let Ok(s) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
             let _ = s.send_to(&[0], self.wake);
         }
+    }
+
+    /// Stops the thread, which deletes the mapping first. Whether it finished
+    /// within [`STOP_WAIT`].
+    fn shut_down(&mut self) -> bool {
+        self.stop();
         self.done.recv_timeout(STOP_WAIT).is_ok()
     }
 }
