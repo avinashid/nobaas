@@ -1,6 +1,6 @@
-import { loadNobaas, Lane } from '../nobaas.js';
-import { WebRtcTransport, BroadcastSignaling } from '../webrtc.js';
-import { NostrSignaling } from '../nostr.js';
+import { loadNobaas, Lane } from '../src/nobaas.js';
+import { WebRtcTransport, BroadcastSignaling } from '../src/webrtc.js';
+import { NostrSignaling } from '../src/nostr.js';
 
 const params = new URLSearchParams(location.search);
 const room = params.get('room') ?? 'demo';

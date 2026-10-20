@@ -13,8 +13,10 @@ export class WebRtcTransport {
   // `loss` drops that fraction of outgoing datagrams, for testing.
   // `trickle: false` sends one offer/answer with every candidate once ICE
   // gathering finishes (fewer signalling messages, for relays like Nostr).
-  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true } = {}) {
+  // `RTCPeerConnection` lets Node pass in an implementation (node-datachannel).
+  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     this.ep = endpoint;
+    this.Pc = RTCPeerConnection;
     this.trickle = trickle;
     this.dropped = 0;
     this.sig = signaling;
@@ -38,7 +40,7 @@ export class WebRtcTransport {
     let h = this.byPeer.get(peer);
     if (h !== undefined) return this.links.get(h);
     h = this.nextHandle++;
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    const pc = new this.Pc({ iceServers: this.iceServers });
     const dc = pc.createDataChannel('nobaas', { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 });
     dc.binaryType = 'arraybuffer';
     const l = { pc, dc, peer, handle: h, dialer: false };
@@ -67,6 +69,8 @@ export class WebRtcTransport {
   }
 
   async onSignal(from, msg) {
+    // Only an offer opens a link; answers and candidates for a dropped one are stale.
+    if (msg.kind !== 'offer' && !this.byPeer.has(from)) return;
     if (msg.kind === 'offer') {
       const l = this.link(from);
       await l.pc.setRemoteDescription(msg.sdp);
@@ -98,8 +102,28 @@ export class WebRtcTransport {
     });
   }
 
+  has(peer) {
+    return this.byPeer.has(peer);
+  }
+
+  // Forgets the link to `peer`, so a later dial or offer starts afresh.
+  drop(peer) {
+    const h = this.byPeer.get(peer);
+    if (h === undefined) return;
+    const l = this.links.get(h);
+    l.dc.onclose = null;
+    l.pc.close();
+    this.links.delete(h);
+    this.byPeer.delete(peer);
+  }
+
   close() {
-    for (const l of this.links.values()) l.pc.close();
+    for (const l of this.links.values()) {
+      l.dc.onclose = null;
+      l.pc.close();
+    }
+    this.links.clear();
+    this.byPeer.clear();
     this.sig.close();
   }
 }

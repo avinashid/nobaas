@@ -9,9 +9,9 @@
 // Players run input-only lockstep with integer physics, so every member of an
 // island computes the same state; checkpoint hashes let a test compare them.
 
-import { loadNobaas, Lane } from '../nobaas.js';
-import { WebRtcTransport, BroadcastSignaling } from '../webrtc.js';
-import { NostrSignaling } from '../nostr.js';
+import { loadNobaas, Lane } from '../src/nobaas.js';
+import { WebRtcTransport, BroadcastSignaling } from '../src/webrtc.js';
+import { NostrSignaling } from '../src/nostr.js';
 
 const HZ = 60;
 const TICK_MS = 1000 / HZ;
