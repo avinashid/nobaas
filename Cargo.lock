@@ -317,6 +317,8 @@ dependencies = [
 name = "nobaas-game"
 version = "0.1.0"
 dependencies = [
+ "rand_chacha",
+ "rand_core",
  "siphasher",
 ]
 
