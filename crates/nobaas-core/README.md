@@ -75,8 +75,10 @@ complete host loop on std UDP sockets.
   - At most 1232 bytes (`MAX_DATAGRAM`), which fits the IPv6 minimum MTU.
 - **Lanes:**
   - *Reliable*: ordered, exactly once, fragmented up to `Config::max_message` (1 MiB).
-  - *Urgent*: ordered with *Reliable*, but each fragment is sent twice, 4 ms apart, so a
-    single loss costs nothing. For small, latency-critical events; it arrives as `Lane::Reliable`.
+  - *Urgent*: exactly once and in order with other urgent messages, but in its own sequence,
+    so it never waits for *Reliable* data queued before it. Each fragment is sent twice, 4 ms
+    apart, so a single loss costs nothing. For small, latency-critical events; it arrives as
+    `Lane::Reliable`.
   - *Unreliable*: at most once, up to 1100 B (`MAX_UNRELIABLE`), drop-oldest queue.
   - Frames from every lane and ACKs are packed into one packet.
 - **Loss recovery and congestion control** on the reliable lanes:
@@ -85,11 +87,13 @@ complete host loop on std UDP sockets.
     RACK-style reordering window (RFC 8985).
   - A tail-loss probe resends the newest fragment when ACKs stop, so a lost tail costs
     about one RTT instead of an RTO.
-  - A NewReno-style AIMD congestion window (16 fragments to start, 4 at the floor), capped
-    by `Config::reliable_window` (1024). It also backs off when queueing delay passes 25 ms,
-    before any loss, which keeps router buffers short for real-time traffic. A loss halves
-    the window, except one found by fast retransmit while the RTT shows under 5 ms of
-    queueing: that is taken as random (TCP Veno) and keeps 80%.
+  - A NewReno-style AIMD congestion window (16 fragments to start, 4 at the floor), shared by
+    both lanes; each lane also stays within `Config::reliable_window` (1024) fragments. It
+    also backs off when queueing delay passes 25 ms, before any loss, which keeps router
+    buffers short for real-time traffic. A loss halves the window, except one found by fast
+    retransmit while the RTT shows under 5 ms of queueing: that is taken as random (TCP
+    Veno) and keeps 80%. Urgent fragments take free slots first, but at most half the
+    window while reliable data waits.
   - The sender keeps in-flight fragments in ordered indexes by retransmission time
     (`by_due`) and urgent-copy time (`by_dup`), so each packet visits only what is due.
 - **Liveness:** keepalive every 10 s, then a probe every 1 s while the peer is silent, and

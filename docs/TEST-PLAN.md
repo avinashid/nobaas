@@ -75,7 +75,9 @@ browser + arena ~30 s).
 
 - `wire`: frame round trips, truncated frames fail once, frame parser survives garbage, packet bounds.
 - `reliable`: out-of-order reassembly, ACK and retransmit, tail-loss probe beats the RTO, urgent fragments are
-  sent twice, buffer limit.
+  sent twice, urgent goes ahead of queued reliable data within the shared window and takes at most half of it,
+  each stream stays within the receiver's window and has its own buffer, the window grows by the slots
+  acknowledged, buffer limit.
 - `stun`: RFC 5769 IPv4/IPv6 vectors; Nobaas packets are not mistaken for STUN.
 - `crypto`, `identity`, `sealed`, `invite`, `addr`: Noise static key derivation, sign/verify, replay window,
   sealed-box open/reject, RFC 4648 vectors, invite round trip and garbage rejection, socket address round trip.

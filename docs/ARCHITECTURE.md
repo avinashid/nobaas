@@ -50,7 +50,7 @@ over a signaling carrier, and simultaneous dials. See [NAT-TRAVERSAL.md](NAT-TRA
 |---|---|---|
 | Unreliable | at most once, ≤ 1100 B, drop-oldest | positions, cursors, voice-activity |
 | Reliable | ordered, exactly once, ≤ 1 MiB (fragmented) | chat, document ops, events |
-| Urgent | reliable, and every transmission sent twice, 4 ms apart | inputs, hits, anything where p99 matters more than bytes |
+| Urgent | reliable and ordered in its own sequence, ahead of queued Reliable data; every transmission sent twice, 4 ms apart | inputs, hits, anything where p99 matters more than bytes |
 
 ## Scaling past a mesh: super-peers and islands
 

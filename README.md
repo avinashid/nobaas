@@ -38,7 +38,7 @@ node.join_room("my-game", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4"); // the room name 
 
 - **Zero backend.** Peers find each other over pluggable, untrusted signaling: an invite link or QR code, public Nostr relays, or in-process and LAN carriers. STUN learns the public address, and both sides dial at once to punch through. When two NATs can't be punched, any peer connected to both relays the traffic, so no TURN server is needed.
 - **Encrypted, key-addressed.** A `PeerId` *is* an Ed25519 public key. Every link is a `Noise_IK_25519_ChaChaPoly_BLAKE2s` session, so dialling an ID authenticates whoever answers. Signaling relays, peer relays and NATs in the path can't read or forge traffic.
-- **Real-time lanes.** Each link has three lanes. *Unreliable* is for state. *Reliable* is ordered and carries up to 1 MiB, for events. *Urgent* is reliable and sends every fragment twice, 4 ms apart, for inputs and hits. Selective ACKs, tail-loss probes and delay-based congestion control keep p99 latency low under loss.
+- **Real-time lanes.** Each link has three lanes. *Unreliable* is for state. *Reliable* is ordered and carries up to 1 MiB, for events. *Urgent* is reliable, goes ahead of queued reliable data and sends every fragment twice, 4 ms apart, for inputs and hits. Selective ACKs, tail-loss probes and delay-based congestion control keep p99 latency low under loss.
 - **One core, every platform.** `nobaas-core` never touches sockets, threads or clocks. The same deterministic state machine is driven by a native UDP socket, tokio, a browser WebRTC DataChannel, a C caller or Godot, and replayed exactly by the network simulator.
 - **Scales past the mesh.** The game layer splits players into islands of up to 12 along a Hilbert curve. Super-peers bundle each island's traffic, with failover and overload control. 512 players were simulated at a p99 lag of 79 ms.
 
@@ -301,7 +301,7 @@ drops the link: builds before 1.0 don't promise to interoperate.
 |---|---|---|---|
 | `Unreliable` | at most once, drop-oldest | ≤ 1100 B | positions, cursors, voice activity |
 | `Reliable` | ordered, exactly once, fragmented | ≤ 1 MiB | chat, document ops, game events |
-| `Urgent` | reliable, and every fragment is sent twice, 4 ms apart | ≤ 1 MiB | inputs, hits: anything where p99 beats bytes |
+| `Urgent` | exactly once, ordered among urgent messages, ahead of queued `Reliable` data; every fragment sent twice, 4 ms apart | ≤ 1 MiB | inputs, hits: anything where p99 beats bytes |
 
 The reliable lane is a small, real-time-tuned transport:
 

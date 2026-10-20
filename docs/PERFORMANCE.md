@@ -49,11 +49,17 @@ aarch64 core.
 
 | Link | Throughput | Peak cwnd / inflight | Delay backoffs | Retransmits | Urgent p50 / p99 | Sender CPU per fragment |
 |---|---|---|---|---|---|---|
-| Clean | 9.14 MB/s (7.3 s) | 1561 / 1024 | 1 | 0 | 326 / 875 ms | 5 µs |
-| 1% loss | 0.20 MB/s (333 s) | 339 / 339 | 0 | 996 | 18 / 23 s | 6 µs |
-| 0–10 ms jitter, drawn per packet (reorders) | 7.00 MB/s (9.6 s) | 952 / 952 | 2 | 0 | 451 / 975 ms | 6 µs |
-| 0–10 ms jitter, in order | 6.02 MB/s (11.1 s) | 899 / 899 | 2 | 12 | 526 / 1106 ms | 5 µs |
-| Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60416 / 1024 | 0 | 0 | 292 / 797 ms | 5 µs |
+| Clean | 9.18 MB/s (7.3 s) | 1511 / 1025 | 1 | 0 | 50 / 130 ms | 5 µs |
+| 1% loss | 0.20 MB/s (332 s) | 336 / 336 | 0 | 966 | 72 / 131 ms | 5 µs |
+| 0–10 ms jitter, drawn per packet (reorders) | 7.10 MB/s (9.5 s) | 970 / 970 | 2 | 3 | 56 / 119 ms | 6 µs |
+| 0–10 ms jitter, in order | 5.85 MB/s (11.5 s) | 865 / 865 | 2 | 0 | 60 / 128 ms | 5 µs |
+| Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60353 / 1026 | 0 | 0 | 50 / 130 ms | 5 µs |
+
+Inflight counts window slots: a reliable fragment is one, an urgent fragment its share of one by wire size. The
+jitter rows depend on the seed (the table is seed 1): over seeds 1–60 they average 7.39 MB/s per packet and
+5.42 MB/s in order, against 7.47 and 5.58 MB/s before PERF-9 (`a6e4a69`), with Urgent p99 120–128 ms against
+963–1178 ms. For example:
+`for s in $(seq 1 60); do cargo run -q --release -p nobaas-sim --example bulk -- --jitter 10 --seed $s; done`.
 
 What limits it:
 - **One delay backoff costs 15% of the window.** Slow start puts 1024 fragments per RTT on the wire, about
@@ -73,8 +79,14 @@ What limits it:
   round trip and the link was dropped after 0.54 s. Each copy is now resent once, and only after an ACK for a
   fragment sent after it; reordering within a quarter of the minimum RTT (RACK's window) is not taken as loss, so
   per-packet jitter costs no retransmissions.
-- **Urgent messages wait behind queued bulk data.** They share the reliable queue, so their latency is the time to
-  drain the send buffer (up to 4 MiB), not the RTT.
+- **Urgent messages don't wait behind queued bulk data.** Before PERF-9 they shared the reliable sequence, so their
+  latency was the time to drain the send buffer (p50/p99 326/875 ms clean, 18/23 s at 1% loss). Urgent now has its
+  own sequence and send buffer and takes free window slots first, so it waits only for the path: 50 ms one way,
+  plus the queue that slow start builds before the first backoff (the p99). At most half the congestion window goes
+  to urgent fragments while reliable data waits, and they count by wire size, so 50–200 small inputs a second take
+  a few slots, and the window grows by the slots acknowledged. With 64 B urgent messages at 200 Hz: clean
+  9.18 MB/s and 50/130 ms, against 9.00 MB/s and 333/886 ms before; at 1% loss 0.19 MB/s and 84/145 ms, against
+  0.17 MB/s and 21/27 s.
 - **Sender CPU no longer grows with fragments in flight.** Before PERF-6, `RelSend::has_sendable`, `next_due` and
   `write_frames` walked every in-flight fragment on each packet: about 68% of the sender's CPU at 100 Mbit/s and
   81% at a steady 1024 in flight (19 and 28 µs per fragment). They now read ordered indexes of retransmission and

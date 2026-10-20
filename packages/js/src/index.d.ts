@@ -7,7 +7,8 @@ export type PeerId = string;
 export type Presence = any;
 
 /** `reliable`: ordered, retransmitted. `unreliable`: latest-wins datagrams, one packet at most.
- * `urgent`: reliable, each fragment sent twice; arrives as `reliable`. */
+ * `urgent`: reliable, each fragment sent twice, ordered only among urgent messages (it overtakes queued
+ * `reliable` data); arrives as `reliable`. */
 export type LaneName = 'reliable' | 'unreliable' | 'urgent';
 
 /** What `room.send` accepts. Strings arrive as strings, bytes as a Uint8Array, anything else as parsed JSON. */

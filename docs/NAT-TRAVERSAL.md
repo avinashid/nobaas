@@ -237,7 +237,8 @@ gives out. Changing it affects the next invites and offers; links already up kee
     is itself dialling directly or already has a direct link with. It sends no OBSERVED frames or origin tags.
   - It sends its relayed packets in `FWD_QUIET` frames: the relay forwards them in `RELAYED` frames with no
     origin address. (`FWD` asks the relay to say where it sees the sender, so that the far end can punch.) A
-    build older than `FWD_QUIET` takes frame type 11 as a protocol violation and drops the link.
+    build older than `FWD_QUIET` takes frame type 11 as a protocol violation and drops the link. In the same way
+    a build from before the urgent stream drops a link on its first `Urgent` message (frame types 12 and 13).
   - Cost: latency `rtt(A,R) + rtt(R,B)`, and the relay uploads every relayed byte again (capped by
     `Config::relay_rate`, 256 KiB/s per requesting peer by default).
 

@@ -61,7 +61,8 @@ await room.leave();                             // peers see 'peer-leave' at onc
   anything else as JSON.
 - **Lanes:** `reliable` (default: ordered, retransmitted), `unreliable` (no
   retransmits, for positions and cursors), `urgent` (reliable, each fragment sent
-  twice). Reliable sends past the send window queue up instead of failing.
+  twice, ordered only among urgent messages so it overtakes queued `reliable`
+  data). Reliable sends past the send window queue up instead of failing.
 - **Presence** travels over the encrypted links, not through signalling. A peer
   counts as joined once its presence has arrived, so `peer-join` always has it.
 - **Closed rooms:** the roomId is the room's secret. Relays see only a hash of it
