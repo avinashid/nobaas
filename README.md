@@ -70,6 +70,8 @@ ep.send(peerId, Lane.Reliable, new TextEncoder().encode('hello'));
 | Path | What it is |
 |---|---|
 | `crates/nobaas-core` | Sans-IO session core: identity, Noise handshake, reliable/unreliable/urgent lanes, NAT traversal, peer relay, STUN codec, invites |
+| `crates/nobaas` | The Rust facade: `Node` on a UDP socket (sync, or `AsyncNode` with tokio), STUN, rooms, signaling (`MemoryHub`, Nostr), NAT traversal |
+| `bindings/godot` | Godot 4 GDExtension: `NobaasMultiplayerPeer` (see `docs/GODOT.md`) |
 | `crates/nobaas-sim` | Deterministic network simulator (latency, jitter, loss, NAT types, uplink limits) and the multiplayer arena benchmark |
 | `crates/nobaas-ffi` | C ABI: one surface for WebAssembly (browsers, Node) and native FFI |
 | `crates/nobaas-game` | Deterministic fixed-point maths, Hilbert-curve islands and desync detection |

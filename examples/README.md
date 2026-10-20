@@ -6,7 +6,9 @@
 | whiteboard | planned (NB-008) | CRDT strokes, live cursors |
 | game | planned (NB-009); today: `packages/js/demo/arena.html` | super-peer lockstep islands |
 | meet | planned (NB-010) | WebRTC audio/video over Nobaas signaling |
-| [godot](godot/) | working (NB-020) | Godot 4 `@rpc`, `MultiplayerSynchronizer`, `MultiplayerSpawner` over Nobaas; see [docs/GODOT.md](../docs/GODOT.md) |
+| [godot](godot/) | working (NB-020, NB-004) | Godot 4 `@rpc`, `MultiplayerSynchronizer`, `MultiplayerSpawner` over Nobaas, by invite or room, through NATs; see [docs/GODOT.md](../docs/GODOT.md) |
 | [rust/echo.rs](rust/echo.rs) | working (NB-003) | `nobaas::Node`: host prints an invite, joiner echoes |
+| [rust/echo_async.rs](rust/echo_async.rs) | working (NB-003) | the same with `nobaas::AsyncNode` on tokio |
+| [rust/nostr_relay.rs](rust/nostr_relay.rs) | working (NB-004) | a minimal in-memory Nostr relay for tests and LAN play |
 
 Until then, the working demos are in [`packages/js/demo`](../packages/js/demo).

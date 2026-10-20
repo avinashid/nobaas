@@ -38,6 +38,9 @@
    addresses, and through any mutual peer that can relay.
 3. **Handshake.** It takes one RTT. When both sides dial at once, the dial from the smaller PeerId wins, so
    exactly one link results.
+
+For native nodes the `nobaas` crate automates steps 1 and 2: STUN for the public address, rooms and sealed offers
+over a signaling carrier, and simultaneous dials. See [NAT-TRAVERSAL.md](NAT-TRAVERSAL.md).
 4. **Upgrade to direct.** If the link is relayed, it keeps punching candidates (with port spraying for
    sequential NATs). It moves to a direct path only after an echoed PUNCH_ACK.
 

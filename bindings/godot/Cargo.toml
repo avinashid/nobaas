@@ -11,6 +11,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-nobaas = { path = "../../crates/nobaas" }
+# Nostr signaling for rooms and NAT-punching invites.
+nobaas = { path = "../../crates/nobaas", features = ["nostr"] }
 # 0.5.5 with the Godot 4.3 API: the extension loads in Godot 4.3 and later.
 godot = { version = "=0.5.5", features = ["api-4-3"] }

@@ -669,15 +669,12 @@ mod tests {
         assert_eq!(run([4000, 4001]).0, NatType::Symmetric);
         // Unanswered: retransmitted twice, then given up until the next round.
         let mut t = Traversal::new(&ia, [3; 32], 0, vec![local], vec![s1]);
-        let mut now = Instant::ZERO;
         let mut sent = 0;
         while let Some(at) = t.poll_timeout().filter(|t| *t < Instant::from_millis(20_000)) {
-            now = at;
-            t.handle_timeout(now, &mut ep);
+            t.handle_timeout(at, &mut ep);
             sent += std::iter::from_fn(|| t.poll_transmit()).count();
         }
         assert_eq!((sent, t.nat_type()), (3, NatType::Unknown));
-        assert_eq!(t.poll_timeout(), Some(STUN_INTERVAL.as_micros() as u64).map(Instant::from_micros));
-        let _ = now;
+        assert_eq!(t.poll_timeout(), Some(Instant::ZERO + STUN_INTERVAL));
     }
 }
