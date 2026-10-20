@@ -50,7 +50,7 @@ aarch64 core.
 | Link | Throughput | Peak cwnd / inflight | Delay backoffs | Retransmits | Urgent p50 / p99 | Sender CPU per fragment |
 |---|---|---|---|---|---|---|
 | Clean | 9.14 MB/s (7.3 s) | 1561 / 1024 | 1 | 0 | 326 / 875 ms | 5 µs |
-| 1% loss | 0.13 MB/s (504 s) | 339 / 339 | 0 | 977 | 27 / 34 s | 5 µs |
+| 1% loss | 0.20 MB/s (333 s) | 339 / 339 | 0 | 996 | 18 / 23 s | 6 µs |
 | 0–10 ms jitter, drawn per packet (reorders) | 7.00 MB/s (9.6 s) | 952 / 952 | 2 | 0 | 451 / 975 ms | 6 µs |
 | 0–10 ms jitter, in order | 6.02 MB/s (11.1 s) | 899 / 899 | 2 | 12 | 526 / 1106 ms | 5 µs |
 | Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60416 / 1024 | 0 | 0 | 292 / 797 ms | 5 µs |
@@ -59,14 +59,20 @@ What limits it:
 - **One delay backoff costs 15% of the window.** Slow start puts 1024 fragments per RTT on the wire, about
   103 Mbit/s, so the uplink queues. Queueing delay over `QUEUE_TARGET` sets ssthresh to 85% of inflight (about
   870), and congestion avoidance then adds about one fragment per RTT. Before PERF-7B the cut halved the window
-  (to about 512), which held the clean run to 5.94 MB/s and the jitter runs to 3.26 and 2.89 MB/s. A loss still
-  halves the window, so the loss row is unchanged.
-- **Loss caps the window, as in any Reno-style sender.** At 1% loss the window settles near
-  `1.22 / √p` ≈ 12 fragments, which is **0.13 MB/s** at 100 ms (the Mathis bound, matched by the run). Before
-  PERF-8, fast retransmit resent a lost fragment on every later ACK, so it reached `MAX_TRIES` in one round trip
-  and the link was dropped after 0.54 s. Each copy is now resent once, and only after an ACK for a fragment sent
-  after it; reordering within a quarter of the minimum RTT (RACK's window) is not taken as loss, so per-packet
-  jitter costs no retransmissions.
+  (to about 512), which held the clean run to 5.94 MB/s and the jitter runs to 3.26 and 2.89 MB/s.
+- **Loss caps the window, as in any Reno-style sender.** A sender that halves on every loss settles near
+  `1.22 / √p` ≈ 12 fragments at 1% loss, which is 0.13 MB/s at 100 ms (the Mathis bound; the run matched it before
+  PERF-7V). Since PERF-7V a loss found by fast retransmit while the latest RTT sample showed under 5 ms of queueing
+  is taken as random, as in TCP Veno, and keeps 80% of the window: keeping a share `b` gives
+  `√((1+b) / (2(1−b)p))`, **theoretical** 2.12 / √p ≈ 21 fragments, 0.23 MB/s. The run gets **0.20 MB/s**,
+  because a timeout still halves, and many of its timeouts are spurious: the 64-fragment SACK bitmap can't report
+  fragments further above a hole while the hole is repaired. A buffer that overflows usually shows in the RTT
+  first, so that loss still halves; behind a buffer shorter than 5 ms congestive loss looks random too and keeps
+  80%, as it does for every sender on that link.
+- **Before PERF-8**, fast retransmit resent a lost fragment on every later ACK, so it reached `MAX_TRIES` in one
+  round trip and the link was dropped after 0.54 s. Each copy is now resent once, and only after an ACK for a
+  fragment sent after it; reordering within a quarter of the minimum RTT (RACK's window) is not taken as loss, so
+  per-packet jitter costs no retransmissions.
 - **Urgent messages wait behind queued bulk data.** They share the reliable queue, so their latency is the time to
   drain the send buffer (up to 4 MiB), not the RTT.
 - **Sender CPU no longer grows with fragments in flight.** Before PERF-6, `RelSend::has_sendable`, `next_due` and
