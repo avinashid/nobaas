@@ -84,6 +84,8 @@ browser + arena ~30 s).
 | `fixed_point.rs` | int conversion (floors), saturating add/sub vs an i64 reference, mul vs `(a*b)>>16`, mul/div identities, div inverts mul within tolerance, div by zero panics, `q16_sqrt` is the exact floor and monotonic, physics step per input bit, dash, arena clamp, bit-identical replay, line of sight |
 | `hilbert.rs` | known order-1/2 indices, bijection and grid-adjacent steps on every grid up to 64×64, range on 65536², partition invariants (each player once, full islands, ids, Hilbert order, non-overlapping ranges), `k_max` clamp, input-order independence with position ties, off-grid positions, spatial locality |
 | `desync.rs` | CRC golden values (a change is a wire break), determinism, every hashed field changes the CRC (collisions bounded), order sensitivity, input bits not hashed, quorum known cases (exact 2/3, below 2/3, output order) and a property over island sizes 1–12 |
+| `restored.rs` | the checks from the original `p0-hilbert-rollback` tests that still apply (Hilbert neighbours, ten-tick step, the wall-at-x∈[4,6] sight line, 4-peer quorum eviction); the rollback-simulator and witness parts return with NB-018 |
+| `lockstep.rs` | 30 players × 600 ticks replayed by peers that registered players in different orders: identical island hashes on every tick; a golden digest of the whole run (a change is a protocol break); one wrong input diverges exactly one island and the quorum names the cheater |
 
 ### nobaas-sim arena (`crates/nobaas-sim/tests/arena.rs`)
 
@@ -96,6 +98,43 @@ is the full harness for `docs/PERFORMANCE.md`.
 `two_endpoints_through_the_c_abi` (Rust), `node_pair.mjs` (wasm in Node), `browser.mjs` and `arena.mjs`
 (Chromium, WebRTC over loopback), `nostr.mjs` (opt-in).
 
+## Godot binding (NB-020)
+
+The binding must be testable with plain `cargo test`, with no Godot binary. The design rule that makes this
+possible: keep the MultiplayerPeer logic in a Godot-free Rust module (no `godot` types in its API), and make
+`NobaasMultiplayerPeer` a thin GDExtension shell that only converts types and forwards calls. The same logic module
+runs on a test double, on `nobaas-sim` and inside Godot.
+
+**Unit tests (logic module, `cargo test`):**
+
+- *Peer IDs:* the host is 1; a joiner's ID comes from its Nobaas PeerId, is in `2..=i32::MAX`, and stays the same
+  across reconnects. Collisions are forced with an injected hash, and every peer must resolve them to the same IDs
+  whatever order the joins arrive in (a property test over shuffled join orders).
+- *Packet queue:* FIFO; `_get_available_packet_count` matches the queue length; `_get_packet_peer` belongs to the
+  packet `_get_packet_script` returns next. Target peer `0` means broadcast, `-id` means everyone except `id`, and
+  an unknown target is an error. Packets from a peer that disconnected before they were drained are handled the
+  way the spec decides.
+- *Transfer modes:* reliable goes to the reliable lane and unreliable to the unreliable lane. Unreliable-ordered
+  never delivers a packet older than one already delivered (property: random reordering, the output sequence is
+  strictly increasing). Packets over the unreliable limit (1100 B) are rejected. Ordering holds per channel.
+- *Connection status:* disconnected → connecting → connected; `host()` connects immediately and returns an invite
+  that parses; a bad invite or a failed join returns to disconnected; `_close` and `_disconnect_peer` raise
+  `peer_disconnected` once per peer.
+
+**Simulator tests (`crates/nobaas-sim/tests/godot_peer.rs`):** a host and three joiners on `nobaas-sim` through
+the logic module, at 0 % and 5 % loss with jitter and behind the NAT matrix. Every `@rpc`-style reliable packet
+arrives exactly once and in order, unreliable-ordered packets never go backwards, a joiner dropping out raises
+`peer_disconnected` on the others, and the same seed replays the run exactly.
+
+**Determinism:** lockstep game logic uses `nobaas-game` fixed-point maths, not Godot physics. `lockstep.rs` is
+the reference: the binding's demo state hash must match a Rust replay of the same input log.
+
+**Headless Godot smoke test (opt-in, not in the default gate):** Godot 4.7.2 is installed at `~/.local/bin/godot`.
+Once `examples/godot/` exists, a `scripts/godot-smoke.sh` starts one `godot --headless` instance that hosts and
+writes its invite to a file, and a second that joins with it. They exchange an `@rpc` chat line and a few
+synchronizer updates, then both exit 0 within a timeout. It runs on loopback only and gets added as a
+`--godot` flag on `scripts/gate.sh`.
+
 ## Known gaps
 
 | Gap | Test | Owner |
@@ -105,7 +144,7 @@ is the full harness for `docs/PERFORMANCE.md`.
 | No property tests yet for `nobaas-core` codecs (wire, invite, STUN) beyond the garbage-input tests | — | qa (with NB-014 fuzzing) |
 | `browser.mjs` reports round trips and throughput but asserts only that the mesh forms and data arrives | — | qa |
 | No rustfmt on the dev host, so formatting is only checked in CI | — | ops (NB-002) |
-| Planned crates (facade, sync, media, store) have no tests yet; each lands with its own | — | backend |
+| Planned crates (facade, sync, media, store, Godot binding) have no tests yet; each lands with its own, per the plans above | — | backend |
 
 ## CI
 
