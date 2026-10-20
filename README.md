@@ -281,6 +281,7 @@ frames (inside DATA, several per packet):
   CLOSE
   OBSERVED  alen(u8) addr               "I see you at addr" (reflexive address)
   FWD       to(32) len(u16) packet      relay: please forward this packet to peer `to`
+  FWD_QUIET to(32) len(u16) packet      the same, without telling `to` my address (relay-only)
   RELAYED   alen(u8) addr len(u16) packet   relayed packet + where the relay saw its origin
   PUNCH     token(u64) / PUNCH_ACK token(u64)   hole-punch probe and its echo
 ```
@@ -322,11 +323,11 @@ Details are in [docs/NAT-TRAVERSAL.md](docs/NAT-TRAVERSAL.md).
 | **STUN** | Binding requests go out on the session socket, every 25 s, which also keeps the mapping alive. The defaults are `stun.l.google.com:19302` and `stun.cloudflare.com:3478`. An answer counts only if it comes from the queried server and echoes the random 96-bit transaction id. The first byte (RFC 7983) separates STUN from session traffic. |
 | **Signaling** | `trait Signaling { subscribe, unsubscribe, publish, poll }` over 32-byte topics. `MemoryHub` runs in-process. `NostrSignaling` (feature `nostr`) sends ephemeral events of kind 25059 over websocket relays: `wss://` uses rustls with the webpki roots. The NIP-01 event id is checked before deduplication. Frames above 128 KiB are rejected, and the queue is capped at 1024 events. |
 | **Topics** | Room topic: `sha256("nobaas/room/" + app + "/" + room)`. Inbox: `sha256("nobaas/peer/" + hex(PeerId))`. These are the same derivations as the JS package, so Rust and browser peers can share relays. |
-| **Room key** | `sha256("nobaas/room-key/" + app + "/" + room)` is a different label over the same name, so it can't be derived from the topic. Hellos and offers carry HMAC-SHA256 proofs under it. Forged ones are dropped before they cost anything. |
-| **Offers** | `Noise_X` sealed boxes to one recipient, with the sender authenticated. Each carries up to 8 candidate addresses, the NAT type, up to 8 connected peers (possible relays), a timestamp (±60 s), a random nonce (replays are dropped) and, in rooms, an HMAC proof. |
+| **Room key** | `sha256("nobaas/room-key/" + app + "/" + room)` is a different label over the same name, so it can't be derived from the topic. Hellos (with the sender's clock, ±60 s) and offers carry HMAC-SHA256 proofs under it. Forged or stale ones are dropped before they cost anything. |
+| **Offers** | `Noise_X` sealed boxes to one recipient, with the sender authenticated. Each carries up to 8 candidate addresses (as the [privacy mode](#privacy-modes) allows), the NAT type, up to 8 connected peers (possible relays), a timestamp (±60 s), a random nonce (replays are dropped) and an HMAC proof: under the room key in a room, or under the recipient's invite key. A node acts on an offer only with a valid proof, or from a peer it dialled itself. |
 | **Punching** | Both sides call `connect_with` on every *dialable* candidate at the same moment. Loopback, unspecified, multicast and broadcast addresses are refused, so an offer can't aim a node at its own host's services. PUNCH probes go every 100 ms for 5 s. A path counts as direct only after an echoed `PUNCH_ACK`. |
 | **Relay fallback** | If no direct path opens, as between two symmetric NATs, the link runs `Path::Via(peer)` through a mutual peer. The relay forwards only ciphertext: `FWD` and `RELAYED` frames wrap the end-to-end packet. The link keeps trying to go direct. |
-| **Abuse limits** | Hellos answered and offers acted on each have a token budget: a burst of 30, then one every 2 s. Each sender also has its own limit: a burst of 8, then one per second. Proofs are checked before any token is spent. |
+| **Abuse limits** | Hellos answered and offers acted on each have a token budget: a burst of 30, then one every 2 s. Each sender also has its own limit: a burst of 8, then one per second. Proofs are checked before any token is spent, and answers from peers a node dialled itself don't draw on the node's budget. |
 
 **Simulated outcome.** In a room of two with signaling only, **43 of 64** NAT-type pairings connect directly in
 360–860 ms. These pairings cover public, full-cone, restricted, port-restricted, sequential and random symmetric,
@@ -336,24 +337,45 @@ a room with a third peer they connect relayed through it.
 ### Invites
 
 ```text
-"nb:" base64url( version(1)=1  peer(32)  n(u8) [alen(u8) addr]*  m(u8) [relay_peer(32) alen(u8) addr]* )
+"nb:" base64url( version(1)=2  peer(32)  key(32)  n(u8) [alen(u8) addr]*  m(u8) [relay_peer(32) alen(u8) addr]* )
 ```
 
-An invite carries no secrets. It is a public key and some places to try it. Whoever answers must prove they hold
-the key in the handshake. `Node::connect` dials the invite's addresses and also sends the host a sealed offer, so
-the host dials back at the same moment and the two punch through.
+An invite is a public key, some places to try it, and an *invite key*. Whoever answers must prove they hold the
+public key in the handshake. `Node::connect` dials the invite's addresses and also sends the host a sealed offer,
+proved with the invite key, so the host dials back at the same moment and the two punch through. The invite key is
+what makes the host dial back: someone who knows only its PeerId gets no answer and no address. Version 1 (no key)
+still parses; such an invite works only where the host is reachable without a dial-back.
+
+### Privacy modes
+
+Peers linked directly see each other's IP address: their packets carry it. A node picks what it gives out with
+`Builder::privacy` or, at runtime, `Node::set_privacy` (the next invites and offers change; links already up stay
+as they are):
+
+| Mode | Invites and offers carry | Links | Cost |
+|---|---|---|---|
+| `Privacy::Direct` (default) | every candidate: public, LAN, loopback | direct where possible | none |
+| `Privacy::PublicOnly` | public addresses only, no LAN, loopback, CGNAT or link-local | direct where possible | peers on one LAN go through their NAT (if it hairpins) or a relay |
+| `Privacy::RelayOnly { via }` | nothing; the relay (`via`, or the room host) gets the public addresses | every link but the relay's goes `Path::Via(relay)` and never punches to direct; `connect` fails with `ConnectError::NoRelay` rather than going direct | latency `rtt(A,R) + rtt(R,B)` instead of `rtt(A,B)`; the relay uploads every relayed byte again, capped at `Config::relay_rate` (256 KiB/s) per peer |
+
+Under `RelayOnly` the relay sees both ends' addresses (it links to both directly), and is asked, with `FWD_QUIET`,
+not to tell the far end where it sees this node. In the simulator (`privacy_modes_matrix`, a room with a public host
+and 37 pairs of peers): Direct links 25 pairs directly and relays 12, PublicOnly 24 and 13 (the LAN pair goes through
+the host), RelayOnly 0 and 37. None fail. In the Godot binding, players link only with the host anyway, so they
+never see each other's addresses in any mode. Browsers: `privacy: 'public-only'` drops `host` ICE candidates;
+`'relay-only'` opens WebRTC to the relay only (there is no TURN).
 
 ### Security model
 
 | Party | Can see | Cannot do |
 |---|---|---|
 | Signaling relay, or anyone watching it | room and inbox topics (hashes), the PeerIds and roles in hellos, timing, source IPs | read offers or addresses, join a room or pose as its host without the name, forge a link |
-| Peer relay (`Path::Via`) | that A and B talk, packet sizes and timing | read, modify or inject session traffic |
+| Anyone who knows a PeerId (not the invite) | the PeerId | make the node dial back, or learn its addresses |
+| Peer relay (`Path::Via`) | that A and B talk, both their IP addresses, packet sizes and timing | read, modify or inject session traffic |
 | On-path attacker | ciphertext | impersonate a PeerId, replay data packets |
-| Room member | other members' PeerIds and candidate addresses | pose as another PeerId |
+| Room member, or invite holder | candidate addresses: all (`Direct`), public only (`PublicOnly`), none (`RelayOnly`, unless it is the relay); the source IP of a direct link | pose as another PeerId |
 
-PeerIds are public. Anyone who knows a node's PeerId can send it an offer, much like holding its invite. Report
-vulnerabilities privately: see [SECURITY.md](SECURITY.md).
+Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 
 ### Scaling: islands and super-peers
 
