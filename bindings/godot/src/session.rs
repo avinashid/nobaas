@@ -979,16 +979,18 @@ mod tests {
                 1 => peer(99, rng.byte()),
                 _ => *rng.pick(&known),
             };
-            let b = frame(&mut rng);
+            let (b, lane) = (frame(&mut rng), *rng.pick(&[Lane::Reliable, Lane::Unreliable]));
             let (before, queued) = (s.my_id, s.inbox.len());
-            s.on_message(from, &b);
+            s.on_message(from, lane, &b);
             if s.my_id != before {
                 assert!(before == 0 && from == hp && assigned.is_none(), "case {i}: id {before} -> {}", s.my_id);
                 assigned = Some(s.my_id);
                 allowed.push(HOST_ID);
             }
-            if s.inbox.len() > queued || s.inbox.len() == MAX_INBOX {
-                assert!(allowed.contains(&s.inbox.back().unwrap().from), "case {i}: a packet from a stranger");
+            if s.inbox.len() > queued {
+                let p = s.inbox.back().unwrap();
+                assert!(allowed.contains(&p.from), "case {i}: a packet from a stranger");
+                assert_eq!(p.mode.lane(), lane, "case {i}: a mode the lane didn't give (N29-1)");
             }
             assert!(s.inbox.len() <= MAX_INBOX && s.inbox_bytes <= MAX_INBOX_BYTES);
             if i % 512 == 0 {
