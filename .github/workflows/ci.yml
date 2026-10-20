@@ -1,10 +1,11 @@
 name: CI
 
+# Lean on purpose: the repo is private and every minute counts against the Actions quota.
+# Linux only, two jobs, cached builds, superseded runs cancelled.
 on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,21 +19,10 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --release
-
-  clippy:
+  rust:
+    name: test + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,71 +30,26 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  fmt:
-    runs-on: ubuntu-latest
-    # Non-blocking until the tree has had one `cargo fmt` pass: the code is formatted by hand today
-    # (rustfmt is not installed on the dev host), so the check would fail on every run.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all --check
+      - run: cargo test --workspace --release
 
   wasm:
+    name: wasm + node
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/web"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: ./packages/js/build.sh
       - name: Size (<= 350 KiB) and zero imports
         run: node .github/scripts/wasm-check.mjs packages/js/pkg/nobaas_ffi.wasm 358400
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nobaas-wasm
-          path: packages/js/pkg/nobaas_ffi.wasm
-          retention-days: 7
-
-  node:
-    needs: wasm
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - uses: actions/download-artifact@v4
-        with:
-          name: nobaas-wasm
-          path: packages/js/pkg
       - run: node packages/js/test/node_pair.mjs
 
-  browser:
-    needs: wasm
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - uses: actions/download-artifact@v4
-        with:
-          name: nobaas-wasm
-          path: packages/js/pkg
-      - name: Install Playwright and Chromium
-        run: |
-          npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/pw" playwright
-          "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps chromium
-          echo "PLAYWRIGHT=$RUNNER_TEMP/pw/node_modules/playwright/index.mjs" >> "$GITHUB_ENV"
-      # Loopback only: a local static server and headless Chromium, no STUN or relays.
-      - run: node packages/js/test/browser.mjs 3
-      - run: node packages/js/test/arena.mjs 4 10
+  # Next: a `godot` job building the GDExtension (NB-020) goes here, Linux only to start.
