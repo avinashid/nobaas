@@ -236,6 +236,12 @@ pub struct PeerStats {
     pub fragments_sent: u64,
     /// Reliable fragments sent again (timeouts, fast retransmits, tail probes).
     pub retransmits: u64,
+    /// Congestion window, in fragments (before the `reliable_window` cap).
+    pub cwnd: u32,
+    /// Reliable fragments sent and not yet acknowledged.
+    pub inflight: u32,
+    /// Window reductions caused by queueing delay rather than loss.
+    pub delay_backoffs: u64,
 }
 
 impl PeerStats {
@@ -506,6 +512,9 @@ impl<A: Address> Endpoint<A> {
                 min_rtt: l.tx.path_min_rtt(),
                 fragments_sent: l.tx.fragments_sent,
                 retransmits: l.tx.retransmits,
+                cwnd: l.tx.cwnd(),
+                inflight: l.tx.inflight(),
+                delay_backoffs: l.tx.delay_backoffs,
             }),
             State::Dialing(_) => None,
         }

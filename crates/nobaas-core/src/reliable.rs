@@ -139,6 +139,14 @@ impl RelSend {
         self.srtt
     }
 
+    pub(crate) fn cwnd(&self) -> u32 {
+        self.cwnd as u32
+    }
+
+    pub(crate) fn inflight(&self) -> u32 {
+        self.inflight.len() as u32
+    }
+
     pub(crate) fn push_message(
         &mut self,
         data: &[u8],

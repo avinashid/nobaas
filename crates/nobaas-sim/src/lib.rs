@@ -94,11 +94,21 @@ pub struct NetConfig {
     pub jitter: Duration,
     pub loss: f64,
     pub duplicate: f64,
+    /// Packets between two addresses never overtake each other: jitter varies
+    /// the delay without reordering, as on one queue. Off, each packet's
+    /// jitter is drawn alone, so fast senders see heavy reordering.
+    pub in_order: bool,
 }
 
 impl Default for NetConfig {
     fn default() -> Self {
-        NetConfig { latency: Duration::from_millis(20), jitter: Duration::ZERO, loss: 0.0, duplicate: 0.0 }
+        NetConfig {
+            latency: Duration::from_millis(20),
+            jitter: Duration::ZERO,
+            loss: 0.0,
+            duplicate: 0.0,
+            in_order: false,
+        }
     }
 }
 
@@ -128,6 +138,9 @@ pub struct Node {
     pub rx_bytes: u64,
     /// STUN datagrams that arrived for this node, with their source; the host takes them.
     pub stun_inbox: Vec<(SimAddr, Vec<u8>)>,
+    /// Wall-clock time spent inside this node's endpoint calls, when
+    /// [`Sim::measure_cpu`] is on. Not virtual time, so not deterministic.
+    pub cpu: Duration,
     tx_free_at: Instant,
 }
 
@@ -177,9 +190,13 @@ pub struct Sim {
     pub net: NetConfig,
     pub hook: Option<Hook>,
     pub stats: SimStats,
+    /// Time each node's endpoint calls with the wall clock (into `Node::cpu`), for benchmarks.
+    pub measure_cpu: bool,
     owners: HashMap<u32, Owner>,
     nats: Vec<Nat>,
     queue: BinaryHeap<InFlight>,
+    /// Latest arrival per (from, to), for `NetConfig::in_order`.
+    last_arrival: HashMap<(SimAddr, SimAddr), Instant>,
     seq: u64,
     rng: ChaCha20Rng,
     next_ip: u32,
@@ -198,9 +215,11 @@ impl Sim {
             net,
             hook: None,
             stats: SimStats::default(),
+            measure_cpu: false,
             owners: HashMap::new(),
             nats: Vec::new(),
             queue: BinaryHeap::new(),
+            last_arrival: HashMap::new(),
             seq: 0,
             rng: ChaCha20Rng::seed_from_u64(seed),
             next_ip: 0x0a00_0001,
@@ -294,6 +313,7 @@ impl Sim {
             rx_packets: 0,
             rx_bytes: 0,
             stun_inbox: Vec::new(),
+            cpu: Duration::ZERO,
             tx_free_at: Instant::ZERO,
         });
         self.timers.push(None);
@@ -412,18 +432,34 @@ impl Sim {
         let touched = std::mem::take(&mut self.touched);
         for &i in &touched {
             self.is_touched[i] = false;
-            while let Some(t) = self.nodes[i].endpoint.poll_transmit(self.now) {
+            loop {
+                let t0 = self.wall();
+                let t = self.nodes[i].endpoint.poll_transmit(self.now);
+                self.charge(i, t0);
+                let Some(t) = t else { break };
                 self.put_on_wire(i, t.dst, t.payload);
             }
+            let t0 = self.wall();
             let n = &mut self.nodes[i];
             while let Some(e) = n.endpoint.poll_event() {
                 n.events.push(e);
                 n.event_times.push(self.now);
             }
             self.timers[i] = n.endpoint.poll_timeout();
+            self.charge(i, t0);
         }
         self.touched = touched;
         self.touched.clear();
+    }
+
+    fn wall(&self) -> Option<std::time::Instant> {
+        self.measure_cpu.then(std::time::Instant::now)
+    }
+
+    fn charge(&mut self, i: usize, since: Option<std::time::Instant>) {
+        if let Some(t0) = since {
+            self.nodes[i].cpu += t0.elapsed();
+        }
     }
 
     fn uniform(&mut self) -> f64 {
@@ -477,7 +513,12 @@ impl Sim {
         self.stats.duplicated += copies - 1;
         for _ in 0..copies {
             let jitter = self.net.jitter.mul_f64(self.uniform());
-            let at = depart + self.net.latency + jitter;
+            let mut at = depart + self.net.latency + jitter;
+            if self.net.in_order {
+                let last = self.last_arrival.entry((from, to)).or_insert(at);
+                at = at.max(*last);
+                *last = at;
+            }
             self.seq += 1;
             self.queue.push(InFlight { at, seq: self.seq, from, to, realm, exits: exits.clone(), data: data.clone() });
         }
@@ -505,7 +546,9 @@ impl Sim {
                     if stun::is_stun(&p.data) {
                         n.stun_inbox.push((p.from, p.data));
                     } else {
-                        n.endpoint.handle_datagram(self.now, p.from, &p.data);
+                        let t0 = self.wall();
+                        self.nodes[i].endpoint.handle_datagram(self.now, p.from, &p.data);
+                        self.charge(i, t0);
                     }
                     self.touch(i);
                 }
@@ -514,7 +557,9 @@ impl Sim {
         }
         for i in 0..self.nodes.len() {
             if self.timers[i].is_some_and(|t| t <= self.now) {
+                let t0 = self.wall();
                 self.nodes[i].endpoint.handle_timeout(self.now);
+                self.charge(i, t0);
                 self.touch(i);
             }
         }

@@ -64,6 +64,7 @@ fn reliable_lane_exact_and_ordered_under_loss() {
         jitter: Duration::from_millis(40),
         loss: 0.10,
         duplicate: 0.05,
+        in_order: false,
     };
     let mut sim = pair(net, 2);
     let mut rng = ChaCha20Rng::seed_from_u64(9);
@@ -383,8 +384,12 @@ fn fuzzed_datagrams_never_panic_or_break_the_link() {
 
 #[test]
 fn hub_with_300_peers() {
-    let net =
-        NetConfig { latency: Duration::from_millis(25), jitter: Duration::from_millis(10), loss: 0.02, duplicate: 0.0 };
+    let net = NetConfig {
+        latency: Duration::from_millis(25),
+        jitter: Duration::from_millis(10),
+        loss: 0.02,
+        ..Default::default()
+    };
     let mut sim = Sim::new(net, 14);
     let n = 300;
     for _ in 0..=n {
