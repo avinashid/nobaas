@@ -299,3 +299,8 @@ pub fn find_byzantine_desync_peers(peer_crcs: &[(u16, u16)]) -> Vec<u16> {
     }
     peer_crcs.iter().filter(|(_, crc)| *crc != majority_crc).map(|(pid, _)| *pid).collect()
 }
+
+// The README examples run as doc tests (`cargo test --doc`).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
