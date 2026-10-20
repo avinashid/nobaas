@@ -1,0 +1,50 @@
+# The optional always-on peer and the browser demos, on this machine only (see docs/DOCKER.md).
+#
+#   docker compose up -d --build
+#   docker compose exec peer nobaas-peer check     # or: docker compose logs peer  (prints the invite)
+#
+# Nothing listens beyond localhost by default:
+#   peer      UDP 127.0.0.1:7700 (host network, so its invite and the addresses it sees are the real ones);
+#             set NOBAAS_BIND=0.0.0.0:7700 to make it reachable from other hosts.
+#   examples  http://127.0.0.1:7780 (set NOBAAS_EXAMPLES_PORT to change the port).
+
+services:
+  peer:
+    build:
+      context: .
+      target: peer
+    image: nobaas-peer
+    network_mode: host
+    environment:
+      NOBAAS_BIND: ${NOBAAS_BIND:-127.0.0.1:7700}
+      NOBAAS_STUN: ${NOBAAS_STUN:-}
+      NOBAAS_MAX_PEERS: ${NOBAAS_MAX_PEERS:-256}
+      NOBAAS_RELAY_RATE: ${NOBAAS_RELAY_RATE:-262144}
+    volumes:
+      - peer-data:/data
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    pids_limit: 64
+    restart: unless-stopped
+
+  examples:
+    build:
+      context: .
+      target: examples
+    image: nobaas-examples
+    ports:
+      - "127.0.0.1:${NOBAAS_EXAMPLES_PORT:-7780}:8080"
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 64
+    restart: unless-stopped
+
+volumes:
+  peer-data:
