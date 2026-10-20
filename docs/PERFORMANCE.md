@@ -37,7 +37,43 @@ message.
 
 **Theoretical ceiling.** ChaCha20-Poly1305 runs at roughly 1–2 GB/s per modern core. A full 1232 B packet
 therefore costs about 0.6–1.2 µs of crypto, so the ceiling is roughly 1 M full packets/s, or 8 Gbit/s, per core.
-The NIC or the uplink runs out long before the CPU does.
+The NIC or the uplink runs out long before the CPU does. Bulk reliable transfers are an exception today (see below):
+the reliable lane's scans cost more than the crypto.
+
+### Bulk transfer on a long, fast link (measured, simulator)
+
+Setup: two hosts, 100 ms RTT, 100 Mbit/s uplinks. 64 MiB is sent as 1 MiB `Reliable` messages that keep the send
+buffer (4 MiB) full, and a 64 B `Urgent` message goes every 20 ms. The default `Config` is used: a window of 1024
+fragments of 1100 B, so the ceiling is about 11 MB/s at 100 ms. CPU is wall-clock time inside each endpoint, on one
+aarch64 core.
+
+| Link | Throughput | Peak cwnd / inflight | Delay backoffs | Retransmits | Urgent p50 / p99 | Sender CPU per fragment |
+|---|---|---|---|---|---|---|
+| Clean | 5.94 MB/s (11.3 s) | 1561 / 1024 | 1 | 0 | 546 / 955 ms | 16 µs |
+| 1% loss | **link dropped** after 0.54 s | 278 / 278 | 0 | 104 of 540 | — | — |
+| 0–10 ms jitter, drawn per packet (reorders) | not done after 600 s, ~0.1 MB/s | 43 / 43 | 0 | 2803 | 57 / 66 s | 3 µs |
+| 0–10 ms jitter, in order | 2.89 MB/s (23.2 s) | 899 / 899 | 2 | 8 | 1.2 / 1.9 s | 7 µs |
+| Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60416 / 1024 | 0 | 0 | 292 / 797 ms | 27 µs |
+
+What limits it:
+- **One delay backoff halves a whole transfer.** Slow start puts 1024 fragments per RTT on the wire, about
+  103 Mbit/s, so the uplink queues. Queueing delay over `QUEUE_TARGET` sets ssthresh to inflight / 2 (about 512),
+  and congestion avoidance then adds about one fragment per RTT. The window never returns to the cap.
+- **Fast retransmit repeats on every ACK.** A fragment marked lost is marked again by each later ACK once its
+  retransmission is out, so it reaches `MAX_TRIES` within one round trip and the link is dropped. Reordering
+  triggers the same path, which is why per-packet jitter stalls the transfer. The test
+  `bulk_transfer_survives_one_percent_loss` (ignored until this is fixed) reproduces it.
+- **Urgent messages wait behind queued bulk data.** They share the reliable queue, so their latency is the time to
+  drain the send buffer (up to 4 MiB), not the RTT.
+- **Sender CPU grows with fragments in flight.** `RelSend::has_sendable`, `next_due` and `write_frames` walk every
+  in-flight fragment on each packet. perf (frame pointers, inline-expanded stacks) puts **50%** of the process in
+  them on the clean 100 Mbit/s run, and **65%** at a steady 1024 in flight. That is about **71%** and **80%** of the
+  sender's CPU. At 27 µs per fragment, one core sends at most about 40 MB/s.
+
+Reproduce with `cargo run --release -p nobaas-sim --example bulk` (all variants), or one variant with flags such
+as `-- --loss 0.01 --cpu 1 --trace 1`. The CPU split is `scripts/perf-relsend.sh [flags]`, for example `--up 1000`
+(set `PERF="sudo perf"` where unprivileged profiling is off). It builds with frame pointers and debug info, records
+with `perf record --call-graph fp`, and counts the samples whose inline-expanded stack contains each function.
 
 ## 3. Multiplayer games (measured, simulator)
 

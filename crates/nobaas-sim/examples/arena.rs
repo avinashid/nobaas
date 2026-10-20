@@ -315,6 +315,7 @@ pub fn run(a: Args) -> Summary {
         jitter: Duration::from_millis(a.jitter_ms),
         loss: a.loss,
         duplicate: 0.0,
+        in_order: false,
     };
     let mut sim = Sim::new(net, a.seed);
     // A long handshake timeout so heavy-loss runs still bring every link up.
