@@ -38,7 +38,7 @@ page: `<script type="importmap">{"imports":{"@nobaas/js":"/path/to/packages/js/s
 ```js
 const room = await joinRoom({
   appId: 'my-app',          // rooms of different apps never meet
-  roomId: 'lobby',
+  roomId: randomRoomId(),   // the room's secret: share it to invite (see Closed rooms)
   signaling: 'local',       // 'local' (tabs of one browser, one Node process) | 'nostr' | custom factory
   presence: { name: 'Ana' }, // shared with every peer when it joins
   privacy: 'direct',        // or 'public-only': no LAN addresses in ICE (see Privacy below)
@@ -64,10 +64,18 @@ await room.leave();                             // peers see 'peer-leave' at onc
   twice). Reliable sends past the send window queue up instead of failing.
 - **Presence** travels over the encrypted links, not through signalling. A peer
   counts as joined once its presence has arrived, so `peer-join` always has it.
+- **Closed rooms:** the roomId is the room's secret. Relays see only a hash of it
+  (the topic); every hello, WebRTC offer and link carries an HMAC under a key
+  derived from it (`sha256("nobaas/room-key/<appId>/<roomId>")`, as in Rust). A peer
+  is dialled only on a hello that proves the key, offers that don't prove it get no
+  answer (and so none of your addresses), and a link that doesn't prove it within
+  10 s is dropped without seeing presence or messages. A name anyone can guess
+  (`'lobby'`) makes a public lobby; for a closed room use at least 128 random bits:
+  `randomRoomId()`. Members are trusted alike: anyone given the roomId can join.
 - **Signalling:** `'nostr'` publishes ephemeral events to `wss://relay.damus.io` and
   `wss://nos.lol` (override with `relays`) and uses Google and Cloudflare STUN
-  (override with `iceServers`). Anyone who knows the appId and roomId sees that
-  someone joined; offers are sealed to the recipient.
+  (override with `iceServers`). Relays see the room topic and the PeerIds in
+  hellos, not the roomId; offers are sealed to the recipient.
 - **Node:** Node has no WebRTC. `signaling: 'local'` rooms then carry their
   datagrams over the BroadcastChannel (peers in one process or its workers). For
   real networks pass `RTCPeerConnection` from a WebRTC package such as
@@ -104,6 +112,7 @@ Types are in `src/index.d.ts`.
 |---|---|
 | `src/index.js` | The package entry: `joinRoom` and everything below. |
 | `src/room.js` | `joinRoom` and `Room`: mesh, presence, message framing, backpressure. |
+| `src/proof.js` | Room key and HMAC proofs (hello, offer, link), compatible with Rust's; `randomRoomId()`. |
 | `src/nobaas.js` | Loads the module; `Endpoint` (connect, send, events, stats, seal/open) and Nostr key helpers. Browser and Node. |
 | `src/webrtc.js` | `WebRtcTransport`: one negotiated, unordered, no-retransmit DataChannel per peer. `BroadcastSignaling` for tabs of one browser. |
 | `src/nostr.js` | `NostrSignaling` over public relays: ephemeral events, a throwaway key per session, payloads sealed to the recipient's PeerId. |
@@ -151,6 +160,12 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_node.mjs`: `joinRoom` with three peers in Node: presence,
   message types, lanes, targeted sends, backpressure, leaving, a late joiner and
   the pull-style `poll()`/`receive()`/`sendTo()` path.
+- `node packages/js/test/peer_id.mjs`: untrusted peer ids. A malformed or over-long id
+  throws a `TypeError` before any copy into wasm memory, and every signalling layer
+  drops a `from` that isn't 64 lowercase hex characters.
+- `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
+  gets no dial, no answer to its offers and, on a link it dials itself, nothing but
+  the link proof before it is dropped; the hello proof matches Rust's.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

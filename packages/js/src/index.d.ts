@@ -35,6 +35,11 @@ export interface SignalingContext {
 export interface JoinRoomOptions {
   /** Names your app; rooms of different apps never meet. */
   appId: string;
+  /**
+   * The room's name, and its only secret: peers prove they know it, so the topic
+   * relays see lets no one in. A guessable name is a public lobby; for a closed
+   * room use at least 128 random bits, e.g. `randomRoomId()`.
+   */
   roomId: string;
   /**
    * How peers find each other.
@@ -128,6 +133,9 @@ export declare class Room {
 /** Joins a room: `const room = await joinRoom({ appId: 'my-app', roomId: 'lobby' })`. */
 export declare function joinRoom(options: JoinRoomOptions): Promise<Room>;
 
+/** 128 random bits, base64url (22 characters): a roomId nobody can guess. */
+export declare function randomRoomId(): string;
+
 export declare const DEFAULT_ICE_SERVERS: RTCIceServer[];
 export declare const DEFAULT_RELAYS: string[];
 
@@ -181,6 +189,8 @@ export interface Nobaas {
 
 export declare function loadNobaas(source: string | URL | BufferSource): Promise<Nobaas>;
 
+/** Every method that takes a peer throws a TypeError unless it is 32 bytes or 64 lowercase hex
+ * characters: ids from signalling are untrusted and never reach wasm memory unchecked. */
 export declare class Endpoint {
   readonly peerId: Uint8Array;
   readonly id: PeerId;
@@ -210,6 +220,10 @@ export declare function toHex(bytes: Uint8Array): string;
 /** Removes `host` candidates (LAN, loopback, mDNS) from an SDP. */
 export declare function withoutHostCandidates(sdp: string): string;
 export declare function fromHex(hex: string): Uint8Array;
+/** Whether `id` is a PeerId as text: 64 lowercase hex characters. Check ids from signalling with it. */
+export declare function isPeerId(id: unknown): id is PeerId;
+/** A PeerId as 32 bytes; throws a TypeError unless `id` is 32 bytes or 64 lowercase hex characters. */
+export declare function peerBytes(id: PeerId | Uint8Array): Uint8Array;
 
 export interface Transport {
   dial(peer: PeerId): void | Promise<void>;
@@ -230,6 +244,8 @@ export declare class WebRtcTransport implements Transport {
       /** `'relay-only'` needs `relay`: WebRTC then runs only with that peer. */
       privacy?: 'direct' | 'public-only' | 'relay-only';
       relay?: PeerId;
+      /** Offers carry `p: await sign(to)`; an offer is answered only if `check(from, p)` holds. */
+      offerProof?: { sign(to: PeerId): Promise<string>; check(from: PeerId, p: unknown): Promise<boolean> };
       RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
     },
   );
