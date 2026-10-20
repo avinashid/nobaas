@@ -8,6 +8,9 @@
 //! cargo run -p nobaas --features nostr --example natcheck -- room <name> v6   # the same, over IPv6
 //! ```
 //!
+//! `NATCHECK_PORT=<port>` binds the room node to that UDP port instead of a random one,
+//! for a peer whose firewall has that one port open.
+//!
 //! Uses the default public STUN servers (Google, Cloudflare) and Nostr relays only. The
 //! router check only asks the LAN gateway what it supports (SSDP search, NAT-PMP
 //! external-address query); it never creates a mapping.
@@ -273,7 +276,11 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
 /// Joins `room` over Nostr, waits for a peer, exchanges a ping each way and
 /// reports the path.
 fn meet(room: &str, v6: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let mut node = Node::builder().signaling(NostrSignaling::default()).bind((unspecified(v6), 0))?;
+    let port = match std::env::var("NATCHECK_PORT") {
+        Ok(p) => p.parse().map_err(|_| format!("NATCHECK_PORT: not a port: {p:?}"))?,
+        Err(_) => 0,
+    };
+    let mut node = Node::builder().signaling(NostrSignaling::default()).bind((unspecified(v6), port))?;
     let start = Instant::now();
     while node.nat_type() == NatType::Unknown && start.elapsed() < Duration::from_secs(5) {
         tick(&mut node);
