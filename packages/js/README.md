@@ -180,7 +180,8 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_drain.mjs`: 6 MiB through a Room at once, over the send
   window: the outbox is flushed as ACKs arrive (`Endpoint.onDrain`), the timer is a fallback.
 - `node packages/js/test/room_leave.mjs`: a room leaving with a full send window reaches
-  its peers at once, before `leave()` returns; with the Bye lost, the core's close still does.
+  its peers at once, before `leave()` returns; with the Bye lost, the core's close still does;
+  the `pagehide` handler holds the page 20 ms after it, only if it had peers.
 - `node packages/js/test/room_throttled.mjs --ab=<other packages/js>`: benchmark, not a test.
   Room send throughput when the sender's timers are throttled like a background tab's.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two

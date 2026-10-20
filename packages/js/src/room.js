@@ -36,6 +36,10 @@ const HELLO_EVERY_MS = 15000;
 const PROOF_MS = 10000;
 // Frames held from one peer while its link proof is checked.
 const MAX_HELD = 256;
+// How long a pagehide handler that said goodbye holds the page. The browser may end
+// the renderer as soon as the handler returns, before its WebRTC thread has put the
+// Bye on the wire; holding the main thread a few ms lets that thread send it.
+const PAGEHIDE_GRACE_MS = 20;
 const NOT_CONNECTED = -1;
 const TOO_LARGE = -2;
 const WOULD_BLOCK = -3;
@@ -154,7 +158,12 @@ export class Room {
     endpoint.onDrain = () => this.outbox.size && this.flush('drain');
     signaling.onHello = (peer, meta) => this.onHello(peer, meta);
     this.helloTimer = setInterval(() => this.hello(), HELLO_EVERY_MS);
-    this.onPageHide = () => this.leave();
+    this.onPageHide = () => {
+      const linked = this.linked.size;
+      this.leave();
+      // A wait that blocks: no timer or promise would run before the page goes.
+      for (const end = performance.now() + PAGEHIDE_GRACE_MS; linked && performance.now() < end;);
+    };
     globalThis.addEventListener?.('pagehide', this.onPageHide);
   }
 

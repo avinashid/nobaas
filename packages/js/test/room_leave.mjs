@@ -2,8 +2,8 @@
 // full, and must do it all before leave() returns: on pagehide the page may be gone
 // before any timer or await. Three rooms in this process (BroadcastChannel and
 // LocalTransport): a sends 6 MiB, then leaves at once. Then, with the Bye lost, the
-// core's sealed close alone must still tell the other side. test/leave.mjs does the
-// same with real tab closes in Chromium.
+// core's sealed close alone must still tell the other side. Last, the pagehide handler
+// and its grace. test/leave.mjs does the same with real tab closes in Chromium.
 //
 //   node packages/js/test/room_leave.mjs
 import { joinRoom, Lane } from '../src/index.js';
@@ -63,6 +63,23 @@ const leaves = (r) => {
   check(dropped === 1, 'the Bye was dropped');
   check(await until(() => seen.length, FAST_MS) && seen[0].peer === a.self && seen[0].reason === 'closed',
     `with no Bye the core's close reached the peer: peer-leave ${seen[0]?.reason} after ${seen.length ? (seen[0].at - t0).toFixed(0) : '-'} ms`);
+  await b.leave();
+}
+
+// 3. pagehide: the handler says goodbye, then holds the page ~20 ms (the browser may end
+// the renderer once it returns, before the Bye is on the wire), but only if it had peers.
+{
+  const [a, b] = await rooms(2, 'pagehide');
+  const seen = leaves(b);
+  let t0 = performance.now();
+  a.onPageHide();
+  const held = performance.now() - t0;
+  check(a.endpoint.closed && held >= 20, `the pagehide handler left and held the page ${held.toFixed(1)} ms`);
+  check(await until(() => seen.length, FAST_MS) && seen[0].reason === 'left', `the peer saw peer-leave ${seen[0]?.reason}`);
+  t0 = performance.now();
+  a.onPageHide();
+  const again = performance.now() - t0;
+  check(again < 5, `a second pagehide, with no peers left, returns at once (${again.toFixed(1)} ms)`);
   await b.leave();
 }
 
