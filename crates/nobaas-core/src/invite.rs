@@ -65,14 +65,15 @@ impl<A: Address> Invite<A> {
             VERSION_KEYED => Some(r.take(32)?.try_into().ok()?),
             _ => None,
         };
-        let n = r.take(1)?[0] as usize;
+        // A count over MAX_ENTRIES is refused, not clamped: each invite has one encoding.
+        let n = r.count()?;
         let mut addrs = Vec::new();
-        for _ in 0..n.min(MAX_ENTRIES) {
+        for _ in 0..n {
             addrs.push(r.addr()?);
         }
-        let n = r.take(1)?[0] as usize;
+        let n = r.count()?;
         let mut relays = Vec::new();
-        for _ in 0..n.min(MAX_ENTRIES) {
+        for _ in 0..n {
             relays.push((r.peer()?, r.addr()?));
         }
         r.0.is_empty().then_some(Invite { peer, key, addrs, relays })
@@ -96,6 +97,11 @@ impl<'a> Reader<'a> {
         Some(h)
     }
 
+    fn count(&mut self) -> Option<usize> {
+        let n = self.take(1)?[0] as usize;
+        (n <= MAX_ENTRIES).then_some(n)
+    }
+
     fn peer(&mut self) -> Option<PeerId> {
         let mut id = [0u8; 32];
         id.copy_from_slice(self.take(32)?);
@@ -112,9 +118,10 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Unpadded base64url (RFC 4648 section 5).
+/// Unpadded base64url (RFC 4648 section 5), canonical: decoding refuses a last
+/// symbol whose unused low bits are set, so every byte string has one link.
 mod b64 {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    pub(super) const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
     pub(super) fn encode(b: &[u8]) -> String {
         let mut s = String::with_capacity(b.len().div_ceil(3) * 4);
@@ -139,6 +146,10 @@ mod b64 {
             for (i, &ch) in c.iter().enumerate() {
                 n |= val(ch)? << (18 - 6 * i);
             }
+            // Bits below the decoded bytes: 4 of them after 2 symbols, 2 after 3, none after 4.
+            if n & (0xFF_FFFF >> (8 * (c.len() - 1))) != 0 {
+                return None;
+            }
             let bytes = n.to_be_bytes();
             out.extend_from_slice(&bytes[1..c.len()]);
         }
@@ -154,6 +165,30 @@ mod b64 {
             assert_eq!(decode(enc).unwrap(), raw.as_bytes());
         }
         assert_eq!(decode("Zm9v+g"), None);
+    }
+
+    #[test]
+    fn rejects_non_canonical_tails() {
+        // "Zg" is "f"; "Zh".."Zv" set some of the 4 unused bits and used to decode to "f" too.
+        for last in ALPHABET.iter().map(|&c| c as char) {
+            let ok = ALPHABET.iter().position(|&a| a as char == last).unwrap() & 15 == 0;
+            assert_eq!(decode(&format!("Z{last}")).is_some(), ok, "Z{last}");
+        }
+        // "Zm8" is "fo"; the last symbol has 2 unused bits.
+        for last in ALPHABET.iter().map(|&c| c as char) {
+            let ok = ALPHABET.iter().position(|&a| a as char == last).unwrap() & 3 == 0;
+            assert_eq!(decode(&format!("Zm{last}")).is_some(), ok, "Zm{last}");
+        }
+        assert_eq!(decode("Zh"), None);
+        assert_eq!(decode("Zm9"), None);
+        // Every byte string survives a round trip, and its encoding is the only one accepted.
+        for len in 0..7 {
+            for seed in 0..64u8 {
+                let raw: Vec<u8> =
+                    (0..len).map(|i| seed.wrapping_mul(37).wrapping_add((i as u8).wrapping_mul(101))).collect();
+                assert_eq!(decode(&encode(&raw)).unwrap(), raw);
+            }
+        }
     }
 }
 
@@ -196,5 +231,50 @@ mod tests {
         let mut v3 = b.clone();
         v3[0] = 3;
         assert_eq!(Invite::<SocketAddr>::from_bytes(&v3), None);
+    }
+
+    #[test]
+    fn one_link_per_invite() {
+        let me = Identity::generate(&mut OsRng).peer_id();
+        let relay = Identity::generate(&mut OsRng).peer_id();
+        let full = |n: usize| Invite::<u32> {
+            peer: me,
+            key: n.is_multiple_of(2).then_some([7; 32]),
+            addrs: (0..n as u32).collect(),
+            relays: (0..n as u32).map(|a| (relay, a)).collect(),
+        };
+        // 67 + 42n bytes with a key and 35 + 42n without: base64 tails of 2 and of 3 symbols.
+        for n in 0..=MAX_ENTRIES {
+            let inv = full(n);
+            let s = inv.to_link();
+            assert_eq!(Invite::parse(&s).as_ref(), Some(&inv));
+            assert_eq!(Invite::<u32>::parse(&s).unwrap().to_link(), s);
+            // The same link with the unused low bits of its last symbol set is refused.
+            let tail = (s.len() - PREFIX.len()) % 4;
+            if tail != 0 {
+                let last = s.as_bytes()[s.len() - 1];
+                let i = b64::ALPHABET.iter().position(|&a| a == last).unwrap();
+                for bits in 1..(if tail == 2 { 16 } else { 4 }) {
+                    let lookalike = format!("{}{}", &s[..s.len() - 1], b64::ALPHABET[i | bits] as char);
+                    assert_eq!(Invite::<u32>::parse(&lookalike), None, "{lookalike}");
+                }
+            }
+        }
+        // A count over 16 is refused, even when exactly 16 entries follow (it used to be clamped).
+        let b = full(MAX_ENTRIES).to_bytes();
+        let n_addrs = 1 + 32 + 32;
+        let n_relays = n_addrs + 1 + MAX_ENTRIES * 5;
+        assert_eq!((b[n_addrs], b[n_relays]), (16, 16));
+        for (at, count) in [(n_addrs, 17), (n_addrs, 255), (n_relays, 17), (n_relays, 255)] {
+            let mut bad = b.clone();
+            bad[at] = count;
+            assert_eq!(Invite::<u32>::from_bytes(&bad), None, "count {count} at {at}");
+            assert_eq!(Invite::<u32>::parse(&format!("{PREFIX}{}", b64::encode(&bad))), None);
+        }
+        // to_bytes never writes more than 16 of each.
+        let mut big = full(MAX_ENTRIES);
+        big.addrs.push(99);
+        big.relays.push((relay, 99));
+        assert_eq!(Invite::<u32>::from_bytes(&big.to_bytes()), Some(full(MAX_ENTRIES)));
     }
 }

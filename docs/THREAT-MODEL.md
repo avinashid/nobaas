@@ -320,9 +320,14 @@ public key and the addresses are routing hints. Security properties:
   the carrier chose, exactly as if the carrier had sent its own invite. Invites
   therefore inherit the trust of the channel they arrive on; a QR shown in person
   or a sealed signaling message is trustworthy, a plaintext forum post is not.
-- **Parsing is safe.** `from_bytes` is a bounds-checked reader, caps entries at
-  16, rejects trailing bytes, and validates each PeerId is a real Ed25519 point.
+- **Parsing is safe.** `from_bytes` is a bounds-checked reader, refuses more than
+  16 entries, rejects trailing bytes, and validates each PeerId is a real Ed25519 point.
   Reviewed, no issues; covered going forward by fuzzing (NB-014).
+- **Canonical.** Each invite has exactly one link: base64url decoding refuses a last
+  symbol with its unused low bits set, and a count over 16 is refused rather than
+  clamped. Nothing keys on the link string today, but a future dedupe, cache or
+  allow-list on it cannot be bypassed with a lookalike. `fuzz_invites` asserts
+  `to_link(parse(s)) == s` for every accepted `s`.
 
 No new finding; the exposure is documented so apps set expectations for where an
 invite may be posted.

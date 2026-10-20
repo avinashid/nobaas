@@ -318,7 +318,7 @@ fn fuzz_stun() {
 #[test]
 fn fuzz_invites() {
     let ids = identities(6);
-    let (mut accepted, mut noncanonical) = (0usize, 0usize);
+    let mut accepted = 0usize;
     run(
         "invite",
         cases(8_000),
@@ -336,7 +336,8 @@ fn fuzz_invites() {
             b
         },
         |b| {
-            // Bytes and links; whatever parses must survive its own round trip.
+            // Bytes and links; whatever parses must survive its own round trip, and be the one
+            // encoding of what it decodes to (a link up to the whitespace parse trims).
             fn round_trip<A: Address>(inv: Invite<A>) {
                 assert!(inv.addrs.len() <= 16 && inv.relays.len() <= 16);
                 assert_eq!(Invite::<A>::from_bytes(&inv.to_bytes()).as_ref(), Some(&inv));
@@ -344,24 +345,26 @@ fn fuzz_invites() {
             }
             if let Some(inv) = Invite::<SocketAddr>::from_bytes(b) {
                 accepted += 1;
-                noncanonical += (inv.to_bytes() != b) as usize;
+                assert_eq!(inv.to_bytes(), b);
                 round_trip(inv);
             }
             if let Some(inv) = Invite::<u32>::from_bytes(b) {
+                assert_eq!(inv.to_bytes(), b);
                 round_trip(inv);
             }
             let s = String::from_utf8_lossy(b);
             if let Some(inv) = Invite::<SocketAddr>::parse(&s) {
                 accepted += 1;
-                noncanonical += (inv.to_link() != s.trim()) as usize;
+                assert_eq!(inv.to_link(), s.trim());
                 round_trip(inv);
             }
             if let Some(inv) = Invite::<u64>::parse(&s) {
+                assert_eq!(inv.to_link(), s.trim());
                 round_trip(inv);
             }
         },
     );
-    println!("fuzz invite: {accepted} accepted, {noncanonical} of them not in canonical form");
+    println!("fuzz invite: {accepted} accepted, all canonical");
     assert!(accepted > 0);
 }
 
