@@ -1091,6 +1091,7 @@ impl<A: Address> Offer<A> {
 mod tests {
     use super::*;
     use nobaas_core::Config;
+    use nobaas_sim::fuzz::{cases, hex as fuzz_hex, mutate, run, seed, Rng};
     use std::net::SocketAddr;
 
     fn id(n: u8) -> Identity {
@@ -2051,5 +2052,181 @@ mod tests {
             theirs.starts_with("the peer's NAT is symmetric") && theirs.contains("this side's router only lets in")
         );
         assert!(say(Failure::Symmetric(Side::Both)).starts_with("both NATs are symmetric"));
+    }
+
+    fn fuzz_addr(rng: &mut Rng) -> SocketAddr {
+        const SPECIAL: [&str; 9] = [
+            "127.0.0.1:5",
+            "[::ffff:127.0.0.1]:5",
+            "0.0.0.0:5",
+            "224.0.0.1:5",
+            "[ff02::1]:5",
+            "255.255.255.255:5",
+            "198.51.100.7:0",
+            "169.254.1.1:5",
+            "[fe80::1]:5",
+        ];
+        match rng.below(4) {
+            0 => rng.pick(&SPECIAL).parse().unwrap(),
+            1 => SocketAddr::from((std::net::Ipv4Addr::from(rng.u32()), rng.u32() as u16)),
+            2 => SocketAddr::from((std::net::Ipv6Addr::from(u128::from(rng.u64()) << 64 | 1), rng.u32() as u16)),
+            _ => SocketAddr::from(([198, 51, 100, rng.byte()], 1 + rng.below(65535) as u16)),
+        }
+    }
+
+    fn fuzz_offer(rng: &mut Rng, kind: Proof) -> Offer<SocketAddr> {
+        let roles = [Role::Peer, Role::Host, Role::Client];
+        let nats = [NatType::Unknown, NatType::Open, NatType::Cone, NatType::Symmetric];
+        Offer {
+            kind,
+            reply: rng.one_in(2),
+            role: *rng.pick(&roles),
+            nat: *rng.pick(&nats),
+            ts: rng.u64() >> rng.below(64),
+            nonce: rng.u64(),
+            addrs: (0..rng.below(MAX_CANDIDATES + 1)).map(|_| fuzz_addr(rng)).collect(),
+            predict: rng.one_in(2).then(|| Prediction { next: rng.u32() as u16, step: 1 + rng.below(8) as u16 }),
+            relays: (0..rng.below(MAX_RELAYS + 1)).map(|_| PeerId([rng.byte(); 32])).collect(),
+        }
+    }
+
+    /// NB-014: hellos and offers, mutated; whatever parses round-trips and stays within its limits.
+    #[test]
+    fn fuzz_hello_and_offer_parsers() {
+        let key = room_key(ROOM.0, ROOM.1);
+        let ids: Vec<PeerId> = (1..6).map(|n| id(n).peer_id()).collect();
+        run(
+            "hello",
+            cases(30_000),
+            |rng| {
+                let roles = [Role::Peer, Role::Host, Role::Client];
+                let mut b = hello(&key, rng.pick(&ids), *rng.pick(&roles), rng.u64() >> rng.below(64));
+                if rng.below(4) != 0 {
+                    mutate(rng, &mut b, 400);
+                }
+                b
+            },
+            |b| {
+                if let Some((from, role, ts, proof)) = parse_hello(b) {
+                    let (id, name, p) = (hex(from.as_bytes()), role_name(role), hex(&proof));
+                    let again = format!("{HELLO_HEAD}{id}{HELLO_MID}{name}{HELLO_TS}{ts}{HELLO_PROOF}{p}{HELLO_TAIL}");
+                    assert_eq!(parse_hello(again.as_bytes()), Some((from, role, ts, proof)));
+                }
+            },
+        );
+        let base: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        run(
+            "offer",
+            cases(30_000),
+            |rng| {
+                let kinds = [Proof::None, Proof::Room, Proof::Invite];
+                let kind = *rng.pick(&kinds);
+                let mut b = fuzz_offer(rng, kind).encode();
+                if rng.below(4) != 0 {
+                    mutate(rng, &mut b, 600);
+                }
+                b
+            },
+            |b| {
+                if let Some(o) = Offer::<SocketAddr>::decode(b) {
+                    assert!(o.addrs.len() <= MAX_CANDIDATES && o.relays.len() <= MAX_RELAYS);
+                    assert_eq!(Offer::decode(&o.encode()).as_ref(), Some(&o));
+                    if let Some(p) = o.predict {
+                        assert!((1..=MAX_STEP).contains(&p.step));
+                        assert!(p.window(&base).len() <= (GUESS_BEFORE + GUESS_AFTER + 1) as usize);
+                    }
+                }
+                if let Some(o) = Offer::<u32>::decode(b) {
+                    assert_eq!(Offer::decode(&o.encode()).as_ref(), Some(&o));
+                }
+            },
+        );
+    }
+
+    /// NB-014: a room member that holds the room key (and an invite holder) sends
+    /// authenticated hellos and sealed, proved offers with random and mutated
+    /// bodies. Nothing panics, and nothing makes the endpoint dial a special address.
+    #[test]
+    fn fuzz_authenticated_signals() {
+        fn special(a: &SocketAddr) -> bool {
+            let ip = a.ip().to_canonical();
+            a.port() == 0
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_loopback()
+                || match ip {
+                    std::net::IpAddr::V4(v) => v.is_broadcast() || v.is_link_local(),
+                    std::net::IpAddr::V6(v) => v.segments()[0] & 0xffc0 == 0xfe80,
+                }
+        }
+        let me = id(1).peer_id();
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        let (room, inbox) = (Topic::room(ROOM.0, ROOM.1), Topic::peer(&me));
+        let (key, invite_key) = (room_key(ROOM.0, ROOM.1), t.invite_key());
+        let senders: Vec<Identity> = (2..10).map(id).collect();
+        let mut rng = Rng::for_target("signals");
+        let mut now = Instant::from_millis(1000);
+        let (mut dialled, mut hellos) = (0usize, 0usize);
+        for i in 0..cases(1_500) {
+            let from = rng.pick(&senders);
+            let (topic, payload) = match rng.below(5) {
+                0 => {
+                    let roles = [Role::Peer, Role::Host, Role::Client];
+                    let ts =
+                        ((now - Instant::ZERO).as_millis() as u64 + rng.below(120_000) as u64).saturating_sub(60_000);
+                    hellos += 1;
+                    (room, hello(&key, &from.peer_id(), *rng.pick(&roles), ts))
+                }
+                1 => {
+                    let n = rng.below(300);
+                    let mut b = rng.bytes(n);
+                    if rng.one_in(2) {
+                        b = sealed::seal(from, &me, rng.bytes(32).try_into().unwrap(), &b).unwrap();
+                    }
+                    (*rng.pick(&[room, inbox]), b)
+                }
+                _ => {
+                    let kinds = [Proof::None, Proof::Room, Proof::Invite];
+                    let kind = *rng.pick(&kinds);
+                    let mut o = fuzz_offer(&mut rng, kind);
+                    o.ts = (now - Instant::ZERO).as_millis() as u64;
+                    let mut body = o.encode();
+                    if rng.one_in(3) {
+                        mutate(&mut rng, &mut body, 600);
+                    }
+                    let proof = match kind {
+                        Proof::None => None,
+                        Proof::Room => {
+                            Some(mac(&key, &[b"nb-offer".as_slice(), from.peer_id().as_bytes(), me.as_bytes(), &body]))
+                        }
+                        Proof::Invite => Some(mac(
+                            &invite_key,
+                            &[b"nb-invite".as_slice(), from.peer_id().as_bytes(), me.as_bytes(), &body],
+                        )),
+                    };
+                    body.extend(proof.into_iter().flatten());
+                    (inbox, sealed::seal(from, &me, rng.bytes(32).try_into().unwrap(), &body).unwrap())
+                }
+            };
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                t.handle_signal(now, &mut ep, topic, &payload)
+            })) {
+                eprintln!("fuzz signals: case {i} of seed {:#x} failed on {topic:?} {}", seed(), fuzz_hex(&payload));
+                std::panic::resume_unwind(e);
+            }
+            now = now + Duration::from_millis(rng.below(400) as u64);
+            ep.handle_timeout(now);
+            t.handle_timeout(now, &mut ep);
+            while let Some(e) = ep.poll_event() {
+                t.handle_event(now, &mut ep, &e);
+            }
+            while t.poll_signal().is_some() {}
+            for d in dials(&mut ep, now) {
+                assert!(!special(&d), "case {i}: dialled {d}");
+                dialled += 1;
+            }
+        }
+        println!("fuzz signals: {hellos} hellos, {dialled} dials");
+        assert!(dialled > 0, "authenticated offers must reach the dialler");
     }
 }

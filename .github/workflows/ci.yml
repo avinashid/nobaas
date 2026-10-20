@@ -33,6 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --release
+      - name: Fuzz tests in a debug build (integer overflow panics there, wraps in release)
+        run: cargo test --lib -p nobaas-core -p nobaas -p nobaas-ffi -p nobaas-sim fuzz
 
   wasm:
     name: wasm + node
@@ -62,6 +64,7 @@ jobs:
       - run: node packages/js/test/endpoint_closed.mjs
       - run: node packages/js/test/scratch_buffers.mjs
       - run: node packages/js/test/room_drain.mjs
+      - run: node packages/js/test/fuzz.mjs
       - run: node packages/js/test/room_leave.mjs
 
   docker:

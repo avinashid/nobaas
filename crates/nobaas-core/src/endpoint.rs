@@ -1418,6 +1418,16 @@ impl<A: Address> Endpoint<A> {
     pub fn poll_event(&mut self) -> Option<Event<A>> {
         self.events.pop_front()
     }
+
+    /// Seals any plaintext, well-formed or not, as the next DATA packet on the
+    /// live link to `peer`: what a misbehaving peer that completed the
+    /// handshake can send. For the fuzz tests.
+    #[cfg(test)]
+    pub(crate) fn seal_raw(&mut self, peer: &PeerId, plaintext: &[u8]) -> Option<Vec<u8>> {
+        let sess = self.sessions.get_mut(self.peers.get(peer)?)?;
+        let State::Live(link) = &mut sess.state else { return None };
+        seal(link, plaintext)
+    }
 }
 
 /// Builds the initiator handshake and writes HS1 (our Ed25519 identity as payload).

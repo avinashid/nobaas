@@ -503,6 +503,161 @@ mod tests {
             }
         }
     }
+
+    /// Whether `e` has the documented event encoding (see the module docs).
+    fn event_ok(e: &[u8]) -> bool {
+        let path_ok = |p: &[u8]| matches!(p, [0, _, _, _, _]) || p.len() == 33 && p[0] == 1;
+        e.len() >= 33
+            && match e[0] {
+                1 => e.len() >= 35 && e[33] <= 1 && path_ok(&e[34..]),
+                2 => e.len() >= 34 && e[33] <= 1,
+                3 => e.len() == 34 && e[33] <= 3,
+                4 => e.len() == 33,
+                5 => path_ok(&e[33..]),
+                6 => e.len() == 37,
+                _ => false,
+            }
+    }
+
+    /// NB-014: two endpoints driven only through the C ABI by random calls with
+    /// random arguments (lanes, lengths, buffer sizes, peers), random and
+    /// mutated datagrams, and random sealed blobs. Every return code is one the
+    /// ABI documents, a too-small event buffer keeps the event for a retry, and
+    /// every event has the documented encoding (what nobaas.js decodes).
+    #[test]
+    fn fuzz_the_c_abi() {
+        use nobaas_sim::fuzz::{cases, mutate, Rng};
+        unsafe {
+            let mut ids = [[0u8; 32]; 2];
+            let eps = [
+                nb_endpoint_new(std::ptr::null(), [1u8; 32].as_ptr(), 0, ids[0].as_mut_ptr()),
+                nb_endpoint_new(std::ptr::null(), [2u8; 32].as_ptr(), 0, ids[1].as_mut_ptr()),
+            ];
+            let mut rng = Rng::for_target("ffi");
+            let (mut t, mut captured, mut events) = (1000u64, Vec::<Vec<u8>>::new(), 0usize);
+            let mut buf = vec![0u8; 1 << 21];
+            assert_eq!(nb_connect(eps[0], t, 2, ids[1].as_ptr()), 0);
+            for i in 0..cases(20_000) {
+                let x = rng.below(2);
+                let (h, other) = (eps[x], ids[1 - x]);
+                let target: [u8; 32] = match rng.below(4) {
+                    0 => rng.bytes(32).try_into().unwrap(),
+                    1 => ids[x],
+                    _ => other,
+                };
+                match rng.below(9) {
+                    0 => {
+                        let any = rng.below(3000);
+                        let n = *rng.pick(&[0, 1, 1100, 1101, 1232, 5000, any]);
+                        let lane = rng.below(4) as u32;
+                        let r = nb_send(h, target.as_ptr(), lane, buf.as_ptr(), n);
+                        assert!([0, NB_ERR_NOT_CONNECTED, NB_ERR_TOO_LARGE, NB_ERR_WOULD_BLOCK].contains(&r), "{r}");
+                        if lane != 0 && lane != 2 && n > 1100 && r != NB_ERR_NOT_CONNECTED {
+                            assert_eq!(r, NB_ERR_TOO_LARGE);
+                        }
+                    }
+                    1 => {
+                        let mut d = match captured.is_empty() || rng.one_in(4) {
+                            true => {
+                                let n = rng.below(1300);
+                                rng.bytes(n)
+                            }
+                            false => rng.pick(&captured).clone(),
+                        };
+                        if rng.below(3) != 0 {
+                            mutate(&mut rng, &mut d, 1400);
+                        }
+                        let any = rng.u32();
+                        let from = *rng.pick(&[1, 2, 3, any]);
+                        nb_handle_datagram(h, t, from, d.as_ptr(), d.len());
+                    }
+                    2 | 3 => {
+                        let any = rng.below(100);
+                        let cap = *rng.pick(&[0, 1, 33, 34, 40, 2048, any]);
+                        let e = match nb_poll_event(h, buf.as_mut_ptr(), cap) {
+                            0 => continue,
+                            r if r > 0 => {
+                                assert!(r as usize <= cap);
+                                buf[..r as usize].to_vec()
+                            }
+                            r => {
+                                let need = (-r) as usize;
+                                assert!(need > cap, "case {i}: asked for {need} with {cap}");
+                                assert_eq!(nb_poll_event(h, buf.as_mut_ptr(), need), need as i32, "kept for a retry");
+                                buf[..need].to_vec()
+                            }
+                        };
+                        assert!(event_ok(&e), "case {i}: bad event {e:?}");
+                        events += 1;
+                    }
+                    4 => {
+                        let cap = *rng.pick(&[0, 1231, 1232, 1500]);
+                        let mut addr = 0u32;
+                        for _ in 0..64 {
+                            let r = nb_poll_transmit(h, t, &mut addr, buf.as_mut_ptr(), cap);
+                            if r == NB_ERR_BUFFER {
+                                assert!(cap < nobaas_core::MAX_DATAGRAM);
+                                break;
+                            }
+                            if r == 0 {
+                                break;
+                            }
+                            assert!(r > 0 && r as usize <= nobaas_core::MAX_DATAGRAM);
+                            let d = buf[..r as usize].to_vec();
+                            if addr == 1 || addr == 2 {
+                                nb_handle_datagram(eps[addr as usize - 1], t, x as u32 + 1, d.as_ptr(), d.len());
+                            }
+                            if captured.len() < 256 {
+                                captured.push(d);
+                            }
+                        }
+                    }
+                    5 => {
+                        let n = rng.below(400);
+                        let (mut out, cap) = (vec![0u8; 600], *rng.pick(&[0, 100, 600]));
+                        let mut s = match nb_seal(h, target.as_ptr(), buf.as_ptr(), n, out.as_mut_ptr(), cap) {
+                            r if r > 0 => out[..r as usize].to_vec(),
+                            r => {
+                                assert!(r == NB_ERR_INVALID || -r as usize > cap, "{r}");
+                                rng.bytes(n)
+                            }
+                        };
+                        if rng.one_in(2) {
+                            mutate(&mut rng, &mut s, 700);
+                        }
+                        let (mut from, mut pt) = ([0u8; 32], vec![0u8; 700]);
+                        let cap = *rng.pick(&[0, s.len(), 700]);
+                        let r = nb_open(eps[1 - x], s.as_ptr(), s.len(), from.as_mut_ptr(), pt.as_mut_ptr(), cap);
+                        assert!(
+                            r == NB_ERR_BUFFER && cap < s.len()
+                                || r == NB_ERR_INVALID
+                                || r >= 0 && r as usize <= s.len()
+                        );
+                    }
+                    6 => match rng.below(4) {
+                        0 => nb_disconnect(h, target.as_ptr()),
+                        _ => assert!([0, NB_ERR_INVALID].contains(&nb_connect(h, t, 2 - x as u32, target.as_ptr()))),
+                    },
+                    7 => {
+                        let mut st = [0u64; 16];
+                        nb_stats(h, st.as_mut_ptr());
+                        let _ = (nb_rtt_us(h, target.as_ptr()), nb_is_connected(h, target.as_ptr()));
+                        assert!(nb_poll_timeout(h) >= -1);
+                    }
+                    _ => {
+                        let any = rng.below(3_000_000) as u64;
+                        t += *rng.pick(&[0, 1_000, 30_000, any]);
+                        nb_handle_timeout(h, t);
+                    }
+                }
+            }
+            println!("fuzz ffi: {events} events, all well-formed");
+            assert!(events > 0);
+            for h in eps {
+                nb_endpoint_free(h);
+            }
+        }
+    }
 }
 
 // The README examples run as doc tests (`cargo test --doc`).

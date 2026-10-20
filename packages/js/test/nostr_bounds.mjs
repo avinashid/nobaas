@@ -65,6 +65,16 @@ for (const id of bad) feed(id);
 check(sig.stats.received === before + 2 && sig.seen.size === size && [...sig.seen].every((id) => id.length === 64),
   `4096 events with 64 KiB ids and ${bad.length} non-hex or wrong-length ids are dropped, never remembered`);
 check(process.memoryUsage().heapUsed - heap < 64 << 20, `heap grew ${((process.memoryUsage().heapUsed - heap) / 2 ** 20).toFixed(1)} MiB (unbounded: ~256 MiB)`);
+
+// 3c. NB-014 (found by fuzz.mjs): a relay message that is JSON but not an array
+// (`null` threw a TypeError out of the WebSocket handler) is ignored.
+let scalarThrew = false;
+try {
+  for (const raw of ['null', '0', '1', '"EVENT"', 'true', 'false', '{}', '{"0":"EVENT"}']) sig.onRelay('test', raw);
+} catch {
+  scalarThrew = true;
+}
+check(!scalarThrew && sig.stats.received === before + 2, 'relay messages that are JSON but not arrays are ignored');
 sig.close();
 
 // 4. base64 round-trips a 100 KB and a 1 MB body (spread into fromCharCode fails at that size on some engines).

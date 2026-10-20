@@ -4,7 +4,7 @@
 #
 #   scripts/gate.sh             Rust tests, clippy, wasm build and checks, Node glue, browser tests (loopback)
 #   scripts/gate.sh --quick     skip the browser tests
-#   scripts/gate.sh --strict    clippy with -D warnings
+#   scripts/gate.sh --strict    clippy with -D warnings, and the fuzz tests again in a debug build (overflow checks)
 #   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch relay.damus.io, nos.lol,
 #                               public STUN)
 #
@@ -64,6 +64,8 @@ wasm_check() {
 step "cargo test" cargo test --workspace --release
 if [ $strict = 1 ]; then
   step "cargo clippy" cargo clippy --workspace --all-targets -- -D warnings
+  # Release builds wrap on integer overflow; the parser fuzzers must also run where it panics.
+  step "fuzz (debug)" cargo test --lib -p nobaas-core -p nobaas -p nobaas-ffi -p nobaas-sim fuzz
 else
   step "cargo clippy" cargo clippy --workspace --all-targets
 fi
@@ -84,6 +86,7 @@ step "node pump re-arm" node packages/js/test/pump_rearm.mjs
 step "node endpoint closed" node packages/js/test/endpoint_closed.mjs
 step "node scratch buffers" node packages/js/test/scratch_buffers.mjs
 step "node room drain" node packages/js/test/room_drain.mjs
+step "node fuzz" node packages/js/test/fuzz.mjs
 step "node room leave" node packages/js/test/room_leave.mjs
 
 if [ $quick = 1 ]; then
@@ -91,12 +94,14 @@ if [ $quick = 1 ]; then
   skip "arena" "--quick"
   skip "readme chat" "--quick"
   skip "poll" "--quick"
+  skip "webrtc signals" "--quick"
   skip "tab close" "--quick"
 else
   step "browser" node packages/js/test/browser.mjs 2
   step "arena" node packages/js/test/arena.mjs 8 10
   step "readme chat" node packages/js/test/readme.mjs
   step "poll" node packages/js/test/poll.mjs 3
+  step "webrtc signals" node packages/js/test/webrtc_signals.mjs
   step "tab close" node packages/js/test/leave.mjs --runs=5 --crash=0
 fi
 if [ $nostr = 1 ]; then

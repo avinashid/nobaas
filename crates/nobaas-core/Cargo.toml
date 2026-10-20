@@ -14,3 +14,5 @@ rand_chacha = "0.3"
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
+# The fuzz harness (src/fuzz.rs); a dev-only cycle, the harness deals in bytes.
+nobaas-sim = { path = "../nobaas-sim" }

@@ -70,7 +70,9 @@ export class WebRtcTransport {
         this.congested++;
       }
     };
-    signaling.onMessage((from, msg) => this.onSignal(from, msg));
+    // Signals are untrusted: one that fails must not become an unhandled rejection
+    // (which ends a Node process).
+    signaling.onMessage((from, msg) => void this.onSignal(from, msg).catch(() => {}));
   }
 
   link(peer) {
@@ -147,14 +149,25 @@ export class WebRtcTransport {
     // Only an offer opens a link; answers and candidates for a dropped one are stale.
     if (msg.kind !== 'offer' && !this.byPeer.has(from)) return;
     if (msg.kind === 'offer') {
+      const fresh = !this.byPeer.has(from);
       const l = this.link(from);
-      await l.pc.setRemoteDescription(msg.sdp);
-      await l.pc.setLocalDescription(await l.pc.createAnswer());
+      try {
+        await l.pc.setRemoteDescription(msg.sdp);
+        await l.pc.setLocalDescription(await l.pc.createAnswer());
+      } catch {
+        // A malformed offer: the link it opened is dropped, so it can't block a later one.
+        if (fresh && this.links.get(l.handle) === l) this.drop(from);
+        return;
+      }
       await this.gathered(l.pc);
       this.sig.send(from, { kind: 'answer', sdp: this.description(l.pc) });
     } else if (msg.kind === 'answer') {
       const l = this.link(from);
-      await l.pc.setRemoteDescription(msg.sdp);
+      try {
+        await l.pc.setRemoteDescription(msg.sdp);
+      } catch {
+        // Malformed, or a copy for a link already answered: ignored, the dial times out or stands.
+      }
     } else if (msg.kind === 'ice') {
       const l = this.link(from);
       try {

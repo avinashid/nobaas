@@ -36,6 +36,12 @@ const QUEUE_TARGET: Duration = Duration::from_millis(25);
 /// per RTT of regrowth).
 const LOSS_CUT: f64 = 0.5;
 const DELAY_CUT: f64 = 0.85;
+/// A loss found by fast retransmit while the latest RTT sample showed under
+/// this much queueing is taken as random (a lossy radio link, not a full
+/// buffer) and keeps RANDOM_LOSS_CUT of the window instead of LOSS_CUT, as in
+/// TCP Veno. A timeout always halves.
+const RANDOM_LOSS_QUEUE: Duration = Duration::from_millis(5);
+const RANDOM_LOSS_CUT: f64 = 0.8;
 /// Tail-loss probe: when nothing has been acknowledged for srtt + 2·rttvar +
 /// this, the newest unacknowledged fragment is sent again. Its ACK (or the SACK
 /// gap it exposes) repairs a lost tail in about one RTT instead of an RTO;
@@ -93,6 +99,8 @@ pub(crate) struct RelSend {
     recover_until: Instant,
     min_rtt: Option<Duration>,
     path_min_rtt: Option<Duration>,
+    /// Queueing delay of the latest RTT sample (sample − min_rtt); none before the first.
+    queue_delay: Option<Duration>,
     pub(crate) delay_backoffs: u64,
     /// When to send a tail-loss probe; one per flight, re-armed on ACK progress.
     probe_at: Option<Instant>,
@@ -127,6 +135,7 @@ impl RelSend {
             recover_until: Instant::ZERO,
             min_rtt: None,
             path_min_rtt: None,
+            queue_delay: None,
             delay_backoffs: 0,
             probe_at: None,
             probe_used: false,
@@ -229,6 +238,7 @@ impl RelSend {
             self.min_rtt = Some(min);
             self.path_min_rtt = Some(self.path_min_rtt.map_or(r, |m| m.min(r)));
             queued_too_long = r > min + QUEUE_TARGET;
+            self.queue_delay = Some(r - min);
         }
         if queued_too_long {
             if now >= self.recover_until {
@@ -311,6 +321,7 @@ impl RelSend {
     /// Appends due retransmissions, then new fragments, while they fit in `max` bytes.
     pub(crate) fn write_frames(&mut self, now: Instant, window: usize, out: &mut Vec<u8>, max: usize) {
         let mut lost = false;
+        let mut timed_out = false;
         let mut resent = false;
         let sent_end = self.sent_end;
         for seq in due_by_seq(&self.by_due, now) {
@@ -319,6 +330,7 @@ impl RelSend {
                 break;
             }
             lost = true;
+            timed_out |= !f.fast;
             resent = true;
             f.fast = false;
             f.epoch = sent_end;
@@ -342,7 +354,8 @@ impl RelSend {
             self.retransmits += 1;
         }
         if lost {
-            self.back_off(now, LOSS_CUT);
+            let random = !timed_out && self.queue_delay.is_some_and(|q| q < RANDOM_LOSS_QUEUE);
+            self.back_off(now, if random { RANDOM_LOSS_CUT } else { LOSS_CUT });
         }
         for seq in due_by_seq(&self.by_dup, now) {
             let f = self.inflight.get_mut(&seq).expect("indexed fragment in flight");
@@ -592,8 +605,39 @@ mod tests {
         let cwnd = tx.cwnd();
         assert_eq!(drain(&mut tx, Instant::from_millis(125)), vec![(0, true, vec![0])]);
         assert!(tx.cwnd() < cwnd);
-        // A loss halves the 8 in flight (0 and 9..15).
-        assert_eq!(tx.cwnd(), 4);
+        // The ACKs showed no queueing, so the loss is taken as random: 80% of
+        // the 8 in flight (0 and 9..15) is kept.
+        assert_eq!(tx.ssthresh, 8.0 * RANDOM_LOSS_CUT);
+        assert_eq!(tx.cwnd(), 6);
+    }
+
+    /// The other losses halve: one found by fast retransmit when the latest RTT
+    /// sample showed RANDOM_LOSS_QUEUE of queueing, and a timeout.
+    #[test]
+    fn queued_or_timed_out_loss_halves_the_window() {
+        let sent = || {
+            let mut tx = RelSend::new();
+            tx.seed_rtt(Duration::from_millis(100));
+            for i in 0..16u8 {
+                tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+            }
+            assert_eq!(drain(&mut tx, Instant::ZERO).len(), 16);
+            tx
+        };
+        // 1 and 2 set the minimum RTT; 3..8 come back 5 ms later; 0 is lost.
+        let mut tx = sent();
+        tx.on_ack(Instant::from_millis(100), 0, 0b11);
+        tx.on_ack(Instant::from_millis(100) + RANDOM_LOSS_QUEUE, 0, 0xff);
+        assert_eq!(tx.delay_backoffs, 0);
+        assert_eq!(drain(&mut tx, Instant::from_millis(200)), vec![(0, true, vec![0])]);
+        assert_eq!(tx.ssthresh, 8.0 * LOSS_CUT);
+        // No queueing, but 15 time out (0 was acknowledged): halved too.
+        let mut tx = sent();
+        tx.on_ack(Instant::from_millis(100), 1, 0);
+        let due = earliest(&tx.by_due).unwrap();
+        assert_eq!(drain(&mut tx, due).len(), 15);
+        assert_eq!(tx.retransmits, 15);
+        assert_eq!(tx.ssthresh, 15.0 * LOSS_CUT);
     }
 
     #[test]

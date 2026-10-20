@@ -14,3 +14,7 @@ nobaas-core = { path = "../nobaas-core" }
 rand_core = "0.6"
 rand_chacha = "0.3"
 k256 = { version = "0.13", default-features = false, features = ["schnorr", "arithmetic"] }
+
+[dev-dependencies]
+# The fuzz harness (nobaas_sim::fuzz).
+nobaas-sim = { path = "../nobaas-sim" }

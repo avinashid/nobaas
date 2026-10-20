@@ -35,6 +35,8 @@ nobaas-core = { path = "../nobaas-core" }
 # Tests and examples cover the async host and Nostr signaling too.
 nobaas = { path = ".", features = ["tokio", "nostr"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
+# The fuzz harness (nobaas_sim::fuzz); a dev-only cycle, the harness deals in bytes.
+nobaas-sim = { path = "../nobaas-sim" }
 
 [[example]]
 name = "echo"

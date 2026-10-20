@@ -9,7 +9,7 @@ One command runs it:
 ```sh
 scripts/gate.sh             # everything below that stays on loopback
 scripts/gate.sh --quick     # skip the browser tests (no Playwright needed)
-scripts/gate.sh --strict    # clippy with -D warnings
+scripts/gate.sh --strict    # clippy with -D warnings, and the fuzz tests again in a debug build
 scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a change touches signaling
 ```
 
@@ -17,7 +17,8 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 |---|---|---|
 | Rust tests | `cargo test --workspace --release` | every test passes (ignored tests are known gaps, below) |
 | Lints | `cargo clippy --workspace --all-targets` (`-- -D warnings` with `--strict`) | no errors; `--strict` is clean today |
-| Format | `cargo fmt --all -- --check` | skipped while rustfmt is not installed on the dev host; CI runs it |
+| Fuzz, debug build (`--strict`) | `cargo test --lib -p nobaas-core -p nobaas -p nobaas-ffi -p nobaas-sim fuzz` | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
+| Format | `cargo fmt --all -- --check` | no diff (skipped if rustfmt is not installed) |
 | wasm build | `packages/js/build.sh` | builds `packages/js/pkg/nobaas_ffi.wasm` |
 | wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
 | Node glue | `node packages/js/test/node_pair.mjs` | two endpoints connect; 1000 × 64 B and one 64 KiB reliable message arrive, the large one intact |
@@ -27,6 +28,7 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 | Node pump re-arm | `node packages/js/test/pump_rearm.mjs` | PERF-1: the endpoint re-arms its timer whatever `onTransmit` or `onEvent` do; a reliable message sent while the transport throws, refuses, or has a DataChannel over `MAX_BUFFERED` (1 MiB) queued arrives after the outage by retransmit, well inside the 10 s keepalive; `WebRtcTransport` counts those drops in `congested` |
 | Node nostr bounds | `node packages/js/test/nostr_bounds.mjs` | PERF-2: 12,000 distinct relay events keep `NostrSignaling.seen` at `MAX_SEEN` (4096), oldest evicted first, recent duplicates still dropped; ids that are not 64 lowercase hex (including 4096 events with 64 KiB ids) never enter the set, and non-array tags are ignored without throwing; base64 round-trips 100 KB and 1 MB |
 | Node endpoint closed | `node packages/js/test/endpoint_closed.mjs` | PERF1-2: after `Endpoint.close()` no public method calls into wasm (counted per export): late `receive` datagrams are dropped, `send`/`connect`/`connectVia` throw `endpoint closed`, `secret`/`seal`/`open`/`rttMs` return null, `isConnected` false, `stats` the counters at close; a second `close()` frees nothing; other endpoints on the module keep working |
+| Node fuzz | `node packages/js/test/fuzz.mjs` | NB-014: the JS parsers (below) never throw or leave a rejection unhandled on random and mutated input |
 | Node scratch buffers | `node packages/js/test/scratch_buffers.mjs` | PERF-3: `send`/`receive` reuse the endpoint's `sendBuf` (16 KiB) and `rxBuf`: messages arrive intact back to back across the 0 B, 1232 B and 16 KiB boundaries, 3-byte strings that just fit or just miss, and after wasm memory grows (detached views); no `nb_alloc` on the hot path; `toHex`/`fromHex` tables agree with the old code, non-hex input included |
 | Node room drain | `node packages/js/test/room_drain.mjs` | PERF-4: 6 MiB sent at once between two rooms (over the 4 MiB reliable send window) arrives intact and in order; the frames that waited in the outbox were moved by the endpoint's `onDrain` hook (incoming datagrams, ACKs among them), not the 2 ms timer, which stops once the outbox is empty; with no hook the timer alone still delivers. `scratch_buffers.mjs` covers `sendRetry` (no copy on retry, freed at `close()`) |
 | Node room leave | `node packages/js/test/room_leave.mjs` | a room that leaves while 6 MiB wait behind its full send window has said goodbye and closed before `leave()` returns (nothing waits on a timer or await, which a closing page never runs); both peers see `peer-leave` 'left' at once. With the Bye dropped, the core's sealed close (`Endpoint.disconnect`) alone still gives 'closed' at once. The `pagehide` handler leaves, then holds the page 20 ms (only if it had peers) |
@@ -34,6 +36,7 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 | Arena | `node packages/js/test/arena.mjs 8 10` | every island's checkpoint hashes match, ticks keep confirming |
 | README chat | `node packages/js/test/readme.mjs` | the chat block in `packages/js/README.md` runs in two tabs, messages cross both ways, and it stays ≤ 10 lines |
 | Poll | `node packages/js/test/poll.mjs 3` | three tabs driven only by `poll()`/`sendTo()` see each other; a closed tab leaves |
+| WebRTC signals | `node packages/js/test/webrtc_signals.mjs` | NB-014: malformed offers leave no link and no unhandled rejection; 300 random signals neither throw nor reject; real offers are still answered |
 | Tab close | `node packages/js/test/leave.mjs --runs=5 --crash=0` | a tab streaming reliable data to two others is closed; both see its `peer-leave` within 5 s, every run (the Bye and the core's close go out from `pagehide`). By hand: `--runs=10 --stress=3` on a loaded host, and the default `--crash=1` crashes a tab (`chrome://crash`, no `pagehide`), whose leave comes by the 30 s idle timeout |
 | Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `relay.damus.io` / `nos.lol` and connect over public STUN |
 
@@ -147,13 +150,54 @@ writes its invite to a file, and a second that joins with it. They exchange an `
 synchronizer updates, then both exit 0 within a timeout. It runs on loopback only and gets added as a
 `--godot` flag on `scripts/gate.sh`.
 
+## Fuzzing (NB-014)
+
+Every parser of untrusted input is fuzzed on the stable toolchain, without cargo-fuzz (which needs nightly):
+seeded random and structure-aware inputs (real messages, then mutated: bit flips, boundary bytes, boundary
+u16 lengths, inserts, deletes, duplicated chunks, truncation), with properties checked on whatever a parser
+accepts, not only "no panic". The harness is `nobaas_sim::fuzz` (Rust) and the top of `fuzz.mjs` (JS).
+
+```sh
+cargo test --workspace --release fuzz                     # in the gate: ~400 k cases, a few seconds per target
+cargo test --lib -p nobaas-core -p nobaas -p nobaas-ffi -p nobaas-sim fuzz   # debug: overflow panics
+NB_FUZZ_SCALE=20 NB_FUZZ_SEED=7 cargo test --workspace --release fuzz -- --nocapture   # a soak
+NB_FUZZ_SCALE=5 NB_FUZZ_SEED=7 node packages/js/test/fuzz.mjs
+```
+
+The default seed is fixed, so the gate is deterministic; `NB_FUZZ_SEED` explores others and `NB_FUZZ_SCALE`
+multiplies the case counts. A failing Rust case prints its target, index and input as hex, to paste into a
+regression test.
+
+| Target | Test | Properties |
+|---|---|---|
+| Packets, frames | `nobaas-core` `fuzz::fuzz_packet_parse`, `fuzz_frames` | an accepted packet re-encodes to the same bytes and a well-formed one is never rejected; frames yielded re-encode to exactly the bytes consumed, a malformed tail yields one `Err` |
+| Addresses | `fuzz_addresses`, `nobaas-sim` `fuzz_sim_addresses` | `SocketAddr`/`u32`/`u64`/`SimAddr` decoding accepts canonical encodings only |
+| STUN | `fuzz_stun` | requests and responses (extra attributes too); STUN never parses as a Nobaas packet |
+| Invites | `fuzz_invites` | bytes and `nb:` links: whatever parses survives its own round trip, ≤ 16 entries |
+| Sealed | `fuzz_sealed` | only an untouched message sealed to us opens, naming its real sender |
+| Hostile peer | `fuzz_hostile_peer` | an authenticated peer sends sealed random frames, garbage, FWD to a bystander and RELAYED nested 12 deep, roaming and jumping time: no panic, a violation drops it and it may reconnect, half-open sessions stay bounded, and the bystander and the peer still exchange messages after |
+| Hellos, offers | `nobaas` `traversal::fuzz_hello_and_offer_parsers` | round trips; candidates, relays and the prediction window stay within their limits |
+| Authenticated signals | `traversal::fuzz_authenticated_signals` | a room-key or invite-key holder's proved hellos and offers, random and mutated: the endpoint never dials loopback, multicast, broadcast, link-local, unspecified or port 0 |
+| Gateway answers | `portmap::fuzz_gateway_answers` | PCP, NAT-PMP, SSDP, URLs, IGD XML, HTTP (chunked, lengths at the integer limits): mappings have a port and lifetime, URLs and control paths are printable, SSDP points only at the private host that answered |
+| Port mapper | `portmap::fuzz_mapper` | a hostile gateway and LAN hosts: datagrams only to the gateway or the SSDP group, HTTP only to private hosts, request heads printable with a 3-part request line |
+| Nostr (Rust) | `nostr::fuzz_relay_messages` | mutated events and JSON nested 100,000 deep: what is passed on has a topic and payload that round-trip |
+| C ABI | `nobaas-ffi` `fuzz_the_c_abi` | random call sequences and arguments: documented return codes only, a short event buffer keeps the event for a retry, every event has the documented encoding |
+| Godot frames | `nobaas-godot` `fuzz_frames_from_peers` | frames round-trip; a joiner takes its id only from its host's first ASSIGN, queues packets only from known peers, keeps its inbox caps |
+| JS | `packages/js/test/fuzz.mjs` | `decodeEvent` matches a reference encoder; hex, peer ids, base64 round-trip; `NostrSignaling.onRelay`, `RoomProof.checkHello`, `Room.onMessage` never throw and leave no rejection unhandled; only real proofs and real senders get through |
+| WebRTC signals | `packages/js/test/webrtc_signals.mjs` | see the gate table |
+
+Found and fixed, each with a regression test: a gateway's `Content-Length` near `usize::MAX` overflowed
+`portmap::http_complete` (`huge_content_length_is_not_complete`); a relay message `null` threw out of
+`NostrSignaling.onRelay` (`nostr_bounds.mjs` 3c); a malformed SDP in an offer or answer became an unhandled
+rejection, ending a Node host, and left a dead link (`webrtc_signals.mjs`).
+
 ## Known gaps
 
 | Gap | Test | Owner |
 |---|---|---|
-| No property tests yet for `nobaas-core` codecs (wire, invite, STUN) beyond the garbage-input tests | — | qa (with NB-014 fuzzing) |
+| Invite links are malleable: base64url trailing bits are not checked, and a count over 16 is accepted when 16 entries follow, so several strings parse to one invite (`fuzz_invites` counts them) | — | security (decide) |
+| Fuzzing is not coverage-guided (cargo-fuzz needs nightly) | — | qa, if the toolchain is approved |
 | `browser.mjs` reports round trips and throughput but asserts only that the mesh forms and data arrives | — | qa |
-| No rustfmt on the dev host, so formatting is only checked in CI | — | ops (NB-002) |
 | Planned crates (facade, sync, media, store, Godot binding) have no tests yet; each lands with its own, per the plans above | — | backend |
 
 ## CI
