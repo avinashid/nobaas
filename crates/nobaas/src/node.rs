@@ -192,11 +192,21 @@ impl Node {
 
     /// [`poll`](Node::poll) with the time supplied by the caller (it must never go backwards).
     pub fn poll_at(&mut self, now: Instant) {
+        self.poll_drained(now);
+    }
+
+    /// [`poll_at`](Node::poll_at), returning whether the socket was read until empty
+    /// (`false` when the per-poll read cap stopped it first).
+    pub(crate) fn poll_drained(&mut self, now: Instant) -> bool {
         let now = self.at(now);
+        let mut drained = false;
         for _ in 0..MAX_READS_PER_POLL {
             match self.sock.recv_from(&mut self.buf[..]) {
                 Ok((n, from)) => self.ep.handle_datagram(now, from, &self.buf[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    drained = true;
+                    break;
+                }
                 // ICMP errors surface here on some platforms (ConnectionReset): keep reading.
                 Err(_) => continue,
             }
@@ -209,6 +219,7 @@ impl Node {
             self.track(&e);
             self.events.push_back(e);
         }
+        drained
     }
 
     /// The next event, if any is queued.

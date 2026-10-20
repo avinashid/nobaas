@@ -24,9 +24,16 @@
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! With the `tokio` feature, [`AsyncNode`] wraps a `Node` and waits on the socket
+//! and timers itself: `node.next_event().await`.
 
+#[cfg(feature = "tokio")]
+mod async_node;
 mod node;
 
+#[cfg(feature = "tokio")]
+pub use async_node::AsyncNode;
 pub use node::{Error, Node, Status};
 pub use nobaas_core::{
     Config, ConnectError, DisconnectReason, Identity, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
