@@ -49,11 +49,11 @@ aarch64 core.
 
 | Link | Throughput | Peak cwnd / inflight | Delay backoffs | Retransmits | Urgent p50 / p99 | Sender CPU per fragment |
 |---|---|---|---|---|---|---|
-| Clean | 5.94 MB/s (11.3 s) | 1561 / 1024 | 1 | 0 | 546 / 955 ms | 16 µs |
-| 1% loss | 0.13 MB/s (504 s) | 339 / 339 | 0 | 977 | 27 / 34 s | 7 µs |
-| 0–10 ms jitter, drawn per packet (reorders) | 3.26 MB/s (20.6 s) | 952 / 952 | 2 | 0 | 1.1 / 1.6 s | 17 µs |
-| 0–10 ms jitter, in order | 2.89 MB/s (23.2 s) | 899 / 899 | 2 | 8 | 1.2 / 1.9 s | 7 µs |
-| Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60416 / 1024 | 0 | 0 | 292 / 797 ms | 27 µs |
+| Clean | 5.94 MB/s (11.3 s) | 1561 / 1024 | 1 | 0 | 546 / 955 ms | 6 µs |
+| 1% loss | 0.13 MB/s (504 s) | 339 / 339 | 0 | 977 | 27 / 34 s | 5 µs |
+| 0–10 ms jitter, drawn per packet (reorders) | 3.26 MB/s (20.6 s) | 952 / 952 | 2 | 0 | 1.1 / 1.6 s | 6 µs |
+| 0–10 ms jitter, in order | 2.89 MB/s (23.2 s) | 899 / 899 | 2 | 8 | 1.2 / 1.9 s | 5 µs |
+| Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60416 / 1024 | 0 | 0 | 292 / 797 ms | 5 µs |
 
 What limits it:
 - **One delay backoff halves a whole transfer.** Slow start puts 1024 fragments per RTT on the wire, about
@@ -67,10 +67,12 @@ What limits it:
   jitter costs no retransmissions.
 - **Urgent messages wait behind queued bulk data.** They share the reliable queue, so their latency is the time to
   drain the send buffer (up to 4 MiB), not the RTT.
-- **Sender CPU grows with fragments in flight.** `RelSend::has_sendable`, `next_due` and `write_frames` walk every
-  in-flight fragment on each packet. perf (frame pointers, inline-expanded stacks) puts **50%** of the process in
-  them on the clean 100 Mbit/s run, and **65%** at a steady 1024 in flight. That is about **71%** and **80%** of the
-  sender's CPU. At 27 µs per fragment, one core sends at most about 40 MB/s.
+- **Sender CPU no longer grows with fragments in flight.** Before PERF-6, `RelSend::has_sendable`, `next_due` and
+  `write_frames` walked every in-flight fragment on each packet: about 68% of the sender's CPU at 100 Mbit/s and
+  81% at a steady 1024 in flight (19 and 28 µs per fragment). They now read ordered indexes of retransmission and
+  duplicate times, and perf (frame pointers, inline-expanded stacks) puts them at **3–4%** of the process, about
+  **7–9%** of the sender. At about 6 µs per fragment one core sends roughly 190 MB/s. The simulator output is
+  unchanged.
 
 Reproduce with `cargo run --release -p nobaas-sim --example bulk` (all variants), or one variant with flags such
 as `-- --loss 0.01 --cpu 1 --trace 1`. The CPU split is `scripts/perf-relsend.sh [flags]`, for example `--up 1000`
