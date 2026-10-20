@@ -706,8 +706,11 @@ impl<A: Address> Traversal<A> {
         };
         let addrs: Vec<A> = o.addrs.into_iter().filter(|a| dialable(a, loopback) && !self.local.contains(a)).collect();
         let mut relay = self.relay();
-        if relay.is_none() && room && o.role == Role::Host && matches!(self.privacy, Privacy::RelayOnly { .. }) {
+        let reachable = ep.is_connected(&from) || !addrs.is_empty();
+        if relay.is_none() && room && reachable && o.role == Role::Host && matches!(self.privacy, Privacy::RelayOnly { .. }) {
             // The first proven Host this relay-only node dials becomes its relay, and stays.
+            // A Host offer with nothing to dial is not picked: no dial means no
+            // ConnectFailed to clear the pick, and the real Host would be locked out.
             (self.picked, relay) = (Some(from), Some(from));
         }
         if matches!(self.privacy, Privacy::RelayOnly { .. }) && relay != Some(from) {
@@ -1444,6 +1447,25 @@ mod tests {
         // A pinned `via` overrides any pick.
         t.set_privacy(&mut ep, Privacy::RelayOnly { via: Some(first.peer_id()) });
         assert_eq!(t.relay(), Some(first.peer_id()));
+    }
+
+    /// A Host offer with no address to dial isn't picked as the relay: nothing
+    /// would ever clear the pick, locking the real Host out.
+    #[test]
+    fn relay_only_client_skips_a_host_it_cannot_dial() {
+        let me = id(1).peer_id();
+        let (key, inbox) = (room_key(ROOM.0, ROOM.1), Topic::peer(&me));
+        let real_at: SocketAddr = "198.51.100.10:4000".parse().unwrap();
+        let (empty, real) = (id(2), id(3));
+        let (mut t, mut ep) = in_room(Role::Client, None, "10.0.0.1:7000".parse().unwrap());
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: None });
+        let now = Instant::from_millis(10);
+        t.handle_signal(now, &mut ep, inbox, &offer_from(&empty, &me, Some(&key), 1, Role::Host, vec![]));
+        assert_eq!(t.relay(), None);
+        assert_eq!(dials(&mut ep, now), vec![]);
+        t.handle_signal(now, &mut ep, inbox, &offer_from(&real, &me, Some(&key), 1, Role::Host, vec![real_at]));
+        assert_eq!(t.relay(), Some(real.peer_id()));
+        assert_eq!(dials(&mut ep, now), vec![real_at]);
     }
 
     /// NB-032: a stale or replayed-later hello is dropped.
