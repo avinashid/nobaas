@@ -427,7 +427,7 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | Node.js | the same wasm module |
 | Godot 4.3+ desktop | `nobaas-godot` GDExtension |
 | Swift, Kotlin, Dart, C | `nobaas-ffi` native library (C ABI). Higher-level bindings are planned |
-| Docker | an always-on peer is just a node that stays online (planned image) |
+| Docker | an always-on peer is just a node that stays online: `docker compose up` runs one on localhost, with the demos ([docs/DOCKER.md](docs/DOCKER.md)) |
 
 ## Repository layout
 
@@ -469,6 +469,7 @@ Tests run on loopback, in the simulator or against an in-process Nostr relay
 | [Architecture](docs/ARCHITECTURE.md) | principles, layers, connection flow, lanes, super-peers |
 | [NAT traversal](docs/NAT-TRAVERSAL.md) | STUN, signaling, rooms and proofs, message formats, rules, threat analysis, coverage |
 | [Godot](docs/GODOT.md) | install, API, demo, limits |
+| [Docker](docs/DOCKER.md) | the always-on peer, the examples server, settings, exposing them |
 | [Performance model](docs/PERFORMANCE.md) | measured and theoretical numbers for games, whiteboards, chat and meetings |
 | [Test plan](docs/TEST-PLAN.md) | what is tested, and how |
 | [Comparison](docs/COMPARISON.md) | GunJS, Yjs, PeerJS, libp2p, Trystero, Hyperswarm |
