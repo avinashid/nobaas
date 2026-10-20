@@ -1,0 +1,16 @@
+[package]
+name = "nobaas-godot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Godot 4 GDExtension: NobaasMultiplayerPeer, Godot's high-level multiplayer over Nobaas with no server"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nobaas = { path = "../../crates/nobaas" }
+# 0.5.5 with the Godot 4.3 API: the extension loads in Godot 4.3 and later.
+godot = { version = "=0.5.5", features = ["api-4-3"] }

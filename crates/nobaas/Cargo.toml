@@ -1,0 +1,30 @@
+[package]
+name = "nobaas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Nobaas: peer-to-peer nodes over UDP, with no server"
+
+[dependencies]
+nobaas-core = { path = "../nobaas-core" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Optional async host; the sync Node needs no runtime.
+tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "macros", "rt"] }
+
+[features]
+tokio = ["dep:tokio"]
+
+[dev-dependencies]
+# Tests and examples cover the async host too.
+nobaas = { path = ".", features = ["tokio"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
+
+[[example]]
+name = "echo"
+path = "../../examples/rust/echo.rs"
+
+[[example]]
+name = "echo_async"
+path = "../../examples/rust/echo_async.rs"
+required-features = ["tokio"]

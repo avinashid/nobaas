@@ -146,6 +146,30 @@ pub enum SendError {
     WouldBlock,
 }
 
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConnectError::SelfConnect => "cannot connect to self",
+            ConnectError::InvalidPeerId => "invalid peer id",
+            ConnectError::NoPath => "no address or relay to dial",
+        })
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SendError::NotConnected => "peer not connected",
+            SendError::TooLarge => "message too large for the lane",
+            SendError::WouldBlock => "reliable send buffer full",
+        })
+    }
+}
+
+impl std::error::Error for SendError {}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub tx_packets: u64,
@@ -168,6 +192,34 @@ pub struct Stats {
     /// Punch rounds that ran out without a direct path.
     pub punch_failed: u64,
     pub direct_fallbacks: u64,
+}
+
+/// Per-link counters for one connected peer; see [`Endpoint::peer_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerStats {
+    /// Smoothed round-trip time, once measured.
+    pub rtt: Option<Duration>,
+    /// Lowest round-trip time seen (the handshake counts).
+    pub min_rtt: Option<Duration>,
+    /// Reliable and urgent fragments sent for the first time.
+    pub fragments_sent: u64,
+    /// Reliable fragments sent again (timeouts, fast retransmits, tail probes).
+    pub retransmits: u64,
+}
+
+impl PeerStats {
+    /// Estimated packet loss in `[0, 1]`: the share of reliable transmissions
+    /// that were repeats. Only the reliable lanes are acknowledged, so a link
+    /// carrying only unreliable traffic reports 0. Spurious retransmits make
+    /// this an upper bound.
+    pub fn loss(&self) -> f32 {
+        let total = self.fragments_sent + self.retransmits;
+        if total == 0 {
+            0.0
+        } else {
+            self.retransmits as f32 / total as f32
+        }
+    }
 }
 
 struct Dial<A> {
@@ -361,6 +413,19 @@ impl<A: Address> Endpoint<A> {
     pub fn rtt(&self, peer: &PeerId) -> Option<Duration> {
         match &self.sessions.get(self.peers.get(peer)?)?.state {
             State::Live(l) => l.tx.srtt(),
+            State::Dialing(_) => None,
+        }
+    }
+
+    /// RTT and loss counters for a connected peer.
+    pub fn peer_stats(&self, peer: &PeerId) -> Option<PeerStats> {
+        match &self.sessions.get(self.peers.get(peer)?)?.state {
+            State::Live(l) => Some(PeerStats {
+                rtt: l.tx.srtt(),
+                min_rtt: l.tx.path_min_rtt(),
+                fragments_sent: l.tx.fragments_sent,
+                retransmits: l.tx.retransmits,
+            }),
             State::Dialing(_) => None,
         }
     }
