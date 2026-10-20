@@ -34,6 +34,8 @@
 //! of a room, and [`Node::connect`] punches too. Where NATs can't punch (a
 //! symmetric one against one that filters by port), a peer connected to both
 //! relays, and [`Node::failure`] says which side was symmetric. See [`traversal`].
+//! With [`Builder::port_mapping`] a node also asks its router (PCP, NAT-PMP or
+//! UPnP-IGD) to forward a public port to it, and offers that address too.
 //! The `nostr` feature adds `NostrSignaling`, over public Nostr relays.
 //!
 //! # Privacy
@@ -53,6 +55,7 @@ mod async_node;
 mod node;
 #[cfg(feature = "nostr")]
 pub mod nostr;
+mod portmap;
 mod signaling;
 pub mod traversal;
 
@@ -64,6 +67,7 @@ pub use nobaas_core::{
 pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
+pub use portmap::{MapProtocol, PortMapping};
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
 pub use traversal::{Failure, NatType, Privacy, Role, Side};
 

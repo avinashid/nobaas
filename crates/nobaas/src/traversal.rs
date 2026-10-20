@@ -274,6 +274,8 @@ pub struct Traversal<A: Address> {
     nat: NatType,
     /// The port a sequential symmetric NAT will likely pick next, at `public`'s IP.
     prediction: Option<Prediction>,
+    /// A port the router forwards to this node (router port mapping), if public.
+    mapped: Option<A>,
     observed: Vec<A>,
     room: Option<Room>,
     remotes: BTreeMap<PeerId, Remote>,
@@ -319,6 +321,7 @@ impl<A: Address> Traversal<A> {
             public: None,
             nat: NatType::Unknown,
             prediction: None,
+            mapped: None,
             observed: Vec::new(),
             room: None,
             remotes: BTreeMap::new(),
@@ -357,7 +360,7 @@ impl<A: Address> Traversal<A> {
     }
 
     /// The addresses given out (in invites), as [`Privacy`] allows: public (STUN),
-    /// observed by peers, local. None under [`Privacy::RelayOnly`].
+    /// mapped by the router, observed by peers, local. None under [`Privacy::RelayOnly`].
     pub fn candidates(&self) -> Vec<A> {
         match self.privacy {
             Privacy::Direct => self.addresses(false),
@@ -377,12 +380,18 @@ impl<A: Address> Traversal<A> {
 
     fn addresses(&self, public_only: bool) -> Vec<A> {
         let mut out: Vec<A> = Vec::new();
-        for a in self.public.iter().chain(&self.observed).chain(&self.local) {
+        for a in self.public.iter().chain(&self.mapped).chain(&self.observed).chain(&self.local) {
             if !out.contains(a) && out.len() < MAX_CANDIDATES && (!public_only || is_public(a)) {
                 out.push(a.clone());
             }
         }
         out
+    }
+
+    /// A public address the router forwards to this node's socket (from router
+    /// port mapping), offered after the STUN address. Ignored unless it is public.
+    pub fn set_mapped(&mut self, addr: Option<A>) {
+        self.mapped = addr.filter(|a| is_public(a) && dialable(a, false));
     }
 
     /// Which addresses this node gives out.
@@ -852,7 +861,7 @@ fn dialable<A: Address>(a: &A, loopback: bool) -> bool {
 /// Whether an address is on the public internet: not loopback, private (RFC 1918,
 /// IPv6 ULA), carrier-grade NAT (100.64/10), link-local or otherwise special.
 /// Addresses that aren't IP addresses count as public.
-fn is_public<A: Address>(a: &A) -> bool {
+pub(crate) fn is_public<A: Address>(a: &A) -> bool {
     use std::net::IpAddr;
     let Some(s) = a.to_socket_addr() else { return true };
     let ip = s.ip().to_canonical();
@@ -1463,6 +1472,48 @@ mod tests {
         let key = room_key(ROOM.0, ROOM.1);
         t.handle_signal(now, &mut ep, Topic::peer(&me), &offer_from(&holder, &me, Some(&key), 1, Role::Peer, vec![]));
         assert_eq!(answer(&mut t, &holder), (vec![lan], vec![relay.peer_id()]));
+    }
+
+    /// NB-038: a router-mapped address is offered like a public one: after the STUN
+    /// address and before observed ones, to invite holders (who get public addresses only) and under
+    /// `PublicOnly`, never under `RelayOnly`. A mapping that isn't public is ignored.
+    #[test]
+    fn mapped_address_is_offered_like_a_public_one() {
+        let ia = id(1);
+        let me = ia.peer_id();
+        let (lan, public, mapped): (SocketAddr, SocketAddr, SocketAddr) = (
+            "10.0.0.1:7000".parse().unwrap(),
+            "203.0.113.5:7000".parse().unwrap(),
+            "203.0.113.5:7001".parse().unwrap(),
+        );
+        let (relay, holder) = (id(3), id(2));
+        let mut ep = Endpoint::new(&ia, Config::default(), [1; 32]);
+        let mut t = Traversal::new(&ia, [3; 32], 0, vec![lan], vec![]);
+        let now = Instant::from_millis(10);
+        assert_eq!(t.candidates(), vec![lan]);
+        t.set_mapped(Some(mapped));
+        assert_eq!(t.candidates(), vec![mapped, lan]);
+        link(&mut ep, lan, &relay, "198.51.100.3:9".parse().unwrap(), now);
+        t.handle_event(now, &mut ep, &Event::AddrObserved { by: relay.peer_id(), addr: public });
+        // An observed address (no STUN here) comes after it: from a symmetric NAT it
+        // only works for the peer that saw it.
+        assert_eq!(t.candidates(), vec![mapped, public, lan]);
+        let k = t.invite_key();
+        let o = proved_offer(&holder, &me, Some((Proof::Invite, &k)), 1, Role::Peer, vec![]);
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &o);
+        let o = sent_offers(&mut t, &holder);
+        assert_eq!((o[0].addrs.clone(), o[0].relays.clone()), (vec![mapped, public], vec![]));
+        t.set_privacy(&mut ep, Privacy::PublicOnly);
+        assert_eq!(t.candidates(), vec![mapped, public]);
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: None });
+        assert_eq!(t.candidates(), vec![]);
+        t.set_privacy(&mut ep, Privacy::Direct);
+        for not_public in ["100.64.0.9:7001", "192.168.0.2:7001", "127.0.0.1:7001"] {
+            t.set_mapped(Some(not_public.parse().unwrap()));
+            assert_eq!(t.candidates(), vec![public, lan], "{not_public}");
+        }
+        t.set_mapped(None);
+        assert_eq!(t.candidates(), vec![public, lan]);
     }
 
     /// NB-033 N33-1: an invite holder can make its own dial fail (an address that never
