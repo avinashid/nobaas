@@ -67,6 +67,26 @@ impl NobaasMultiplayerPeer {
         self.session.as_ref().map(|s| GString::from(s.invite().as_str())).unwrap_or_default()
     }
 
+    /// The 32-byte Ed25519 public key that authenticated peer `id`'s link, or an
+    /// empty array if `id` is not directly connected (on a joiner, only the host
+    /// is). Godot ids are short labels anyone can aim at; authorize on this key.
+    #[func]
+    fn get_peer_key(&self, id: i32) -> PackedByteArray {
+        match self.session.as_ref().and_then(|s| s.peer_key(id)) {
+            Some(k) => PackedByteArray::from(&k.as_bytes()[..]),
+            None => PackedByteArray::new(),
+        }
+    }
+
+    /// This peer's own 32-byte public key (empty before `host()` / `join()`).
+    #[func]
+    fn get_public_key(&self) -> PackedByteArray {
+        match self.session.as_ref() {
+            Some(s) => PackedByteArray::from(&s.public_key().as_bytes()[..]),
+            None => PackedByteArray::new(),
+        }
+    }
+
     /// Smoothed round-trip time to peer `id` in milliseconds, or -1 if unknown.
     #[func]
     fn get_peer_rtt_ms(&self, id: i32) -> f64 {

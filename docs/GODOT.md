@@ -46,6 +46,8 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `host(port := 0) -> String` | Start hosting; returns the invite, or `""` if the port can't be bound |
 | `join(invite: String) -> Error` | Dial the host; `ERR_INVALID_PARAMETER` for a bad invite |
 | `get_invite() -> String` | This peer's invite again |
+| `get_peer_key(id) -> PackedByteArray` | The 32-byte Ed25519 key that authenticated peer `id`'s link (empty if not directly connected) |
+| `get_public_key() -> PackedByteArray` | This peer's own key |
 | `get_peer_rtt_ms(id) -> float` | Smoothed RTT to a directly connected peer, `-1` if unknown |
 | `get_peer_loss(id) -> float` | Loss estimate 0–1 from reliable retransmissions, `-1` if unknown |
 
@@ -71,6 +73,33 @@ The rest of the `MultiplayerPeer` API works as documented: `refuse_new_connectio
 - **Frame format** (inside the encrypted Nobaas message), from `bindings/godot/src/session.rs`:
   - data: `0x01 mode channel [seq u32 LE, unreliable-ordered only] payload`
   - control: `0x00 0x01 id(i32 LE)`, the host's id assignment. Other control frames are ignored.
+
+## Security
+
+Nobaas guarantees that every byte reaching the `MultiplayerPeer` came from the authenticated peer and was not
+read or changed on the way. Everything Godot does with those bytes is outside that guarantee, and in a P2P game
+**every connected peer is a potential attacker**. (Threat model: SEC-9 to SEC-11 in `docs/THREAT-MODEL.md`.)
+
+- **Keep `allow_object_decoding` off** on the `SceneMultiplayer`. That is Godot's default, and the demo asserts
+  it. With it on, a peer can make you instantiate objects.
+- **`@rpc("any_peer")` arguments are attacker-controlled.** Check types, ranges and lengths, and check
+  `multiplayer.get_remote_sender_id()`, before acting on them.
+- **Godot peer ids are labels, not identities.** `get_packet_peer()` always comes from the authenticated link, and
+  only the dialled host is ever 1. The host gives each joiner a distinct id and renumbers on a collision, so no
+  peer inherits another's id. But ids are 31 bits, and someone can grind a key that lands on a chosen id. Never
+  authorize on an id or on `is_multiplayer_authority()`: use `get_peer_key(id)` and compare it with keys you
+  trust.
+- **Godot's authority model is only as trustworthy as the peer you make the authority.** In this star the host is
+  the natural authority: let it own spawning and validate what joiners send. A malicious host can still push any
+  state. If no single peer can be trusted, run the game as deterministic lockstep on `nobaas-game`, where every
+  peer recomputes the state and desyncs are detected.
+- **Relaying between joiners is Godot's server relay** (`multiplayer.server_relay`, on by default): the host's
+  SceneMultiplayer forwards joiner packets, and the binding only reports that it can. Set
+  `multiplayer.server_relay = false` on the host to stop it. Joiners then see only the host.
+- **The invite is not a password.** It holds no secret, and anyone who has it can join. Set
+  `refuse_new_connections` once everyone is in, or kick with `disconnect_peer()`.
+- **Malformed packets** fail at the binding's `decode` and are dropped. Payloads above the lane caps are refused
+  on the way out. Rust panics are caught at the GDExtension boundary by godot-rust and never unwind into Godot.
 
 ## Demo
 
@@ -113,9 +142,6 @@ binary:
   binding will pick it up without API changes.
 - **The host's uplink carries everyone**, as with any star. Use `nobaas-game` islands and super-peers for big
   sessions.
-- **The invite is not a password.** It holds no secret, and anyone who has it can join. Use
-  `refuse_new_connections` once everyone is in, or kick with `disconnect_peer()`. Godot peer ids are labels the
-  host assigns, not identities; the Nobaas `PeerId` behind each link is authenticated.
 - **Lockstep and rollback games** must run their game logic on `nobaas-game` fixed-point maths, not Godot
   physics or floats. Godot physics is not deterministic across machines.
 - **Web export** has no UDP. It needs a transport through `nobaas.js` (WebRTC) bridged with `JavaScriptBridge`.

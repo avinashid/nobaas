@@ -340,6 +340,17 @@ impl Session {
         v
     }
 
+    /// The authenticated Nobaas identity (Ed25519 public key) behind Godot peer `id`.
+    /// Godot ids are short labels; authorize on this key, never on the id.
+    pub fn peer_key(&self, id: i32) -> Option<PeerId> {
+        self.ids.peer(id)
+    }
+
+    /// This peer's own Nobaas identity.
+    pub fn public_key(&self) -> PeerId {
+        self.node.peer_id()
+    }
+
     /// RTT and loss towards a connected Godot peer.
     pub fn peer_stats(&self, id: i32) -> Option<PeerStats> {
         self.node.peer_stats(&self.ids.peer(id)?)
@@ -671,6 +682,9 @@ mod tests {
         host.target = 0;
         assert_eq!(host.put(&vec![0; MAX_UNRELIABLE]), Err(PutError::TooLarge));
         assert!(host.peer_stats(ia).is_some());
+        assert_eq!(host.peer_key(ia), Some(a.public_key()), "ids resolve to the authenticated key");
+        assert_eq!(a.peer_key(HOST_ID), Some(host.public_key()), "1 is bound to the dialled host");
+        assert_eq!(a.peer_key(ib), None, "joiners hold no link to each other");
 
         // The host kicks b: both sides see it.
         host.disconnect_peer(ib);

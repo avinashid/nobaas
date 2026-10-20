@@ -23,6 +23,8 @@ var elapsed := 0.0
 
 
 func _ready() -> void:
+	# Peers are untrusted: never let them ship encoded Objects (Godot's default, asserted).
+	assert(not (multiplayer as SceneMultiplayer).allow_object_decoding)
 	players.name = "Players"
 	add_child(players)
 	spawner.name = "Spawner"
@@ -100,9 +102,13 @@ func _spawn_player(id: int) -> Node:
 	return p
 
 
+## Any peer can call this with any argument: check it before use.
 @rpc("any_peer", "call_local", "reliable")
 func chat(text: String) -> void:
 	var from := multiplayer.get_remote_sender_id()
+	text = text.strip_edges().left(200)
+	if text.is_empty():
+		return
 	_log("[%d] %s" % [from, text])
 	if from != multiplayer.get_unique_id():
 		got_chat = true
