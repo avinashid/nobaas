@@ -135,6 +135,7 @@ export class Endpoint {
     this.onTransmit = () => {};
     this.onEvent = () => {};
     this.timer = null;
+    this.transmitErrors = 0; // datagrams lost because onTransmit threw
   }
   // Throws on anything but a valid PeerId, before touching wasm memory.
   setPeer(id) {
@@ -241,29 +242,38 @@ export class Endpoint {
       if (!this.closed) this.pump();
     });
   }
-  // Drains datagrams and events, and re-arms the timer.
+  // Drains datagrams and events, and always re-arms the timer: a transport or
+  // handler that throws must not leave the endpoint without retransmits or keepalives.
   pump() {
     const x = this.nb.x;
     const now = nowUs();
-    for (;;) {
-      const n = x.nb_poll_transmit(this.h, now, this.addrBuf, this.txBuf, MAX_DATAGRAM);
-      if (n <= 0) break;
-      const m = this.nb.mem();
-      const addr = new DataView(m.buffer).getUint32(this.addrBuf, true);
-      this.onTransmit(addr, m.slice(this.txBuf, this.txBuf + n));
-    }
-    for (;;) {
-      let n = x.nb_poll_event(this.h, this.evBuf, this.evCap);
-      if (n === 0) break;
-      if (n < 0) {
-        this.nb.free(this.evBuf, this.evCap);
-        this.evCap = -n;
-        this.evBuf = x.nb_alloc(this.evCap);
-        continue;
+    try {
+      for (;;) {
+        const n = x.nb_poll_transmit(this.h, now, this.addrBuf, this.txBuf, MAX_DATAGRAM);
+        if (n <= 0) break;
+        const m = this.nb.mem();
+        const addr = new DataView(m.buffer).getUint32(this.addrBuf, true);
+        try {
+          this.onTransmit(addr, m.slice(this.txBuf, this.txBuf + n));
+        } catch {
+          // A datagram the transport couldn't take is a lost datagram; the core retransmits.
+          this.transmitErrors++;
+        }
       }
-      this.onEvent(decodeEvent(this.nb.mem().slice(this.evBuf, this.evBuf + n)));
+      for (;;) {
+        let n = x.nb_poll_event(this.h, this.evBuf, this.evCap);
+        if (n === 0) break;
+        if (n < 0) {
+          this.nb.free(this.evBuf, this.evCap);
+          this.evCap = -n;
+          this.evBuf = x.nb_alloc(this.evCap);
+          continue;
+        }
+        this.onEvent(decodeEvent(this.nb.mem().slice(this.evBuf, this.evBuf + n)));
+      }
+    } finally {
+      this.arm();
     }
-    this.arm();
   }
   arm() {
     if (this.closed) return;
@@ -274,8 +284,9 @@ export class Endpoint {
     const delayMs = Math.max(0, Number(t - nowUs()) / 1000);
     this.timer = setTimeout(() => {
       this.timer = null;
+      if (this.closed) return;
       this.nb.x.nb_handle_timeout(this.h, nowUs());
-      this.pump();
+      this.pump(); // re-arms, whatever the transport or handlers do
     }, delayMs);
   }
   close() {

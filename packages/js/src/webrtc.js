@@ -11,6 +11,9 @@
 
 import { isPeerId, MAX_DATAGRAM } from './nobaas.js';
 
+// Above this many bytes queued on a DataChannel, new datagrams are dropped (PERF-1).
+export const MAX_BUFFERED = 1024 * 1024;
+
 // Removes `host` candidates (LAN, loopback, mDNS .local names) from an SDP, keeping
 // server-reflexive (public, from STUN) and relay ones.
 export function withoutHostCandidates(sdp) {
@@ -43,7 +46,8 @@ export class WebRtcTransport {
     this.checking = new Map(); // peer hex -> signals that came while its offer was checked
     if (privacy === 'relay-only') endpoint.setRelayOnly(true);
     this.trickle = trickle;
-    this.dropped = 0;
+    this.dropped = 0; // datagrams dropped by the simulated `loss`
+    this.congested = 0; // datagrams dropped because the DataChannel was full or refused them
     this.sig = signaling;
     this.iceServers = iceServers;
     this.onPeer = onPeer;
@@ -56,7 +60,15 @@ export class WebRtcTransport {
         this.dropped++;
         return;
       }
-      if (l && l.dc.readyState === 'open') l.dc.send(bytes);
+      if (!l || l.dc.readyState !== 'open') return;
+      // A full SCTP buffer means the path is congested: drop like UDP would, and
+      // let the core's congestion control back off. dc.send throws when it's full.
+      if (l.dc.bufferedAmount > MAX_BUFFERED) return void this.congested++;
+      try {
+        l.dc.send(bytes);
+      } catch {
+        this.congested++;
+      }
     };
     signaling.onMessage((from, msg) => this.onSignal(from, msg));
   }
