@@ -52,7 +52,7 @@ pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
-pub use traversal::{Failure, NatType, Role};
+pub use traversal::{Failure, NatType, Privacy, Role};
 pub use nobaas_core::{
     Config, ConnectError, DisconnectReason, Identity, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
 };

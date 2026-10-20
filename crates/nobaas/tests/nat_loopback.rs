@@ -104,7 +104,20 @@ fn invite_join_dials_back_over_signaling() {
     let hub = MemoryHub::new();
     let (mut host, mut guest) = (room_node(&hub), room_node(&hub));
     let dead = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap(); // closed when dropped
-    let invite = nobaas_core::Invite { peer: host.peer_id(), key: None, addrs: vec![dead], relays: vec![] }.to_link();
+    let real: nobaas_core::Invite<std::net::SocketAddr> = nobaas_core::Invite::parse(&host.invite()).unwrap();
+    let key = real.key;
+    assert!(key.is_some());
+    let hid = host.peer_id();
+    let invite_with = |key| nobaas_core::Invite { peer: hid, key, addrs: vec![dead], relays: vec![] }.to_link();
+
+    // NB-032: knowing the host's PeerId (and an address) is not enough to make it
+    // dial back: without the invite's key the offer is ignored.
+    let mut stranger = room_node(&hub);
+    let h = stranger.connect(&invite_with(None)).unwrap();
+    pump(&mut [&mut host, &mut stranger], 2, |_| false);
+    assert_eq!((stranger.status(&h), host.peers().count()), (Status::Connecting, 0));
+
+    let invite = invite_with(key);
     let h = guest.connect(&invite).unwrap();
     let g = guest.peer_id();
     assert!(pump(&mut [&mut host, &mut guest], 5, |n| linked(n[0], g) && linked(n[1], h)));

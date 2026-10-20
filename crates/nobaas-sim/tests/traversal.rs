@@ -3,7 +3,7 @@
 //! Signaling is a deterministic in-memory broker with relay-like latency; no
 //! invite or address is exchanged out of band.
 
-use nobaas::traversal::{Failure, NatType, Role, Signal, Traversal};
+use nobaas::traversal::{Failure, NatType, Privacy, Role, Signal, Traversal};
 use nobaas::Topic;
 use nobaas_core::{Config, Event, Lane, Path, PeerId};
 use nobaas_sim::{NatConfig, NetConfig, Sim, SimAddr};
@@ -85,6 +85,16 @@ impl World {
                 self.sim.add_node_behind(h, config)
             }
         };
+        self.attach(node)
+    }
+
+    /// Another peer behind the NAT that `p` is behind (a home LAN).
+    fn add_beside(&mut self, nat: usize) -> usize {
+        let node = self.sim.add_node_behind(nat, Config::default());
+        self.attach(node)
+    }
+
+    fn attach(&mut self, node: usize) -> usize {
         let identity = self.sim.nodes[node].identity.clone();
         let seed = [node as u8 + 1; 32];
         let trav = Traversal::new(&identity, seed, BASE_MS, vec![self.sim.addr(node)], self.stun.clone());
@@ -94,6 +104,11 @@ impl World {
 
     fn id(&self, p: usize) -> PeerId {
         self.sim.peer_id(self.peers[p].node)
+    }
+
+    fn set_privacy(&mut self, p: usize, privacy: Privacy) {
+        let ep = &mut self.sim.nodes[self.peers[p].node].endpoint;
+        self.peers[p].trav.set_privacy(ep, privacy);
     }
 
     fn join(&mut self, p: usize, room: &str, role: Role) {
@@ -332,7 +347,8 @@ fn invite_join_punches_only_with_signaling() {
         w.sim.nodes[nj].endpoint.connect_with(now, hid, &targets).unwrap();
         if signaled {
             let ep = &w.sim.nodes[nj].endpoint;
-            w.peers[j].trav.introduce(now, ep, hid);
+            let key = w.peers[h].trav.invite_key();
+            w.peers[j].trav.introduce(now, ep, hid, Some(key));
         }
         let ok = w.run_until(Duration::from_secs(10), |w| w.connected(h, j));
         assert_eq!(ok, signaled, "signaled: {signaled}");
@@ -340,4 +356,90 @@ fn invite_join_punches_only_with_signaling() {
             assert!(w.direct(h, j));
         }
     }
+}
+
+/// How the A-B link of a room ended up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    Direct,
+    Relayed,
+    Failed,
+}
+
+/// A public host H and two peers A and B (of kinds `a`, `b`, or both behind one
+/// port-restricted NAT with no hairpinning when `a` is `None`) meet in a room,
+/// A and B in `mode`. How does A-B link?
+fn room_trio(a: Option<(&Kind, &Kind)>, mode: Privacy, seed: u64) -> Link {
+    let mut w = World::new(seed);
+    let h = w.add(&Kind::Public);
+    let (pa, pb) = match a {
+        Some((a, b)) => (w.add(a), w.add(b)),
+        None => {
+            let nat = w.sim.add_nat(NatConfig::port_restricted(), None);
+            let pa = w.add_beside(nat);
+            (pa, w.add_beside(nat))
+        }
+    };
+    w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+    for p in [pa, pb] {
+        w.set_privacy(p, mode);
+    }
+    w.join(h, "trio", Role::Host);
+    w.join(pa, "trio", Role::Peer);
+    w.join(pb, "trio", Role::Peer);
+    if !w.run_until(Duration::from_secs(45), |w| w.connected(pa, pb)) {
+        return Link::Failed;
+    }
+    // Time to punch, if anything will.
+    w.run_until(Duration::from_secs(6), |w| w.direct(pa, pb));
+    let (na, nb) = (w.peers[pa].node, w.peers[pb].node);
+    w.peers[pb].events.clear();
+    w.sim.send(na, nb, Lane::Reliable, b"ping").unwrap();
+    w.run_until(Duration::from_secs(1), |w| w.peers[pb].events.iter().any(|e| matches!(e, Event::Message { .. })));
+    assert_eq!(w.messages(pb), vec![b"ping".to_vec()]);
+    if w.direct(pa, pb) {
+        Link::Direct
+    } else {
+        let hid = w.id(h);
+        assert_eq!((w.path(pa, pb), w.path(pb, pa)), (Some(Path::Via(hid)), Some(Path::Via(hid))));
+        Link::Relayed
+    }
+}
+
+/// NB-034: what each privacy mode costs in direct links, over every pair of NAT
+/// kinds (each unordered pair once) plus two peers on one LAN, in a room with a
+/// public host that relays. Prints the counts per mode.
+#[test]
+fn privacy_modes_matrix() {
+    let ks = kinds();
+    let mut pairs: Vec<Option<(&Kind, &Kind)>> = vec![None];
+    for (i, a) in ks.iter().enumerate() {
+        for b in &ks[i..] {
+            pairs.push(Some((a, b)));
+        }
+    }
+    println!("\nroom of a public host and two peers A, B in each mode: A-B links ({} pairs of NAT kinds + one LAN pair)", pairs.len() - 1);
+    let modes = [Privacy::Direct, Privacy::PublicOnly, Privacy::RelayOnly { via: None }];
+    let mut lan = Vec::new();
+    for mode in modes {
+        let mut count = [0u32; 3];
+        for (k, pair) in pairs.iter().enumerate() {
+            let link = room_trio(*pair, mode, 500 + k as u64);
+            count[link as usize] += 1;
+            if pair.is_none() {
+                lan.push(link);
+            }
+            if mode != Privacy::Direct {
+                // No mode loses a link: what can't be direct goes through the host.
+                assert_ne!(link, Link::Failed, "{mode:?} {:?}", pair.map(|(a, b)| (a.name(), b.name())));
+            }
+            if matches!(mode, Privacy::RelayOnly { .. }) {
+                assert_eq!(link, Link::Relayed);
+            }
+        }
+        println!("{:>34}: direct {:>2}, relayed {:>2}, failed {}", format!("{mode:?}"), count[0], count[1], count[2]);
+    }
+    // On one LAN, Direct links over the LAN; PublicOnly gave the LAN address to no
+    // one, and the NAT doesn't hairpin, so the pair goes through the host.
+    assert_eq!(lan, vec![Link::Direct, Link::Relayed, Link::Relayed]);
 }
