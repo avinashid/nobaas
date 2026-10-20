@@ -1,0 +1,10 @@
+[package]
+name = "nobaas-game"
+description = "Deterministic fixed-point maths, Hilbert-curve islands and desync detection for P2P multiplayer games"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+siphasher = "1.0"

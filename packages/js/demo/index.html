@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>nobaas-core browser demo</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 2rem; max-width: 52rem; }
+    code { font-size: 12px; }
+    table { border-collapse: collapse; margin: 1rem 0; }
+    td, th { border: 1px solid #ccc; padding: 4px 8px; text-align: left; }
+    #log { white-space: pre-wrap; height: 14rem; overflow: auto; background: #f6f6f6; padding: .5rem; font: 12px monospace; }
+  </style>
+</head>
+<body>
+  <h1>nobaas-core in the browser</h1>
+  <p>Me: <code id="me">loading…</code> &nbsp; room: <code id="room"></code></p>
+  <p>Open this page in more tabs of the same browser: tabs find each other over a
+     BroadcastChannel, open WebRTC DataChannels (no STUN/TURN, local only) and run
+     the Nobaas Noise handshake over them.</p>
+  <table><thead><tr><th>Peer</th><th>Path</th><th>RTT</th></tr></thead><tbody id="peers"></tbody></table>
+  <form id="chat"><input id="text" size="50" placeholder="message to everyone"> <button>Send</button></form>
+  <div id="log"></div>
+  <script type="module" src="demo.js"></script>
+</body>
+</html>

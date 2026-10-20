@@ -1,0 +1,128 @@
+# Performance model
+
+This page separates two kinds of numbers:
+
+- **Measured**: produced by code in this repository (the deterministic simulator in `crates/nobaas-sim`,
+  real UDP loopback, or headless browsers), with the command that reproduces them.
+- **Theoretical**: worked out from the wire format and published figures for links and crypto. These are
+  planning estimates, not benchmarks. Each one shows its formula so you can plug in your own numbers.
+
+Real networks (CGNAT, mobile radio, Wi-Fi contention) will be worse than the simulator. Treat the theoretical
+column as an upper bound until a real-device test confirms it.
+
+## 1. Cost of a packet
+
+| Item | Bytes |
+|---|---|
+| IPv4 + UDP header | 28 (IPv6: 48) |
+| Nobaas DATA header: kind, receiver index, nonce | 13 |
+| AEAD tag (ChaCha20-Poly1305) | 16 |
+| Frame header: unreliable / reliable | 3 / 8 |
+| Largest datagram | 1232 (fits the IPv6 minimum MTU) |
+| Extra in browsers: DTLS record + SCTP DATA chunk (WebRTC) | ~65 |
+
+So a message of `s` bytes costs about **`s + 60` bytes natively** and **`s + 125` bytes in a browser**. Messages
+sent in the same tick are packed into one packet, so the per-packet part is paid once per tick, not once per
+message.
+
+## 2. Core engine (measured)
+
+| What | Result | How |
+|---|---|---|
+| Reliable messages over UDP loopback, one core (aarch64) | ~1.2 M msg/s | `cargo run --release -p nobaas-core --example udp_pair` |
+| Handshake | 1 RTT (Noise IK) | `tests/endpoint.rs` |
+| WebAssembly module | ~300 KB, 0 imports | `./packages/js/build.sh` |
+| Two endpoints in Node: connect, then 1000 × 64 B + 64 KiB | connect 53 ms, transfer 51 ms | `node packages/js/test/node_pair.mjs` |
+| Super-peer dies mid-game | detected in 267 ms; affected players' p99 316 ms; 0 stalls; every event delivered | `tests/arena.rs` |
+
+**Theoretical ceiling.** ChaCha20-Poly1305 runs at roughly 1–2 GB/s per modern core. A full 1232 B packet
+therefore costs about 0.6–1.2 µs of crypto, so the ceiling is roughly 1 M full packets/s, or 8 Gbit/s, per core.
+The NIC or the uplink runs out long before the CPU does.
+
+## 3. Multiplayer games (measured, simulator)
+
+Setup: 12-player islands, 60 Hz lockstep, 20 ms + 0–10 ms jitter, 1% loss, 20% of peers behind symmetric NAT,
+250 ms router buffers.
+
+| Super-peer uplink | Players at p99 lag < 120 ms | Players still in sync (no stalls) |
+|---|---|---|
+| 10 Mbit/s | **96** (p50/p99 70/109 ms) | 192 (113/335 ms) |
+| 20 Mbit/s | **192** (72/116 ms) | 256 (78/216 ms) |
+
+- **512 players, 8 super-peers:** lag p50/p99 59/79 ms, projectile p99 96 ms, 0.06% late events. Each super-peer
+  sends 5.4 Mbit/s up; each player sends ~40 kbit/s up (~440 kbit/s with the direct island mesh on).
+- **No symmetric NATs:** lag 34/51 ms and super-peer upload 2.7 Mbit/s.
+- **Scale:** 4096 players simulated; per-node load stays flat because islands are independent.
+- **Overload:** stalls begin at about 2.5× oversubscription. Below that, overload control lowers the update rate
+  instead of stalling.
+
+Reproduce with `cargo run --release -p nobaas-sim --example arena -- --players 512 --supers 8` (add `--help`
+for the flags).
+
+**Rule of thumb (theoretical).**
+- Players per super-peer ≈ `0.8 × uplink / (60 Hz × bundle bytes × 8)`.
+- A bundle is one packet to each player, carrying the other island members' run-length-encoded inputs: about
+  60 B of overhead plus ~10 B per member, so ~170 B.
+- The 0.8 leaves headroom so queues stay short and p99 latency stays low.
+- With 10 Mbit/s that gives **~98 players**, close to the measured 96.
+- For 64 players it predicts 5.2 Mbit/s, close to the measured 5.4 Mbit/s.
+
+## 4. Whiteboard and collaborative documents (theoretical)
+
+Assume a stroke update of 64 B sent 20 times a second while someone draws.
+
+- **Per-pair cost:** (64 + 125) × 20 × 8 ≈ **30 kbit/s** in a browser.
+- **Full mesh**, where everyone sends to everyone: per-peer uplink ≈ `(N − 1) × 30 kbit/s`.
+  - On 5 Mbit/s: **~160 active drawers**, by bandwidth.
+  - In practice browsers cap at roughly 50–100 RTCPeerConnections, so the mesh limit is **~50 peers**.
+  - Most peers are idle at any moment, which helps further.
+- **Beyond ~50 peers:** a super-peer fans updates out, so each client keeps one link.
+  - A super-peer with 20 Mbit/s up and 2 Mbit/s of incoming edits relays to ~10 viewers per Mbit/s of edits.
+  - That is roughly **500+ viewers** of a busy board, more with the tree fan-out in §6.
+- **Sync latency:** one network hop (RTT/2), plus one tick if updates are batched (≤ 50 ms at 20 Hz).
+
+## 5. Chat (theoretical)
+
+- **Messages are tiny.** A 200 B message costs ~325 B on the wire per recipient.
+- **Rooms:**
+  - A 50-person room in a full mesh costs the sender ~16 KB per message.
+  - Larger rooms use a super-peer or gossip tree, where each peer forwards to a fixed fan-out `d`.
+- **Gossip delivery:** `log_d(N)` hops.
+  - With `d = 6`, a 10,000-member room is reached in **~5–6 hops**, about 150–300 ms on typical internet RTTs.
+- **Offline delivery:** messages for an offline peer are stored by peers who share the room, up to a quota per
+  peer. They are erasure-coded so any k of n holders can rebuild them. This is planned (`nobaas-store`); see the
+  roadmap.
+
+## 6. Meetings: audio and video (theoretical)
+
+Media runs over WebRTC media tracks in browsers. Nobaas does the signaling, identity and topology.
+
+| Stream | Typical bitrate |
+|---|---|
+| Opus audio | 32 kbit/s |
+| Video 360p / 720p / 1080p | 0.5 / 1.5 / 3 Mbit/s |
+
+- **Mesh**, where each peer sends its stream to every other: per-peer uplink = `(N − 1) × bitrate`.
+  - 720p on 10 Mbit/s: **~6 participants**.
+  - 360p: ~20 by bandwidth, but CPU (encrypting N−1 copies) limits it to about **8–12**.
+- **Peer SFU**, where the participant with the best uplink forwards the streams:
+  - It receives N streams and sends N × (N − 1).
+  - With simulcast at 360p and 50 Mbit/s up, that is about **10 active video participants**, with audio for many more.
+- **Webinar or broadcast:** one speaker, and viewers forward to `d` others.
+  - At 1.5 Mbit/s and `d = 4`, each relaying viewer needs 6 Mbit/s up.
+  - 1000 viewers sit at depth `log_4(1000)` ≈ 5, adding **~100–200 ms** of latency.
+
+## 7. Connection setup (theoretical, plus measured where noted)
+
+| Path | Time to first message |
+|---|---|
+| LAN or same browser (BroadcastChannel) | 1 RTT handshake + signaling ≈ **< 50 ms** (measured in browser tests) |
+| Internet, both peers on cone NAT | signaling (Nostr relay ≈ 100–300 ms) + ICE/hole punch (1–2 RTT) + 1 RTT ≈ **0.3–1 s** |
+| One side behind symmetric NAT | as above, through a peer relay; upgrades to direct if a punch succeeds |
+| Both sides behind symmetric NAT | stays relayed through a mutual peer: adds one hop of latency |
+
+## What would change these numbers
+
+- **Better:** IPv6 (no NAT, so direct paths), QUIC/GSO batching, or a super-peer on wired fibre.
+- **Worse:** mobile radio (RTT 50–150 ms, bursty loss), Wi-Fi contention, or carrier-grade NAT with short timeouts
+  (keepalives cost more).

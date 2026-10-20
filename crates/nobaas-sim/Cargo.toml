@@ -1,0 +1,16 @@
+[package]
+name = "nobaas-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic network simulator for Nobaas"
+
+[dependencies]
+nobaas-core = { path = "../nobaas-core" }
+rand_core = "0.6"
+rand_chacha = "0.3"
+
+
+[dev-dependencies]
+nobaas-game = { path = "../nobaas-game" }

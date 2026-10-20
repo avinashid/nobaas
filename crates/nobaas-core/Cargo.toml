@@ -1,0 +1,16 @@
+[package]
+name = "nobaas-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Nobaas: sans-IO peer-to-peer session core"
+
+[dependencies]
+snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2"] }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "zeroize", "rand_core"] }
+rand_core = "0.6"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

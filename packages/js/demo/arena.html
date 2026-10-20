@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Nobaas arena</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 1.5rem; background: #0b0e12; color: #dde; }
+    code { color: #9cf; }
+    canvas { border: 1px solid #334; display: block; margin: .75rem 0; }
+    #hud { font: 12px monospace; }
+  </style>
+</head>
+<body>
+  <div>Nobaas arena — <b id="role"></b> <code id="me"></code></div>
+  <div id="hud">connecting…</div>
+  <canvas id="view" width="480" height="480"></canvas>
+  <div>Open one tab with <code>?role=super</code> and any number of player tabs.
+    Players are bots unless you press the arrow keys (space dashes).
+    Every input travels player → super-peer → island over Nobaas links on WebRTC DataChannels;
+    each player draws the lockstep-confirmed state of its island.</div>
+  <script type="module" src="arena.js"></script>
+</body>
+</html>
