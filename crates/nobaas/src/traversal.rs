@@ -693,8 +693,13 @@ impl<A: Address> Traversal<A> {
         // A sequential symmetric NAT maps the sender's packets to us at a port
         // near its prediction: probe those too (pointless from an open or
         // symmetric NAT, which take any packet or would burn a port per probe).
+        // Only around a public address: senders predict only for theirs.
         let guesses: Vec<A> = match (o.predict, o.addrs.first()) {
-            (Some(p), Some(base)) if !matches!(self.nat, NatType::Open | NatType::Symmetric) => {
+            (Some(p), Some(base))
+                if !matches!(self.nat, NatType::Open | NatType::Symmetric)
+                    && is_public(base)
+                    && dialable(base, loopback) =>
+            {
                 p.window(base).into_iter().filter(|a| dialable(a, loopback) && !o.addrs.contains(a)).collect()
             }
             _ => Vec::new(),
@@ -1652,6 +1657,59 @@ mod tests {
             }
         }
     }
+
+    /// NB-035 security review: repeating an offer adds no probes (S1), guesses go
+    /// out on three handshake sends only (S3), and never around a private address (S2).
+    #[test]
+    fn guesses_are_probed_three_times_and_only_at_public_addresses() {
+        let me = id(1).peer_id();
+        let (s1, s2): (SocketAddr, SocketAddr) = ("192.0.2.1:3478".parse().unwrap(), "192.0.2.2:3478".parse().unwrap());
+        // Every datagram the endpoint sends to `there`'s IP over 40 s, after `offers` copies of one offer.
+        let sent_to = |there: SocketAddr, offers: u64| -> usize {
+            let local: SocketAddr = "10.0.0.2:7000".parse().unwrap();
+            let mut t = Traversal::new(&id(1), [3; 32], 0, vec![local], vec![s1, s2]);
+            let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+            t.handle_timeout(Instant::ZERO, &mut ep);
+            for r in std::iter::from_fn(|| t.poll_transmit()).collect::<Vec<_>>() {
+                let tx = stun::parse_binding_request(&r.payload).unwrap();
+                t.handle_stun(&r.dst, &stun::binding_response(&tx, "203.0.113.9:5000".parse().unwrap()));
+            }
+            assert_eq!(t.nat_type(), NatType::Cone);
+            let peer = id(2);
+            t.introduce(Instant::ZERO, &ep, peer.peer_id(), None);
+            let mut sent = Vec::new();
+            for nonce in 1..=offers {
+                let o = Offer {
+                    kind: Proof::None,
+                    reply: false,
+                    role: Role::Peer,
+                    nat: NatType::Symmetric,
+                    ts: 0,
+                    nonce,
+                    addrs: vec![there],
+                    predict: Some(Prediction { next: there.port() + 2, step: 1 }),
+                    relays: vec![],
+                };
+                let sealed = sealed::seal(&peer, &me, [7; 32], &o.encode()).unwrap();
+                let now = Instant::from_millis(10 * nonce);
+                t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed);
+                sent.extend(dials(&mut ep, now));
+            }
+            for ms in (100..40_000).step_by(100) {
+                ep.handle_timeout(Instant::from_millis(ms));
+                sent.extend(dials(&mut ep, Instant::from_millis(ms)));
+            }
+            sent.iter().filter(|a| a.ip() == there.ip()).count()
+        };
+        let public: SocketAddr = "198.51.100.9:20000".parse().unwrap();
+        let attempts = usize::from(Config::default().handshake_attempts);
+        // The candidate on every handshake send, the 31 other guesses on three.
+        assert_eq!(sent_to(public, 1), attempts + 31 * 3);
+        assert_eq!(sent_to(public, 4), attempts + 31 * 3);
+        // A private first address gets no guesses: only the candidate itself.
+        assert_eq!(sent_to("192.168.1.50:20000".parse().unwrap(), 4), attempts);
+    }
+
     /// NB-035: a failure reads as a sentence that names the symmetric side.
     #[test]
     fn failures_say_which_side_is_symmetric() {

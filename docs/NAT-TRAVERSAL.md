@@ -41,15 +41,19 @@ sequence, though:
 - **Offer.** The prediction rides in the offer's address list as a tagged entry (below), only when the public
   address leads the list. It takes one of the 8 slots.
 - **Probing.** A receiver whose NAT is neither open nor symmetric (open and symmetric ones gain nothing, and a
-  symmetric one would spend a port per probe) hands the core 32 *guesses*: ports `next - 4·step` to
+  symmetric one would spend a port per probe), given an offer whose first address is public and dialable, hands
+  the core 32 *guesses*: ports `next - 4·step` to
   `next + 27·step`, leaning forward because the NAT may have given out more since STUN asked
-  (`Endpoint::set_guesses`). Guesses are probe-only:
-  - while dialling, every handshake retry also goes to each guess;
-  - while relayed, every 5th punch round (about two a second) probes them;
-  - a guess becomes the path only when the peer answers from it;
+  (`Endpoint::set_guesses`). Guesses are probe-only, and probed three times:
+  - while dialling, on the first three handshake sends (at 0, 0.5 and 1.5 s);
+  - while relayed, on three punch rounds, every 5th one (over about 1 s);
+  - the same guesses set again (a repeated offer) change nothing; new ones get three probes, and only the new
+    ones are sent to at once;
+  - a guess becomes the path only when the peer answers from it, and guesses are dropped once the path is
+    direct;
   - relay-only links that go through a relay ignore them.
-- **Cost.** At most 32 guesses (`MAX_GUESSES` is 64) per offer acted on, each probed by about 6 handshake
-  packets while dialling: within the reflection bound below, but to ports of one IP the offer named.
+- **Cost.** At most 32 guesses (`MAX_GUESSES` is 64) per offer acted on, each probed 3 times: 96 datagrams to
+  ports of the one IP the offer named (see the reflection bound below).
 - Datagrams are told apart by their first byte (RFC 7983): STUN goes to the traversal, everything else to the
   endpoint.
 
@@ -232,9 +236,9 @@ traversal privacy_modes_matrix -- --nocapture`:
   sender's addresses.
 - **Reflection.** Anyone who can get an offer acted on can make a node dial dialable addresses: at most 8 per
   offer, about 6 handshake datagrams each (around 100 B) over 30 s. That is roughly 4.8 KB per accepted offer,
-  within the budgets above. An offer with a port prediction adds up to 32 guessed ports on the IP it offered,
-  probed the same way: about 19 KB more per accepted offer, to one IP. While a link stays relayed, its guesses
-  are probed again every 5th punch round.
+  within the budgets above. An offer with a port prediction adds up to 32 guessed ports on the public IP it
+  offered, probed 3 times each: about 9.6 KB more per accepted offer, to that IP. Only an offer with a new
+  prediction adds probes; a repeated one adds none.
 - **Nostr relays** (`NostrSignaling`):
   - Events are checked against their NIP-01 id before deduplication, so a relay can't present one event as many.
     Signatures aren't checked: offers are sealed and authenticate themselves, and hellos carry room proofs.

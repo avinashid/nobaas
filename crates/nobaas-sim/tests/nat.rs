@@ -352,6 +352,24 @@ fn guessed_ports_punch_a_sequential_symmetric_nat() {
             assert!(sent < 8 * 3, "{sent} punches");
         }
     }
+    // While relayed, guesses that never land are punched on three rounds, however
+    // often they are set again: punches with them minus punches without.
+    let punches = |set: bool| {
+        let (mut sim, r, s, c) = trio(&sym, &pr, Config::default(), 12);
+        sim.connect_via(c, r, s, &[]).unwrap();
+        assert!(sim.run_until(Duration::from_secs(2), |sim| connected(sim, c, s)));
+        let (ps, wrong) = (sim.peer_id(s), (0..8).map(|k| SimAddr::new(sim.nat_ip(0), 30_000 + k)).collect::<Vec<_>>());
+        for _ in 0..5 {
+            if set {
+                let now = sim.now;
+                sim.nodes[c].endpoint.set_guesses(now, &ps, &wrong);
+            }
+            sim.run_for(Duration::from_secs(1));
+        }
+        assert!(!is_direct(&sim, c, s));
+        sim.nodes[c].endpoint.stats().punches_sent
+    };
+    assert_eq!(punches(true) - punches(false), 8 * 3);
     // No relay: S dials C's public address while C dials S's guesses.
     let (mut sim, r, s, c) = trio(&sym, &pr, Config::default(), 13);
     let (ps, pc) = (sim.peer_id(s), sim.peer_id(c));
