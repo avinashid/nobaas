@@ -1,7 +1,7 @@
 //! Signaling: how peers that can't reach each other yet swap addresses.
 //!
 //! A [`Signaling`] carrier is a publish/subscribe channel keyed by [`Topic`]s. Nobaas
-//! uses two kinds of topic, named as in `packages/js/nostr.js` so Rust and browser
+//! uses two kinds of topic, named as in `packages/js/src/nostr.js` so Rust and browser
 //! peers can share a carrier:
 //! - a room, [`Topic::room`]: presence ("hello"), readable by anyone who knows the room name;
 //! - a peer, [`Topic::peer`]: candidate addresses, sealed to that peer's [`PeerId`].

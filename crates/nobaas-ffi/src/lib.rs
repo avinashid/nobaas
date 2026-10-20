@@ -1,7 +1,7 @@
 //! C ABI over [`nobaas_core::Endpoint`], addressed by `u32` transport handles.
 //!
 //! One surface serves every host: built for `wasm32-unknown-unknown` it is a
-//! WebAssembly module with no imports (browsers, via `packages/js/nobaas.js`); built
+//! WebAssembly module with no imports (browsers, via `packages/js/src/nobaas.js`); built
 //! natively it is a shared or static library for Dart FFI, Swift or C.
 //!
 //! Conventions:

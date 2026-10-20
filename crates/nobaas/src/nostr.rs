@@ -1,5 +1,5 @@
 //! Signaling over public Nostr relays (NIP-01), wire-compatible with
-//! `packages/js/nostr.js`: ephemeral events of kind 25059 (relays forward them to
+//! `packages/js/src/nostr.js`: ephemeral events of kind 25059 (relays forward them to
 //! live subscribers and don't store them), one `p` tag holding the [`Topic`] in
 //! hex, the payload in base64 as `content`, and a fresh secp256k1 key per carrier
 //! so nothing links events to the Nobaas identity or to other sessions.

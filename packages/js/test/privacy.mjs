@@ -1,7 +1,7 @@
 // NB-034, in Node over an in-memory wire: SDP host-candidate filtering, and a
 // relay-only endpoint linking only through a relay and refusing direct dials.
-import { loadNobaas, Lane } from '../nobaas.js';
-import { withoutHostCandidates } from '../webrtc.js';
+import { loadNobaas, Lane } from '../src/nobaas.js';
+import { withoutHostCandidates } from '../src/webrtc.js';
 
 const fail = (m) => {
   console.error(`FAIL: ${m}`);

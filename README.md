@@ -150,13 +150,15 @@ python3 -m http.server -d packages/js 8000   # open http://localhost:8000/demo/ 
 ```
 
 ```js
-import { loadNobaas, Lane } from './nobaas.js';
+import { joinRoom } from '@nobaas/js';   // packages/js/src/index.js
 
-const nb = await loadNobaas(new URL('./pkg/nobaas_ffi.wasm', import.meta.url));
-const ep = nb.endpoint();           // a fresh identity; ep.id is your PeerId
-// wire ep to a transport (WebRTC DataChannels: see webrtc.js, Nostr signaling: nostr.js), then:
-ep.send(peerId, Lane.Reliable, new TextEncoder().encode('hello'));
+const room = await joinRoom({ appId: 'my-app', roomId: 'lobby', signaling: 'nostr' });
+room.on('message', (data, peer) => console.log(peer.slice(0, 6), data));
+room.send('hello');                     // every joined peer; room.poll() for game loops
 ```
+
+[`packages/js/README.md`](packages/js/README.md) has the full API, the privacy modes and the lower layers
+(`loadNobaas`, `WebRtcTransport`, `NostrSignaling`).
 
 ## How it works
 

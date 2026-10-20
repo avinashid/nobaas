@@ -1,5 +1,5 @@
 // Two endpoints in one Node process over an in-memory "wire": checks the JS glue.
-import { loadNobaas, Lane } from '../nobaas.js';
+import { loadNobaas, Lane } from '../src/nobaas.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
 const nb = await loadNobaas(wasm);

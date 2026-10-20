@@ -8,7 +8,7 @@ One command runs it:
 
 ```sh
 scripts/gate.sh             # everything below that stays on loopback
-scripts/gate.sh --quick     # skip the two browser tests (no Playwright needed)
+scripts/gate.sh --quick     # skip the browser tests (no Playwright needed)
 scripts/gate.sh --strict    # clippy with -D warnings
 scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a change touches signaling
 ```
@@ -21,8 +21,12 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 | wasm build | `packages/js/build.sh` | builds `packages/js/pkg/nobaas_ffi.wasm` |
 | wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
 | Node glue | `node packages/js/test/node_pair.mjs` | two endpoints connect; 1000 × 64 B and one 64 KiB reliable message arrive, the large one intact |
+| Node privacy | `node packages/js/test/privacy.mjs` | host candidates are filtered; a relay-only endpoint links through its relay and refuses a direct dial |
+| Node room | `node packages/js/test/room_node.mjs` | three `joinRoom` peers mesh; presence, lanes, targeted sends, backpressure, leave, a late joiner and `poll()` work |
 | Browser | `node packages/js/test/browser.mjs 2` | two Chromium tabs form a WebRTC mesh on loopback and exchange data |
 | Arena | `node packages/js/test/arena.mjs 8 10` | every island's checkpoint hashes match, ticks keep confirming |
+| README chat | `node packages/js/test/readme.mjs` | the chat block in `packages/js/README.md` runs in two tabs, messages cross both ways, and it stays ≤ 10 lines |
+| Poll | `node packages/js/test/poll.mjs 3` | three tabs driven only by `poll()`/`sendTo()` see each other; a closed tab leaves |
 | Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `relay.damus.io` / `nos.lol` and connect over public STUN |
 
 The script runs every step even after a failure, prints a PASS/FAIL/SKIP summary and exits non-zero if any step

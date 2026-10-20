@@ -59,7 +59,7 @@ sequence, though:
 
 ## Topics and the room key
 
-Topics use the same derivation as `packages/js/nostr.js`, so Rust and browser peers can share relays:
+Topics use the same derivation as `packages/js/src/nostr.js`, so Rust and browser peers can share relays:
 
 - room: `sha256("nobaas/room/" + app_id + "/" + room)`; a JS peer in room `"<app_id>/<room>"` uses the same topic;
 - peer inbox: `sha256("nobaas/peer/" + lowercase hex of the 32-byte PeerId)`.

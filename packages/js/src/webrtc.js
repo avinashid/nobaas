@@ -19,6 +19,7 @@ export class WebRtcTransport {
   // `loss` drops that fraction of outgoing datagrams, for testing.
   // `trickle: false` sends one offer/answer with every candidate once ICE
   // gathering finishes (fewer signalling messages, for relays like Nostr).
+  // `RTCPeerConnection` lets Node pass in an implementation (node-datachannel).
   // `privacy`: which addresses peers are given in ICE candidates.
   //   'direct' (default): all of them.
   //   'public-only': no `host` candidates (LAN, loopback): only what STUN sees.
@@ -26,10 +27,11 @@ export class WebRtcTransport {
   //     else; reach others with endpoint.connectVia(relay, peer), which stays
   //     relayed. Browsers have no relay but a peer: with no TURN server there is
   //     no relay-only path to a peer that isn't linked to `relay`.
-  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null } = {}) {
+  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
     if (privacy === 'relay-only' && !relay) throw new Error("privacy 'relay-only' needs a relay peer id");
     this.ep = endpoint;
+    this.Pc = RTCPeerConnection;
     this.privacy = privacy;
     this.relay = relay;
     if (privacy === 'relay-only') endpoint.setRelayOnly(true);
@@ -56,7 +58,7 @@ export class WebRtcTransport {
     let h = this.byPeer.get(peer);
     if (h !== undefined) return this.links.get(h);
     h = this.nextHandle++;
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    const pc = new this.Pc({ iceServers: this.iceServers });
     const dc = pc.createDataChannel('nobaas', { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 });
     dc.binaryType = 'arraybuffer';
     const l = { pc, dc, peer, handle: h, dialer: false };
@@ -100,6 +102,8 @@ export class WebRtcTransport {
 
   async onSignal(from, msg) {
     if (!this.allowed(from)) return;
+    // Only an offer opens a link; answers and candidates for a dropped one are stale.
+    if (msg.kind !== 'offer' && !this.byPeer.has(from)) return;
     if (msg.kind === 'offer') {
       const l = this.link(from);
       await l.pc.setRemoteDescription(msg.sdp);
@@ -131,8 +135,28 @@ export class WebRtcTransport {
     });
   }
 
+  has(peer) {
+    return this.byPeer.has(peer);
+  }
+
+  // Forgets the link to `peer`, so a later dial or offer starts afresh.
+  drop(peer) {
+    const h = this.byPeer.get(peer);
+    if (h === undefined) return;
+    const l = this.links.get(h);
+    l.dc.onclose = null;
+    l.pc.close();
+    this.links.delete(h);
+    this.byPeer.delete(peer);
+  }
+
   close() {
-    for (const l of this.links.values()) l.pc.close();
+    for (const l of this.links.values()) {
+      l.dc.onclose = null;
+      l.pc.close();
+    }
+    this.links.clear();
+    this.byPeer.clear();
     this.sig.close();
   }
 }
