@@ -29,6 +29,13 @@ const DUP_THRESHOLD: u32 = 3;
 /// before any loss: keeps buffers short on paths that never drop (a browser
 /// DataChannel, a bloated router), which real-time traffic needs.
 const QUEUE_TARGET: Duration = Duration::from_millis(25);
+/// Share of the fragments in flight the window keeps after a loss, and after
+/// queueing delay over QUEUE_TARGET. Delay is the gentler signal: nothing was
+/// dropped, and the queue drains within a round trip at 85%, whereas halving
+/// a window near the cap costs the rest of the transfer (about one fragment
+/// per RTT of regrowth).
+const LOSS_CUT: f64 = 0.5;
+const DELAY_CUT: f64 = 0.85;
 /// Tail-loss probe: when nothing has been acknowledged for srtt + 2·rttvar +
 /// this, the newest unacknowledged fragment is sent again. Its ACK (or the SACK
 /// gap it exposes) repairs a lost tail in about one RTT instead of an RTO;
@@ -132,12 +139,12 @@ impl RelSend {
         (self.cwnd as usize).clamp(MIN_CWND as usize, max.max(1))
     }
 
-    /// Halves the window at most once per round trip.
-    fn on_loss(&mut self, now: Instant) {
+    /// Cuts the window to `keep` of the fragments in flight, at most once per round trip.
+    fn back_off(&mut self, now: Instant, keep: f64) {
         if now < self.recover_until {
             return;
         }
-        self.ssthresh = (self.inflight.len() as f64 / 2.0).max(MIN_CWND);
+        self.ssthresh = (self.inflight.len() as f64 * keep).max(MIN_CWND);
         self.cwnd = self.ssthresh;
         self.recover_until = now + self.srtt.unwrap_or(self.rto);
     }
@@ -226,7 +233,7 @@ impl RelSend {
         if queued_too_long {
             if now >= self.recover_until {
                 self.delay_backoffs += 1;
-                self.on_loss(now);
+                self.back_off(now, DELAY_CUT);
             }
         } else if newly > 0 {
             if self.cwnd < self.ssthresh {
@@ -335,7 +342,7 @@ impl RelSend {
             self.retransmits += 1;
         }
         if lost {
-            self.on_loss(now);
+            self.back_off(now, LOSS_CUT);
         }
         for seq in due_by_seq(&self.by_dup, now) {
             let f = self.inflight.get_mut(&seq).expect("indexed fragment in flight");
@@ -585,6 +592,29 @@ mod tests {
         let cwnd = tx.cwnd();
         assert_eq!(drain(&mut tx, Instant::from_millis(125)), vec![(0, true, vec![0])]);
         assert!(tx.cwnd() < cwnd);
+        // A loss halves the 8 in flight (0 and 9..15).
+        assert_eq!(tx.cwnd(), 4);
+    }
+
+    #[test]
+    fn queueing_delay_keeps_85_percent_of_the_window() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        for i in 0..64u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(drain(&mut tx, Instant::ZERO).len(), 16);
+        // Seq 0 sets the minimum RTT; seq 1 comes back 30 ms later, over QUEUE_TARGET.
+        tx.on_ack(Instant::from_millis(100), 1, 0);
+        assert_eq!(tx.delay_backoffs, 0);
+        tx.on_ack(Instant::from_millis(130), 2, 0);
+        assert_eq!(tx.delay_backoffs, 1);
+        assert_eq!(tx.retransmits, 0);
+        assert_eq!(tx.ssthresh, 14.0 * DELAY_CUT);
+        assert_eq!(tx.cwnd(), 11, "14 in flight: 85% kept, not halved");
+        // Only one cut per round trip.
+        tx.on_ack(Instant::from_millis(140), 3, 0);
+        assert_eq!(tx.delay_backoffs, 1);
     }
 
     #[test]
