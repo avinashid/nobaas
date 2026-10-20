@@ -233,7 +233,7 @@ traversal privacy_modes_matrix -- --nocapture`:
 - **Reflection.** Anyone who can get an offer acted on can make a node dial dialable addresses: at most 8 per
   offer, about 6 handshake datagrams each (around 100 B) over 30 s. That is roughly 4.8 KB per accepted offer,
   within the budgets above. An offer with a port prediction adds up to 32 guessed ports on the IP it offered,
-  probed the same way: about 24 KB more per accepted offer, to one IP. While a link stays relayed, its guesses
+  probed the same way: about 19 KB more per accepted offer, to one IP. While a link stays relayed, its guesses
   are probed again every 5th punch round.
 - **Nostr relays** (`NostrSignaling`):
   - Events are checked against their NIP-01 id before deduplication, so a relay can't present one event as many.
