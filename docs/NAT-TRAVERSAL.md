@@ -76,7 +76,9 @@ truncation and trailing bytes. Addresses that fail to decode are skipped.
   host dials back at the same time.
 - **New links.** When a link comes up, peers that offered to this node but are still unlinked get a fresh offer
   listing the new peer, which may be the relay they need.
-- **Budget.** Offers acted on: a burst of 30, then one per 2 s, across all senders.
+- **Budget.** Offers acted on and offers sent in answer to hellos share one budget across all senders: a burst of
+  30, then one per 2 s. It bounds what forged hellos or offers can make a node dial, seal or publish, and is ample
+  for the room sizes this layer targets (no mesh limit yet).
 - **Failure.** When a dial ends in `ConnectFailed`, `failure(peer)` is `Symmetric` if one side is symmetric and
   the other isn't open, and `Unreachable` otherwise.
 
@@ -98,7 +100,8 @@ truncation and trailing bytes. Addresses that fail to decode are skipped.
 ## Coverage
 
 - `crates/nobaas/src/traversal.rs` unit tests: hello and offer round trips, truncation, browser hellos, roles,
-  sealed offers turning into dials, replay and stale drops, STUN classification and retransmits.
+  sealed offers turning into dials, replay and stale drops, the budget under a hello flood, STUN classification
+  and retransmits.
 - `crates/nobaas-sim/tests/traversal.rs`:
   - NAT types from simulated STUN;
   - the room-of-two matrix over 8 NAT kinds with 150 ms signaling latency;

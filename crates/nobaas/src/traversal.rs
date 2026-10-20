@@ -39,7 +39,9 @@ const HELLO_MAX: Duration = Duration::from_secs(30);
 const OFFER_GAP: Duration = Duration::from_secs(2);
 /// Offers older or newer than this (by the sender's clock) are dropped.
 const FRESH_MS: u64 = 60_000;
-/// Offers acted on: a burst of `DIAL_BURST`, then one per `DIAL_REFILL`.
+/// Offers acted on, and offers sent in answer to hellos: a burst of `DIAL_BURST`,
+/// then one per `DIAL_REFILL`, so forged hellos or offers can't make a node dial or
+/// publish without bound.
 const DIAL_BURST: u32 = 30;
 const DIAL_REFILL: Duration = Duration::from_secs(2);
 const MAX_CANDIDATES: usize = 8;
@@ -374,7 +376,7 @@ impl<A: Address> Traversal<A> {
             return;
         }
         let recent = self.remotes.get(&from).and_then(|r| r.offered_at).is_some_and(|t| now - t < OFFER_GAP);
-        if !recent {
+        if !recent && self.take_token(now) {
             self.offer(now, ep, from, true);
         }
     }
@@ -642,6 +644,28 @@ mod tests {
         let mut tb2 = Traversal::new(&ib, [6; 32], base + 2 * FRESH_MS, vec![b_addr], vec![]);
         tb2.handle_signal(now, &mut eb2, topic, &sealed);
         assert!(eb2.poll_transmit(now).is_none());
+    }
+
+    #[test]
+    fn forged_hellos_are_answered_within_the_budget() {
+        let ia = id(1);
+        let mut ep = Endpoint::new(&ia, Config::default(), [1; 32]);
+        let mut t = Traversal::new(&ia, [3; 32], 0, vec![], vec![]);
+        t.join_room(Instant::ZERO, "app", "room", Role::Peer);
+        while t.poll_signal().is_some() {}
+        let room = Topic::room("app", "room");
+        let offers = |t: &mut Traversal<SocketAddr>| std::iter::from_fn(|| t.poll_signal()).count();
+        let hello_from = |n: u32| hello(&id((n % 200) as u8 + 2).peer_id(), Role::Peer);
+        for n in 0..100 {
+            t.handle_signal(Instant::ZERO, &mut ep, room, &hello_from(n));
+        }
+        assert_eq!(offers(&mut t), DIAL_BURST as usize, "a burst, then nothing");
+        // Refills at one per DIAL_REFILL.
+        let later = Instant::ZERO + DIAL_REFILL * 3;
+        for n in 100..150 {
+            t.handle_signal(later, &mut ep, room, &hello_from(n));
+        }
+        assert_eq!(offers(&mut t), 3);
     }
 
     #[test]
