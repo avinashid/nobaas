@@ -8,6 +8,9 @@ export const EventKind = { Connected: 1, Message: 2, Disconnected: 3, ConnectFai
 const REASONS = ['timeout', 'closed', 'replaced', 'violation'];
 // The largest datagram the core sends or accepts; transports drop anything bigger.
 export const MAX_DATAGRAM = 1232;
+// Each endpoint keeps a send buffer this size; bigger messages get a buffer of their own.
+const SEND_SCRATCH = 16 * 1024;
+const encoder = new TextEncoder();
 
 export async function loadNobaas(source) {
   let bytes;
@@ -25,8 +28,37 @@ export async function loadNobaas(source) {
   return new Nobaas(instance.exports);
 }
 
-export const toHex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-export const fromHex = (s) => Uint8Array.from(s.match(/../g), (h) => parseInt(h, 16));
+// Byte -> two hex characters, and character code -> nibble (0x100: not a hex digit).
+const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
+const NIBBLE = new Uint16Array(128).fill(0x100);
+for (let i = 0; i < 16; i++) {
+  NIBBLE[i.toString(16).charCodeAt(0)] = i;
+  NIBBLE[i.toString(16).toUpperCase().charCodeAt(0)] = i;
+}
+const nibble = (s, i) => {
+  const c = s.charCodeAt(i);
+  return c < 128 ? NIBBLE[c] : 0x100;
+};
+
+export function toHex(b) {
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += HEX[b[i]];
+  return s;
+}
+// Pairs of hex digits as bytes; a trailing odd character is ignored. Anything
+// that isn't hex takes the old parseInt path, so such input reads as it always did.
+export function fromHex(s) {
+  const out = new Uint8Array(s.length >> 1);
+  let bad = 0;
+  for (let i = 0; i < out.length; i++) {
+    const hi = nibble(s, 2 * i);
+    const lo = nibble(s, 2 * i + 1);
+    bad |= hi | lo;
+    out[i] = (hi << 4) | lo;
+  }
+  if (bad & 0x100) return Uint8Array.from(s.match(/../g), (h) => parseInt(h, 16));
+  return out;
+}
 
 // A PeerId as text: 64 lowercase hex characters. Ids from signalling are
 // untrusted; check them with this before using them.
@@ -58,9 +90,14 @@ function bytesOf(b) {
 class Nobaas {
   constructor(x) {
     this.x = x;
+    this.view = new Uint8Array(x.memory.buffer);
   }
+  // A view of wasm memory. Growing memory replaces memory.buffer (the old one is
+  // detached, length 0), so the view is rebuilt whenever the buffer changed: pointers
+  // into wasm memory outlive a grow, views don't. Never keep a view across a wasm call.
   mem() {
-    return new Uint8Array(this.x.memory.buffer);
+    if (this.view.buffer !== this.x.memory.buffer) this.view = new Uint8Array(this.x.memory.buffer);
+    return this.view;
   }
   // Copies bytes into a fresh buffer in wasm memory, sized from the bytes
   // themselves; caller frees `bytes.length`.
@@ -129,6 +166,8 @@ export class Endpoint {
     // Scratch buffers that live as long as the endpoint.
     this.peerBuf = x.nb_alloc(32);
     this.txBuf = x.nb_alloc(MAX_DATAGRAM);
+    this.rxBuf = x.nb_alloc(MAX_DATAGRAM);
+    this.sendBuf = x.nb_alloc(SEND_SCRATCH);
     this.addrBuf = x.nb_alloc(4);
     this.evCap = 64 * 1024;
     this.evBuf = x.nb_alloc(this.evCap);
@@ -235,11 +274,30 @@ export class Endpoint {
   send(peer, data, lane = Lane.Reliable) {
     this.live('send');
     const pp = this.setPeer(peer);
-    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : bytesOf(data);
-    const p = this.nb.put(bytes);
-    const r = this.nb.x.nb_send(this.h, pp, lane, p, bytes.length);
-    this.nb.free(p, bytes.length);
+    const r = this.sendBytes(pp, lane, data);
     this.schedule();
+    return r;
+  }
+  // Messages up to SEND_SCRATCH go through the endpoint's send buffer: strings are
+  // encoded straight into it (encodeInto stops short when one doesn't fit), bytes
+  // copied in. Bigger ones get a buffer of their own.
+  sendBytes(pp, lane, data) {
+    const x = this.nb.x;
+    let bytes;
+    if (typeof data === 'string') {
+      const { read, written } = encoder.encodeInto(data, this.nb.mem().subarray(this.sendBuf, this.sendBuf + SEND_SCRATCH));
+      if (read === data.length) return x.nb_send(this.h, pp, lane, this.sendBuf, written);
+      bytes = encoder.encode(data);
+    } else {
+      bytes = bytesOf(data);
+      if (bytes.length <= SEND_SCRATCH) {
+        this.nb.mem().set(bytes, this.sendBuf);
+        return x.nb_send(this.h, pp, lane, this.sendBuf, bytes.length);
+      }
+    }
+    const p = this.nb.put(bytes);
+    const r = x.nb_send(this.h, pp, lane, p, bytes.length);
+    this.nb.free(p, bytes.length);
     return r;
   }
   // Feed a datagram that arrived on transport handle `addr`. Over MAX_DATAGRAM is never ours: dropped.
@@ -248,9 +306,8 @@ export class Endpoint {
     if (this.closed) return;
     bytes = bytesOf(bytes);
     if (bytes.length > MAX_DATAGRAM) return;
-    const p = this.nb.put(bytes);
-    this.nb.x.nb_handle_datagram(this.h, nowUs(), addr, p, bytes.length);
-    this.nb.free(p, bytes.length);
+    this.nb.mem().set(bytes, this.rxBuf);
+    this.nb.x.nb_handle_datagram(this.h, nowUs(), addr, this.rxBuf, bytes.length);
     this.schedule();
   }
   // Sends made in the same JS task share packets: flush once, after the task.
@@ -274,7 +331,8 @@ export class Endpoint {
         const n = x.nb_poll_transmit(this.h, now, this.addrBuf, this.txBuf, MAX_DATAGRAM);
         if (n <= 0) break;
         const m = this.nb.mem();
-        const addr = new DataView(m.buffer).getUint32(this.addrBuf, true);
+        const a = this.addrBuf;
+        const addr = (m[a] | (m[a + 1] << 8) | (m[a + 2] << 16) | (m[a + 3] << 24)) >>> 0;
         try {
           this.onTransmit(addr, m.slice(this.txBuf, this.txBuf + n));
         } catch {
@@ -320,7 +378,8 @@ export class Endpoint {
     if (this.timer) clearTimeout(this.timer);
     const x = this.nb.x;
     x.nb_endpoint_free(this.h);
-    for (const [p, n] of [[this.peerBuf, 32], [this.txBuf, MAX_DATAGRAM], [this.addrBuf, 4], [this.evBuf, this.evCap]]) x.nb_free(p, n);
+    for (const [p, n] of [[this.peerBuf, 32], [this.txBuf, MAX_DATAGRAM], [this.rxBuf, MAX_DATAGRAM],
+      [this.sendBuf, SEND_SCRATCH], [this.addrBuf, 4], [this.evBuf, this.evCap]]) x.nb_free(p, n);
   }
 }
 

@@ -3,7 +3,7 @@
 // DataChannel would otherwise run on freed memory shared with every other endpoint.
 // send and connect* throw, receive and setRelayOnly do nothing, queries return
 // null or false, and stats() returns the counters as they were at close.
-import { loadNobaas, Lane } from '../src/nobaas.js';
+import { loadNobaas, Lane, MAX_DATAGRAM } from '../src/nobaas.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
 const nb = await loadNobaas(wasm);
@@ -17,9 +17,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Counts wasm calls an endpoint makes after its close(), by name: any is a use of its freed handle.
 const spy = (ep) => {
   ep.afterClose = [];
+  ep.freed = []; // [pointer, length] of each nb_free after close
   ep.nb = Object.assign(Object.create(nb), {
     x: Object.fromEntries(Object.entries(nb.x).map(([k, v]) => [k,
-      typeof v === 'function' ? (...args) => (ep.closed && ep.afterClose.push(k), v(...args)) : v])),
+      typeof v === 'function' ? (...args) => {
+        if (ep.closed) {
+          ep.afterClose.push(k);
+          if (k === 'nb_free') ep.freed.push(`${args[0]}:${args[1]}`);
+        }
+        return v(...args);
+      } : v])),
   });
   return ep;
 };
@@ -41,8 +48,11 @@ const sealed = a.seal(b.id, new Uint8Array([1, 2, 3]));
 check(before.txPackets > 0 && secret?.length === 32 && sealed !== null, 'stats, secret and seal work before close');
 
 b.close();
-check(b.closed === true && b.afterClose.join() === 'nb_endpoint_free,nb_free,nb_free,nb_free,nb_free',
-  `close() frees the handle and its 4 buffers, nothing else (${b.afterClose.join(', ')})`);
+const bufs = [[b.peerBuf, 32], [b.txBuf, MAX_DATAGRAM], [b.rxBuf, MAX_DATAGRAM], [b.sendBuf, 16 * 1024],
+  [b.addrBuf, 4], [b.evBuf, b.evCap]].map(([p, n]) => `${p}:${n}`);
+check(b.closed === true && b.afterClose.join() === `nb_endpoint_free,${bufs.map(() => 'nb_free').join()}`
+  && b.freed.slice().sort().join() === bufs.slice().sort().join() && new Set(bufs).size === bufs.length,
+  `close() frees the handle and its ${bufs.length} buffers, nothing else (${b.afterClose.join(', ')})`);
 b.afterClose = [];
 
 // The repro from the card: a's sends still reach b's wire, which calls b.receive().

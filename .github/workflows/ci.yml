@@ -60,5 +60,6 @@ jobs:
       - run: node packages/js/test/room_proof.mjs
       - run: node packages/js/test/pump_rearm.mjs
       - run: node packages/js/test/endpoint_closed.mjs
+      - run: node packages/js/test/scratch_buffers.mjs
 
   # Next: a `godot` job building the GDExtension (NB-020) goes here, Linux only to start.

@@ -82,6 +82,7 @@ step "node nostr bounds" node packages/js/test/nostr_bounds.mjs
 step "node room proof" node packages/js/test/room_proof.mjs
 step "node pump re-arm" node packages/js/test/pump_rearm.mjs
 step "node endpoint closed" node packages/js/test/endpoint_closed.mjs
+step "node scratch buffers" node packages/js/test/scratch_buffers.mjs
 
 if [ $quick = 1 ]; then
   skip "browser" "--quick"
