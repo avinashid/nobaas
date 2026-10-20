@@ -35,6 +35,11 @@ export interface SignalingContext {
 export interface JoinRoomOptions {
   /** Names your app; rooms of different apps never meet. */
   appId: string;
+  /**
+   * The room's name, and its only secret: peers prove they know it, so the topic
+   * relays see lets no one in. A guessable name is a public lobby; for a closed
+   * room use at least 128 random bits, e.g. `randomRoomId()`.
+   */
   roomId: string;
   /**
    * How peers find each other.
@@ -127,6 +132,9 @@ export declare class Room {
 
 /** Joins a room: `const room = await joinRoom({ appId: 'my-app', roomId: 'lobby' })`. */
 export declare function joinRoom(options: JoinRoomOptions): Promise<Room>;
+
+/** 128 random bits, base64url (22 characters): a roomId nobody can guess. */
+export declare function randomRoomId(): string;
 
 export declare const DEFAULT_ICE_SERVERS: RTCIceServer[];
 export declare const DEFAULT_RELAYS: string[];
@@ -236,6 +244,8 @@ export declare class WebRtcTransport implements Transport {
       /** `'relay-only'` needs `relay`: WebRTC then runs only with that peer. */
       privacy?: 'direct' | 'public-only' | 'relay-only';
       relay?: PeerId;
+      /** Offers carry `p: await sign(to)`; an offer is answered only if `check(from, p)` holds. */
+      offerProof?: { sign(to: PeerId): Promise<string>; check(from: PeerId, p: unknown): Promise<boolean> };
       RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
     },
   );

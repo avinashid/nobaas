@@ -10,20 +10,32 @@
 // the encrypted links, never through signalling: a peer counts as joined once
 // its presence has arrived, so 'peer-join' always carries it.
 //
+// Rooms are closed by their name (proof.js): hellos, WebRTC offers and the first
+// message on every link carry an HMAC under the room key, which the topic relays
+// see doesn't give away. A peer is dialled only on a hello that proves the key,
+// an offer is answered only if it proves it, and a link that doesn't prove it
+// within PROOF_MS is dropped, never told our presence. Use roomIds with at least
+// 128 random bits (randomRoomId()): a guessable name is a public lobby.
+//
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
 
-import { loadNobaas, Lane, isPeerId } from './nobaas.js';
+import { loadNobaas, Lane, toHex, fromHex, isPeerId } from './nobaas.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
 import { NostrSignaling } from './nostr.js';
 import { LocalTransport } from './local.js';
+import { RoomProof } from './proof.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
-const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4 };
+const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5 };
 // Presence is re-announced this often, so a lost hello only delays a join.
 const HELLO_EVERY_MS = 15000;
+// A link must prove the room key this soon after it connects.
+const PROOF_MS = 10000;
+// Frames held from one peer while its link proof is checked.
+const MAX_HELD = 256;
 const NOT_CONNECTED = -1;
 const TOO_LARGE = -2;
 const WOULD_BLOCK = -3;
@@ -86,6 +98,7 @@ export async function joinRoom({
   const nb = await modules.get(key);
   const endpoint = nb.endpoint({ secret });
   const name = `${appId}/${roomId}`;
+  const proof = await RoomProof.create(name);
   let sig;
   if (signaling === 'local') sig = new BroadcastSignaling(endpoint.id, `nobaas/${name}`);
   else if (signaling === 'nostr') sig = new NostrSignaling(nb, endpoint, { room: name, relays });
@@ -96,7 +109,11 @@ export async function joinRoom({
     // Remote peers need STUN to find a path; tabs of one browser don't.
     const ice = iceServers ?? (signaling === 'local' ? [] : DEFAULT_ICE_SERVERS);
     // Relays charge per event: one offer and one answer, each with every candidate.
-    transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy, RTCPeerConnection });
+    const offerProof = {
+      sign: (to) => proof.pair('nb-rtc-offer', endpoint.id, to),
+      check: (from, p) => proof.checkPair('nb-rtc-offer', from, endpoint.id, p),
+    };
+    transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy, offerProof, RTCPeerConnection });
   } else if (signaling === 'local') {
     transport = () => new LocalTransport(endpoint, sig);
   } else {
@@ -104,15 +121,16 @@ export async function joinRoom({
     sig.close();
     throw new Error('no WebRTC in this runtime: pass RTCPeerConnection (e.g. from node-datachannel) or use signaling: \'local\'');
   }
-  const room = new Room(endpoint, sig, transport, presence);
+  const room = new Room(endpoint, sig, transport, presence, proof);
   if (queue) room.queue = [];
   await sig.ready;
-  sig.hello();
+  await room.hello();
   return room;
 }
 
 export class Room {
-  constructor(endpoint, signaling, makeTransport, presence) {
+  static proofMs = PROOF_MS; // tests shorten it
+  constructor(endpoint, signaling, makeTransport, presence, proof) {
     this.endpoint = endpoint;
     this.signaling = signaling;
     this.self = endpoint.id;
@@ -124,12 +142,16 @@ export class Room {
     this.left = false;
     this.queue = null; // events for poll()/receive(), once asked for
     this.greeted = new Set(); // peers whose hello we answered
+    this.proof = proof;
+    this.proven = new Set(); // linked peers that proved the room key
+    this.proving = new Map(); // peer -> frames held while its proof is checked
+    this.deadlines = new Map(); // peer -> timer that drops it unless it proves the key
     this.transport = makeTransport((peer, state) => {
       if (state === 'closed') this.lost(peer, 'closed');
     });
     endpoint.onEvent = (e) => this.onEvent(e);
-    signaling.onHello = (peer) => this.onHello(peer);
-    this.helloTimer = setInterval(() => signaling.hello(), HELLO_EVERY_MS);
+    signaling.onHello = (peer, meta) => this.onHello(peer, meta);
+    this.helloTimer = setInterval(() => this.hello(), HELLO_EVERY_MS);
     this.onPageHide = () => this.leave();
     globalThis.addEventListener?.('pagehide', this.onPageHide);
   }
@@ -200,7 +222,7 @@ export class Room {
   setPresence(presence) {
     this.me = presence;
     const f = frame(T.Presence, enc.encode(JSON.stringify(presence)));
-    for (const p of this.linked) this.write(p, f, Lane.Reliable);
+    for (const p of this.proven) this.write(p, f, Lane.Reliable);
   }
 
   rtt(peer) {
@@ -224,15 +246,28 @@ export class Room {
     this.endpoint.close();
     this.members.clear();
     this.linked.clear();
+    this.proven.clear();
+    this.proving.clear();
+    for (const t of this.deadlines.values()) clearTimeout(t);
+    this.deadlines.clear();
   }
 
-  onHello(peer) {
+  // Announces us on the room topic, with a proof of the room key.
+  async hello() {
+    if (!this.left) this.signaling.hello(await this.proof.hello(this.self));
+  }
+
+  async onHello(peer, meta) {
     // A custom signalling adapter may pass anything along: only PeerIds are dialled.
-    if (this.left || !isPeerId(peer) || peer === this.self || this.transport.has(peer)) return;
+    // `meta.nb` marks a Rust UDP peer, which WebRTC can't dial.
+    if (this.left || !isPeerId(peer) || peer === this.self || this.transport.has(peer) || meta?.nb) return;
+    // Knowing the topic isn't enough: only hellos that prove the room key count.
+    if (!(await this.proof.checkHello(peer, meta))) return;
+    if (this.left || this.transport.has(peer)) return;
     // Answer a newcomer's hello once, so it learns about us too.
     if (!this.greeted.has(peer)) {
       this.greeted.add(peer);
-      this.signaling.hello();
+      this.hello();
     }
     // One side dials: the smaller id.
     if (this.self < peer) this.transport.dial(peer);
@@ -241,8 +276,16 @@ export class Room {
   onEvent(e) {
     if (this.left) return;
     if (e.type === 'connected') {
-      this.linked.add(e.peer);
-      this.write(e.peer, frame(T.Presence, enc.encode(JSON.stringify(this.me))), Lane.Reliable);
+      const peer = e.peer;
+      this.linked.add(peer);
+      // Prove the room key first; presence follows once the peer has proved it too.
+      this.proof.pair('nb-link', this.self, peer).then((p) => {
+        if (this.linked.has(peer)) this.write(peer, frame(T.Proof, fromHex(p)), Lane.Reliable);
+      });
+      clearTimeout(this.deadlines.get(peer));
+      this.deadlines.set(peer, setTimeout(() => {
+        if (!this.proven.has(peer)) this.lost(peer, 'unproven');
+      }, Room.proofMs));
     } else if (e.type === 'message') {
       this.onMessage(e.peer, e.data, e.lane);
     } else if (e.type === 'disconnected') {
@@ -255,6 +298,7 @@ export class Room {
   onMessage(peer, data, lane) {
     const tag = data[0];
     const body = data.subarray(1);
+    if (!this.proven.has(peer)) return this.unproven(peer, tag, body, data, lane);
     if (tag === T.Presence) {
       let p;
       try {
@@ -284,9 +328,38 @@ export class Room {
     this.emit('message', value, peer, { lane: lane === Lane.Unreliable ? 'unreliable' : 'reliable', kind });
   }
 
+  // A frame from a peer that hasn't proved the room key: only its proof (or a
+  // goodbye) is acted on, and what follows the proof waits for the check.
+  unproven(peer, tag, body, data, lane) {
+    const held = this.proving.get(peer);
+    if (held) {
+      if (held.length >= MAX_HELD) return this.lost(peer, 'unproven');
+      return void held.push([data, lane]);
+    }
+    if (tag === T.Bye) return this.lost(peer, 'left');
+    if (tag !== T.Proof || !this.linked.has(peer)) return;
+    const rest = [];
+    this.proving.set(peer, rest);
+    this.proof.checkPair('nb-link', peer, this.self, toHex(body)).then((ok) => {
+      // Lost (and maybe linked again) meanwhile: this check is stale.
+      if (this.left || this.proving.get(peer) !== rest) return;
+      this.proving.delete(peer);
+      if (!ok) return this.lost(peer, 'unproven');
+      clearTimeout(this.deadlines.get(peer));
+      this.deadlines.delete(peer);
+      this.proven.add(peer);
+      this.write(peer, frame(T.Presence, enc.encode(JSON.stringify(this.me))), Lane.Reliable);
+      for (const [d, l] of rest) this.onMessage(peer, d, l);
+    });
+  }
+
   lost(peer, reason) {
     this.transport.drop(peer);
     this.linked.delete(peer);
+    this.proven.delete(peer);
+    this.proving.delete(peer);
+    clearTimeout(this.deadlines.get(peer));
+    this.deadlines.delete(peer);
     this.outbox.delete(peer);
     this.greeted.delete(peer);
     if (this.members.delete(peer)) this.emit('peer-leave', peer, reason);
