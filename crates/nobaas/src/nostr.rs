@@ -568,4 +568,71 @@ mod tests {
         drop(ws);
         server.join().unwrap();
     }
+
+    /// NB-014: relay messages (real events, mutated, and JSON at the nesting
+    /// limit) never panic; whatever is passed on has a topic and payload that
+    /// decode and round-trip.
+    #[test]
+    fn fuzz_relay_messages() {
+        use nobaas_sim::fuzz::{cases, mutate, run};
+        let pubkey = "ab".repeat(32);
+        // Events with a valid id; the signature isn't checked here, so none is made.
+        let event = |created_at: u64, tag: &str, content: &str| {
+            let tags = json!([["p", tag]]);
+            let id = hex(&Sha256::digest(json!([0, pubkey, created_at, KIND, tags, content]).to_string()));
+            json!({"id": id, "pubkey": pubkey, "created_at": created_at, "kind": KIND, "tags": tags,
+                   "content": content, "sig": "00"})
+        };
+        let (tx, rx) = sync_channel(8);
+        let shared = Shared::default();
+        let topic = Topic([3; 32]).to_hex();
+        let (mut passed, mut decoded, mut noncanonical) = (0usize, 0usize, 0usize);
+        for deep in ["[".repeat(100_000), format!("[\"EVENT\",\"s\",{}", "{\"a\":".repeat(50_000))] {
+            on_relay_message(&deep, &tx, &shared);
+        }
+        run(
+            "relay",
+            cases(6_000),
+            |rng| {
+                let n = rng.below(120);
+                let content = match rng.one_in(4) {
+                    true => String::from_utf8_lossy(&rng.bytes(n)).into_owned(),
+                    false => b64(&rng.bytes(n)),
+                };
+                let tag = match rng.one_in(4) {
+                    true => {
+                        let n = rng.below(40);
+                        hex(&rng.bytes(n))
+                    }
+                    false => topic.clone(),
+                };
+                let ev = event(rng.u64() >> rng.below(64), &tag, &content);
+                let mut b = match rng.below(6) {
+                    0 => json!(["OK", ev["id"], rng.one_in(2), "x"]).to_string(),
+                    _ => json!(["EVENT", "s", ev]).to_string(),
+                }
+                .into_bytes();
+                if rng.below(3) != 0 {
+                    mutate(rng, &mut b, 4096);
+                }
+                b
+            },
+            |b| {
+                on_relay_message(&String::from_utf8_lossy(b), &tx, &shared);
+                for m in rx.try_iter() {
+                    passed += 1;
+                    if let Some(t) = Topic::from_hex(&m.tag) {
+                        assert_eq!(t.to_hex(), m.tag.to_ascii_lowercase());
+                    }
+                    if let Some(p) = unb64(&m.content) {
+                        decoded += 1;
+                        noncanonical += (b64(&p) != m.content) as usize;
+                        assert_eq!(unb64(&b64(&p)), Some(p));
+                    }
+                }
+            },
+        );
+        println!("fuzz relay: {passed} events passed on, {decoded} payloads decoded, {noncanonical} not canonical");
+        assert!(passed > 0 && decoded > 0);
+    }
 }

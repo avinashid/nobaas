@@ -15,6 +15,7 @@
 //! requests with the address they saw, so hosts learn their NAT's mapping. STUN
 //! answers reaching a node go to its [`Node::stun_inbox`], not its endpoint.
 
+pub mod fuzz;
 mod nat;
 
 use nat::Nat;
