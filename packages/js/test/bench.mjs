@@ -11,11 +11,29 @@
 // MB/s counts payload bytes only, in decimal MB (1e6). Unreliable messages are
 // capped at MAX_UNRELIABLE (1100 B) by the core, so 16 KiB and 256 KiB exist on
 // the Reliable lane only. Not part of `npm test`: the numbers depend on the host.
+//
+// A/B, which is how a change is judged: the host is shared, so absolute numbers
+// move with its load. Run main (A) and the branch (B) alternately in one session,
+// so both see the same load. --lib loads src/nobaas.js and pkg/ from another
+// checkout, so both sides run this same script:
+//
+//   git -C ~/projects/personal/nobaas worktree add /tmp/nb-main origin/main
+//   /tmp/nb-main/packages/js/build.sh && ./packages/js/build.sh    # from the branch root
+//   cd packages/js
+//   for i in 1 2 3; do
+//     node test/bench.mjs --lib=/tmp/nb-main/packages/js --json > /tmp/a$i.json
+//     node test/bench.mjs --json > /tmp/b$i.json
+//   done
+//
+// For each case, take B's median over A's median in each pair (a$i against b$i),
+// and report the median of the three ratios, with the load average from each
+// JSON. A ratio within A's own min..max spread is noise, not a change.
 import os from 'node:os';
 import { execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { PerformanceObserver } from 'node:perf_hooks';
-import { loadNobaas, Lane, EventKind, decodeEvent } from '../src/nobaas.js';
 
 const arg = (name, dflt) => {
   const a = process.argv.find((s) => s.startsWith(`--${name}=`));
@@ -25,7 +43,10 @@ const RUNS = Number(arg('runs', 7));
 const WARMUP = Number(arg('warmup', 2));
 const ONLY = arg('only', '');
 const JSON_OUT = process.argv.includes('--json');
-const wasm = arg('wasm', new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname);
+// The packages/js directory under test: this one, or another checkout's (A/B above).
+const LIB = resolve(arg('lib', new URL('..', import.meta.url).pathname));
+const wasm = arg('wasm', `${LIB}/pkg/nobaas_ffi.wasm`);
+const { loadNobaas, Lane, EventKind, decodeEvent } = await import(pathToFileURL(`${LIB}/src/nobaas.js`));
 // Unreliable sends per JS task: the per-link queue holds 256, so none are dropped.
 const UNREL_BATCH = 256;
 
@@ -130,10 +151,11 @@ const CASES = [
 
 let commit = 'unknown';
 try {
-  commit = execSync('git rev-parse --short HEAD', { cwd: new URL('.', import.meta.url), stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  commit = execSync('git rev-parse --short HEAD', { cwd: LIB, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
 } catch {}
 const meta = {
   date: new Date().toISOString(),
+  lib: LIB,
   commit,
   node: process.version,
   v8: process.versions.v8,
