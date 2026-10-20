@@ -59,13 +59,50 @@ fn mul_matches_wide_reference_in_range() {
     }
 }
 
-/// Known gap: `q16_add`/`q16_sub` saturate but `q16_mul`/`q16_div` wrap on overflow, so a large product flips
-/// sign. Deterministic on every peer, but surprising; ignored until the crate picks one overflow policy.
+/// `q16_mul`/`q16_div` saturate like `q16_add`/`q16_sub` instead of wrapping and flipping sign.
 #[test]
-#[ignore = "known gap: q16_mul wraps on overflow while add/sub saturate"]
 fn mul_saturates_on_overflow() {
-    assert_eq!(q16_mul(i32::MAX, q16_from_i32(2)), i32::MAX);
-    assert_eq!(q16_mul(i32::MIN, q16_from_i32(2)), i32::MIN);
+    let two = q16_from_i32(2);
+    assert_eq!(q16_mul(i32::MAX, two), i32::MAX);
+    assert_eq!(q16_mul(i32::MIN, two), i32::MIN);
+    assert_eq!(q16_mul(i32::MAX, -two), i32::MIN);
+    assert_eq!(q16_mul(i32::MIN, -two), i32::MAX);
+    assert_eq!(q16_mul(i32::MIN, i32::MIN), i32::MAX);
+    assert_eq!(q16_mul(i32::MIN, -Q16_ONE), i32::MAX, "-MIN does not fit");
+    assert_eq!(q16_mul(i32::MAX, Q16_ONE), i32::MAX);
+    assert_eq!(q16_mul(i32::MIN, Q16_ONE), i32::MIN);
+}
+
+#[test]
+fn div_saturates_on_overflow() {
+    assert_eq!(q16_div(i32::MAX, Q16_HALF), i32::MAX);
+    assert_eq!(q16_div(i32::MIN, Q16_HALF), i32::MIN);
+    assert_eq!(q16_div(i32::MAX, -Q16_HALF), i32::MIN);
+    assert_eq!(q16_div(i32::MIN, -Q16_HALF), i32::MAX);
+    assert_eq!(q16_div(i32::MAX, 1), i32::MAX, "smallest positive divisor");
+    assert_eq!(q16_div(i32::MIN, -1), i32::MAX);
+    assert_eq!(q16_div(i32::MIN, -Q16_ONE), i32::MAX, "-MIN does not fit");
+    assert_eq!(q16_div(i32::MIN, Q16_ONE), i32::MIN);
+}
+
+#[test]
+fn mul_and_div_match_clamped_wide_reference() {
+    let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let mut r = rng(11);
+    for _ in 0..CASES {
+        let (a, b) = (q16(&mut r), q16(&mut r));
+        assert_eq!(q16_mul(a, b), clamp((a as i64 * b as i64) >> 16), "{a} * {b}");
+        if b != 0 {
+            assert_eq!(q16_div(a, b), clamp(((a as i64) << 16) / b as i64), "{a} / {b}");
+        }
+    }
+}
+
+#[test]
+fn mul_and_div_stay_const() {
+    const P: Q16_16 = q16_mul(i32::MAX, 2 << 16);
+    const Q: Q16_16 = q16_div(i32::MIN, Q16_HALF);
+    assert_eq!((P, Q), (i32::MAX, i32::MIN));
 }
 
 #[test]
@@ -241,12 +278,68 @@ fn line_of_sight_is_symmetric_for_walls_wider_than_a_sample() {
     }
 }
 
-/// Known gap: the raycast samples 17 points, so a wall thinner than `|segment| / 16` between two samples is
-/// missed and players see through it on long sight lines (a fog-of-war leak).
+/// A wall thinner than `|segment| / 16` used to fall between the 17 samples of the old raycast and leak fog of
+/// war on long sight lines.
 #[test]
-#[ignore = "known gap: 16-step sampling misses thin walls on long segments"]
 fn thin_wall_blocks_long_segment() {
     let a = Vec2Q16::from_ints(0, 0);
     let b = Vec2Q16::from_ints(160, 0);
     assert!(!has_line_of_sight_q16(a, b, &[wall(5, -1, 6, 1)]));
+    // Zero-thickness and one-ulp walls, including across the whole i32 range.
+    assert!(!has_line_of_sight_q16(a, b, &[wall(7, -1, 7, 1)]), "zero thickness");
+    let ulp = AabbObstacleQ16 { min_x: 0, min_y: -1, max_x: 0, max_y: 1 };
+    assert!(!has_line_of_sight_q16(Vec2Q16::new(i32::MIN, -1), Vec2Q16::new(i32::MAX, 1), &[ulp]));
+    // A diagonal through a one-ulp-thick wall.
+    let (c, d) = (Vec2Q16::from_ints(0, 0), Vec2Q16::from_ints(1000, 777));
+    let wall_x = AabbObstacleQ16 { min_x: 500 << 16, min_y: 0, max_x: (500 << 16) + 1, max_y: 1000 << 16 };
+    assert!(!has_line_of_sight_q16(c, d, &[wall_x]));
+}
+
+#[test]
+fn line_of_sight_touch_graze_and_end_inside() {
+    let a = Vec2Q16::from_ints(0, 0);
+    let b = Vec2Q16::from_ints(100, 0);
+    // Grazing an edge or a corner blocks (edges are inclusive); one ulp off does not.
+    assert!(!has_line_of_sight_q16(a, b, &[wall(40, 0, 60, 10)]), "runs along the bottom edge");
+    assert!(!has_line_of_sight_q16(a, b, &[wall(40, -10, 60, 0)]), "runs along the top edge");
+    let off = AabbObstacleQ16 { min_x: 40 << 16, min_y: 1, max_x: 60 << 16, max_y: 10 << 16 };
+    assert!(has_line_of_sight_q16(a, b, &[off]), "one ulp above the line");
+    let (d0, d1) = (Vec2Q16::from_ints(0, 0), Vec2Q16::from_ints(10, 10));
+    assert!(!has_line_of_sight_q16(d0, d1, &[wall(5, -5, 10, 5)]), "touches the corner at (5, 5)");
+    let corner = AabbObstacleQ16 { min_x: (5 << 16) + 1, min_y: -(5 << 16), max_x: 10 << 16, max_y: 5 << 16 };
+    assert!(has_line_of_sight_q16(d0, d1, &[corner]), "misses the corner by one ulp");
+    // Segments that start, end, or lie entirely inside a wall.
+    assert!(!has_line_of_sight_q16(a, b, &[wall(95, -1, 120, 1)]), "ends inside");
+    assert!(!has_line_of_sight_q16(a, b, &[wall(-5, -1, 5, 1)]), "starts inside");
+    assert!(!has_line_of_sight_q16(a, b, &[wall(-5, -5, 200, 5)]), "entirely inside");
+    // Touching only at the end point blocks; stopping one ulp short does not.
+    assert!(!has_line_of_sight_q16(a, b, &[wall(100, -1, 110, 1)]), "end point on the edge");
+    let short = Vec2Q16::new((100 << 16) - 1, 0);
+    assert!(has_line_of_sight_q16(a, short, &[wall(100, -1, 110, 1)]), "stops one ulp short");
+    // Walls in line with the segment but past either end, and a point segment beside a wall.
+    assert!(has_line_of_sight_q16(a, b, &[wall(101, -1, 110, 1), wall(-10, -1, -1, 1)]));
+    assert!(has_line_of_sight_q16(a, a, &[wall(1, 1, 2, 2)]));
+}
+
+/// Exact reference on a small integer grid. The segment enters and leaves the box at `t = k / |dx|` or
+/// `t = k / |dy|`, so if it touches the box at all it does so at some `t = k / (|dx| * |dy|)`: checking those
+/// points (exactly, in scaled integers) decides the test.
+#[test]
+fn line_of_sight_matches_exact_reference_and_is_symmetric() {
+    let mut r = rng(12);
+    for _ in 0..CASES {
+        let mut c = || range(&mut r, 0, 31);
+        let (ax, ay, bx, by) = (c(), c(), c(), c());
+        let (x0, y0) = (c(), c());
+        let (x1, y1) = (x0 + c() / 4, y0 + c() / 4);
+        let w = [wall(x0 as i32, y0 as i32, x1 as i32, y1 as i32)];
+        let (a, b) = (Vec2Q16::from_ints(ax as i32, ay as i32), Vec2Q16::from_ints(bx as i32, by as i32));
+        let n = (bx - ax).abs().max(1) * (by - ay).abs().max(1);
+        let hit = (0..=n).any(|k| {
+            let (px, py) = (ax * n + (bx - ax) * k, ay * n + (by - ay) * k);
+            px >= x0 * n && px <= x1 * n && py >= y0 * n && py <= y1 * n
+        });
+        assert_eq!(has_line_of_sight_q16(a, b, &w), !hit, "{a:?} {b:?} {w:?}");
+        assert_eq!(has_line_of_sight_q16(a, b, &w), has_line_of_sight_q16(b, a, &w), "{a:?} {b:?} {w:?}");
+    }
 }

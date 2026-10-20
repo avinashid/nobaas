@@ -53,15 +53,29 @@ pub const fn q16_sub(a: Q16_16, b: Q16_16) -> Q16_16 {
     a.saturating_sub(b)
 }
 
+/// Clamps a widened result into `Q16_16`, so mul/div saturate like `q16_add`/`q16_sub`.
 #[inline(always)]
-pub const fn q16_mul(a: Q16_16, b: Q16_16) -> Q16_16 {
-    (((a as i64) * (b as i64)) >> 16) as i32
+const fn q16_saturate(v: i64) -> Q16_16 {
+    if v > i32::MAX as i64 {
+        i32::MAX
+    } else if v < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        v as i32
+    }
 }
 
+/// Saturating Q16.16 multiply (rounds toward negative infinity).
+#[inline(always)]
+pub const fn q16_mul(a: Q16_16, b: Q16_16) -> Q16_16 {
+    q16_saturate(((a as i64) * (b as i64)) >> 16)
+}
+
+/// Saturating Q16.16 divide (truncates toward zero). Panics if `b == 0`.
 #[inline(always)]
 pub const fn q16_div(a: Q16_16, b: Q16_16) -> Q16_16 {
     assert!(b != 0, "Q16.16 division by zero");
-    (((a as i64) << 16) / (b as i64)) as i32
+    q16_saturate(((a as i64) << 16) / (b as i64))
 }
 
 /// Deterministic integer square root for `Q16_16` (`sqrt(x)` in Q16.16). Zero floats.
@@ -118,18 +132,33 @@ pub struct AabbObstacleQ16 {
 }
 
 impl AabbObstacleQ16 {
-    /// Deterministic integer slab/midpoint raycast test between `p0` and `p1` (`16` subdivisions, zero floats).
+    /// Exact test of whether the segment `p0..=p1` touches this box (edges inclusive). Liang–Barsky slab
+    /// clipping with each crossing `t` kept as an integer fraction and compared in `i128`: zero floats, no
+    /// sampling, so walls of any thickness block and the result is symmetric in `p0`/`p1`.
     pub fn blocks_segment(&self, p0: Vec2Q16, p1: Vec2Q16) -> bool {
-        let dx = (p1.x as i64) - (p0.x as i64);
-        let dy = (p1.y as i64) - (p0.y as i64);
-        for step in 0..=16i64 {
-            let px = (p0.x as i64 + (dx * step) / 16) as Q16_16;
-            let py = (p0.y as i64 + (dy * step) / 16) as Q16_16;
-            if px >= self.min_x && px <= self.max_x && py >= self.min_y && py <= self.max_y {
-                return true;
+        // Entry and exit of the segment inside the box so far, as `num / den` with `den > 0`, within [0, 1].
+        let (mut enter_n, mut enter_d) = (0i128, 1i128);
+        let (mut exit_n, mut exit_d) = (1i128, 1i128);
+        let axes = [(p0.x, p1.x, self.min_x, self.max_x), (p0.y, p1.y, self.min_y, self.max_y)];
+        for (a, b, lo, hi) in axes {
+            let (a, b, lo, hi) = (a as i128, b as i128, lo as i128, hi as i128);
+            let d = b - a;
+            if d == 0 {
+                if a < lo || a > hi {
+                    return false;
+                }
+                continue;
+            }
+            // Crossing of the near and far slab planes along this axis.
+            let (near_n, far_n, den) = if d > 0 { (lo - a, hi - a, d) } else { (a - hi, a - lo, -d) };
+            if near_n * enter_d > enter_n * den {
+                (enter_n, enter_d) = (near_n, den);
+            }
+            if far_n * exit_d < exit_n * den {
+                (exit_n, exit_d) = (far_n, den);
             }
         }
-        false
+        enter_n * exit_d <= exit_n * enter_d
     }
 }
 
