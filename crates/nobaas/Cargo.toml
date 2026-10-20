@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Nobaas: peer-to-peer nodes over UDP, with no server"
+description = "Peer-to-peer nodes over UDP with no server: STUN, rooms, signaling and NAT traversal on nobaas-core"
 
 [dependencies]
 nobaas-core = { path = "../nobaas-core" }

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Deterministic network simulator for Nobaas"
+description = "Deterministic network simulator for Nobaas: real endpoints over simulated latency, loss, uplinks and NATs, in virtual time"
 
 [dependencies]
 nobaas-core = { path = "../nobaas-core" }

@@ -438,7 +438,7 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | [`bindings/godot`](bindings/godot) | Godot 4 GDExtension: `NobaasMultiplayerPeer` |
 | [`crates/nobaas-ffi`](crates/nobaas-ffi) | C ABI: one surface for WebAssembly and native FFI |
 | [`crates/nobaas-sim`](crates/nobaas-sim) | Deterministic network simulator (latency, jitter, loss, NAT types, uplink limits) and the arena benchmark |
-| [`crates/nobaas-game`](crates/nobaas-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep helpers |
+| [`crates/nobaas-game`](crates/nobaas-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep timing constants |
 | [`packages/js`](packages/js) | JavaScript package: wasm glue, WebRTC transport, Nostr signaling, browser demos |
 | [`examples`](examples) | Rust examples (echo, async echo, a local Nostr relay) and the Godot demo |
 | [`docs`](docs) | Architecture, NAT traversal, Godot, performance, test plan, comparison |
