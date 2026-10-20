@@ -2,7 +2,8 @@
 // Works in browsers and Node (ES module). The host owns transports and time;
 // see Endpoint below and webrtc.js for a DataChannel transport.
 
-// Urgent: reliable and ordered with Reliable, each fragment sent twice; arrives as Reliable.
+// Urgent: reliable, ordered among urgent messages only (overtakes queued Reliable), each fragment
+// sent twice; arrives as Reliable.
 export const Lane = { Reliable: 0, Unreliable: 1, Urgent: 2 };
 export const EventKind = { Connected: 1, Message: 2, Disconnected: 3, ConnectFailed: 4, PathChanged: 5, AddrObserved: 6 };
 const REASONS = ['timeout', 'closed', 'replaced', 'violation'];
