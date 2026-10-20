@@ -169,6 +169,13 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's.
+- `node packages/js/test/fuzz.mjs`: seeded random and mutated input to the JS parsers (Nostr
+  events and relay messages, hex and peer ids, room hello proofs, room frames): nothing throws
+  out of a handler of untrusted input and no promise is left rejected.
+- `node packages/js/test/webrtc_signals.mjs` (Chromium, loopback): malformed offers leave no
+  link and no unhandled rejection, 300 random signals throw nothing, real offers are still
+  answered, and each refused signal is counted in `WebRtcTransport.badSignals` (as Nostr's
+  `stats.rejected` counts refused events).
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.

@@ -273,6 +273,12 @@ export declare class WebRtcTransport implements Transport {
   readonly dropped: number;
   /** Datagrams dropped because the DataChannel had over 1 MiB queued or `send` threw. */
   readonly congested: number;
+  /**
+   * Signals refused: a `from` that isn't a PeerId or an empty message, an offer whose `offerProof` fails or whose
+   * SDP doesn't apply, or one that failed unexpectedly. Answers and ICE candidates that don't apply are not counted
+   * (copies and races are normal). The WebRTC counterpart of NostrSignaling's `stats.rejected`.
+   */
+  readonly badSignals: number;
   dial(peer: PeerId): Promise<void>;
   has(peer: PeerId): boolean;
   drop(peer: PeerId): void;
