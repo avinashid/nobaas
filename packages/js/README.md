@@ -174,6 +174,9 @@ Run these with Node and the Playwright install on this host:
   the outage still arrives after it, by retransmit.
 - `node packages/js/test/endpoint_closed.mjs`: after `close()` no `Endpoint` method calls
   into wasm: a late datagram is dropped, `send`/`connect*` throw, queries return null.
+- `node packages/js/test/scratch_buffers.mjs`: `send` and `receive` reuse the endpoint's
+  buffers: messages arrive intact back to back and after wasm memory grows, with no
+  allocation per message up to 16 KiB.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
