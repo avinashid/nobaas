@@ -50,8 +50,8 @@ aarch64 core.
 | Link | Throughput | Peak cwnd / inflight | Delay backoffs | Retransmits | Urgent p50 / p99 | Sender CPU per fragment |
 |---|---|---|---|---|---|---|
 | Clean | 5.94 MB/s (11.3 s) | 1561 / 1024 | 1 | 0 | 546 / 955 ms | 16 µs |
-| 1% loss | **link dropped** after 0.54 s | 278 / 278 | 0 | 104 of 540 | — | — |
-| 0–10 ms jitter, drawn per packet (reorders) | not done after 600 s, ~0.1 MB/s | 43 / 43 | 0 | 2803 | 57 / 66 s | 3 µs |
+| 1% loss | 0.13 MB/s (504 s) | 339 / 339 | 0 | 977 | 27 / 34 s | 7 µs |
+| 0–10 ms jitter, drawn per packet (reorders) | 3.26 MB/s (20.6 s) | 952 / 952 | 2 | 0 | 1.1 / 1.6 s | 17 µs |
 | 0–10 ms jitter, in order | 2.89 MB/s (23.2 s) | 899 / 899 | 2 | 8 | 1.2 / 1.9 s | 7 µs |
 | Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60416 / 1024 | 0 | 0 | 292 / 797 ms | 27 µs |
 
@@ -59,10 +59,12 @@ What limits it:
 - **One delay backoff halves a whole transfer.** Slow start puts 1024 fragments per RTT on the wire, about
   103 Mbit/s, so the uplink queues. Queueing delay over `QUEUE_TARGET` sets ssthresh to inflight / 2 (about 512),
   and congestion avoidance then adds about one fragment per RTT. The window never returns to the cap.
-- **Fast retransmit repeats on every ACK.** A fragment marked lost is marked again by each later ACK once its
-  retransmission is out, so it reaches `MAX_TRIES` within one round trip and the link is dropped. Reordering
-  triggers the same path, which is why per-packet jitter stalls the transfer. The test
-  `bulk_transfer_survives_one_percent_loss` (ignored until this is fixed) reproduces it.
+- **Loss caps the window, as in any Reno-style sender.** At 1% loss the window settles near
+  `1.22 / √p` ≈ 12 fragments, which is **0.13 MB/s** at 100 ms (the Mathis bound, matched by the run). Before
+  PERF-8, fast retransmit resent a lost fragment on every later ACK, so it reached `MAX_TRIES` in one round trip
+  and the link was dropped after 0.54 s. Each copy is now resent once, and only after an ACK for a fragment sent
+  after it; reordering within a quarter of the minimum RTT (RACK's window) is not taken as loss, so per-packet
+  jitter costs no retransmissions.
 - **Urgent messages wait behind queued bulk data.** They share the reliable queue, so their latency is the time to
   drain the send buffer (up to 4 MiB), not the RTT.
 - **Sender CPU grows with fragments in flight.** `RelSend::has_sendable`, `next_due` and `write_frames` walk every

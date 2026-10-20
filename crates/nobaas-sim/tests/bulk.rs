@@ -34,14 +34,23 @@ fn cpu_is_timed_per_endpoint_when_asked() {
     assert!(s.sender_cpu + s.receiver_cpu <= s.wall, "{s:?}");
 }
 
-/// Repro for the PERF-5 finding: a fragment lost while many are in flight is
-/// fast-retransmitted again on every later ACK, passes MAX_TRIES within one
-/// round trip, and the link is dropped as timed out.
+/// PERF-8: a fragment lost while many are in flight was fast-retransmitted
+/// again on every later ACK, passed MAX_TRIES within one round trip, and the
+/// link was dropped as timed out.
 #[test]
-#[ignore = "PERF-5: fast retransmit repeats on every ACK and drops the link at 1% loss"]
 fn bulk_transfer_survives_one_percent_loss() {
     let s = run(Args { loss: 0.01, ..small() });
     assert!(s.done && s.dropped.is_none(), "{s:?}");
+    assert!(s.retransmits < 4 * 1024 * 1024 / 1100 / 10, "{s:?}");
+}
+
+/// Reordering (independent jitter per packet) looked like loss to fast
+/// retransmit and stalled the transfer; the reordering window absorbs it.
+#[test]
+fn bulk_transfer_survives_reordering() {
+    let s = run(Args { jitter_ms: 10, ..small() });
+    assert!(s.done && s.dropped.is_none(), "{s:?}");
+    assert_eq!(s.retransmits, 0, "{s:?}");
 }
 
 /// Datagrams between `0` and `1` with a lot of jitter, as the unreliable payloads in arrival order.
