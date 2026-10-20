@@ -87,6 +87,8 @@ export class NostrSignaling {
     } catch {
       return;
     }
+    // Relay messages are arrays; `null` and other JSON values are ignored, not dereferenced.
+    if (!Array.isArray(m)) return;
     if (m[0] === 'OK' && m[2] === false) {
       this.stats.rejected++;
       this.stats.lastRejection = `${url}: ${m[3]}`;
