@@ -87,7 +87,9 @@ complete host loop on std UDP sockets.
     about one RTT instead of an RTO.
   - A NewReno-style AIMD congestion window (16 fragments to start, 4 at the floor), capped
     by `Config::reliable_window` (1024). It also backs off when queueing delay passes 25 ms,
-    before any loss, which keeps router buffers short for real-time traffic.
+    before any loss, which keeps router buffers short for real-time traffic. A loss halves
+    the window, except one found by fast retransmit while the RTT shows under 5 ms of
+    queueing: that is taken as random (TCP Veno) and keeps 80%.
   - The sender keeps in-flight fragments in ordered indexes by retransmission time
     (`by_due`) and urgent-copy time (`by_dup`), so each packet visits only what is due.
 - **Liveness:** keepalive every 10 s, then a probe every 1 s while the peer is silent, and
