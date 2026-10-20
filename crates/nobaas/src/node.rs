@@ -1,3 +1,5 @@
+use crate::signaling::Signaling;
+use crate::traversal::{Failure, NatType, Role, Signal, Traversal};
 use crate::Event;
 use nobaas_core::{Config, ConnectError, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError, Transmit};
 use rand_core::{OsRng, RngCore};
@@ -5,14 +7,19 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Most datagrams read in one [`Node::poll`], so a flood can't stall the caller's frame.
 const MAX_READS_PER_POLL: usize = 4096;
+/// Most signaling messages handled in one poll.
+const MAX_SIGNALS_PER_POLL: usize = 256;
 /// Datagrams kept while the socket's send buffer is full; older ones are dropped, as UDP would.
 const MAX_PENDING_SENDS: usize = 1024;
-/// Public addresses learned from peers, offered in invites.
-const MAX_OBSERVED: usize = 4;
+/// Signaling carriers are polled, so a host sleeping on `next_timeout` wakes at least this often.
+const SIGNAL_POLL: Duration = Duration::from_millis(50);
+
+/// Public STUN servers [`Node::bind`] asks for the node's public address.
+pub const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
 
 /// Where a node stands with one peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,14 +52,82 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Options for [`Node`], from [`Node::builder`].
+pub struct Builder {
+    identity: Option<Identity>,
+    config: Config,
+    stun: Vec<String>,
+    signaling: Option<Box<dyn Signaling>>,
+}
+
+impl Builder {
+    /// The identity to use (to keep the same [`PeerId`] across runs). Default: a fresh one.
+    pub fn identity(mut self, identity: Identity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// Session settings. Default: [`Config::default`].
+    pub fn config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// STUN servers (`host:port`) to learn the public address from. Default:
+    /// [`DEFAULT_STUN_SERVERS`]; empty turns STUN off. Names are resolved in
+    /// [`bind`](Builder::bind), and servers that don't resolve are skipped.
+    pub fn stun_servers<S: Into<String>>(mut self, servers: impl IntoIterator<Item = S>) -> Self {
+        self.stun = servers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// A signaling carrier, for rooms ([`Node::join_room`]) and for invites that
+    /// punch through NATs. Default: none (invites work where the host is reachable).
+    pub fn signaling(mut self, signaling: impl Signaling + 'static) -> Self {
+        self.signaling = Some(Box::new(signaling));
+        self
+    }
+
+    /// Binds the UDP socket (`"0.0.0.0:0"` for any interface and a free port).
+    pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
+        let sock = UdpSocket::bind(addr)?;
+        sock.set_nonblocking(true)?;
+        let local = sock.local_addr()?;
+        let identity = self.identity.unwrap_or_else(|| Identity::generate(&mut OsRng));
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let ep = Endpoint::new(&identity, self.config, seed);
+        // A socket on loopback can't reach STUN servers anyway.
+        let stun = if local.ip().is_loopback() { Vec::new() } else { resolve(&self.stun, local.is_ipv6()) };
+        OsRng.fill_bytes(&mut seed);
+        let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let trav = Traversal::new(&identity, seed, unix_ms, local_addresses(local), stun);
+        let mut node = Node {
+            sock,
+            local,
+            ep,
+            trav,
+            signaling: self.signaling,
+            epoch: Instant::now(),
+            status: HashMap::new(),
+            events: VecDeque::new(),
+            pending: VecDeque::new(),
+            buf: Box::new([0; 2048]),
+        };
+        node.pump_signals();
+        Ok(node)
+    }
+}
+
 /// One identity on one non-blocking UDP socket, driven by [`poll`](Node::poll).
 pub struct Node {
     sock: UdpSocket,
     local: SocketAddr,
     ep: Endpoint<SocketAddr>,
+    trav: Traversal<SocketAddr>,
+    signaling: Option<Box<dyn Signaling>>,
     epoch: Instant,
     status: HashMap<PeerId, Status>,
-    observed: Vec<SocketAddr>,
     events: VecDeque<Event>,
     pending: VecDeque<Transmit<SocketAddr>>,
     buf: Box<[u8; 2048]>,
@@ -60,29 +135,24 @@ pub struct Node {
 
 impl Node {
     /// Binds a UDP socket (`"0.0.0.0:0"` for any interface and a free port) with a
-    /// fresh identity and the default [`Config`].
+    /// fresh identity, the default [`Config`] and the [`DEFAULT_STUN_SERVERS`].
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Node> {
-        Node::bind_with(addr, Identity::generate(&mut OsRng), Config::default())
+        Node::builder().bind(addr)
     }
 
     /// Binds with a given identity (to keep the same [`PeerId`] across runs) and config.
     pub fn bind_with(addr: impl ToSocketAddrs, identity: Identity, config: Config) -> io::Result<Node> {
-        let sock = UdpSocket::bind(addr)?;
-        sock.set_nonblocking(true)?;
-        let local = sock.local_addr()?;
-        let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
-        Ok(Node {
-            sock,
-            local,
-            ep: Endpoint::new(&identity, config, seed),
-            epoch: Instant::now(),
-            status: HashMap::new(),
-            observed: Vec::new(),
-            events: VecDeque::new(),
-            pending: VecDeque::new(),
-            buf: Box::new([0; 2048]),
-        })
+        Node::builder().identity(identity).config(config).bind(addr)
+    }
+
+    /// Options: identity, config, STUN servers, signaling.
+    pub fn builder() -> Builder {
+        Builder {
+            identity: None,
+            config: Config::default(),
+            stun: DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
+            signaling: None,
+        }
     }
 
     /// This node's identity, and the key every peer authenticates it by.
@@ -95,37 +165,33 @@ impl Node {
         self.local
     }
 
-    /// An `nb:` invite with this node's addresses: the bound address (or, when bound
-    /// to any interface, the LAN and loopback addresses) and any public address
-    /// connected peers have reported. It holds no secret.
+    /// An `nb:` invite with this node's [`addresses`](Node::addresses). It holds no secret.
     pub fn invite(&self) -> String {
         Invite { peer: self.peer_id(), addrs: self.addresses(), relays: Vec::new() }.to_link()
     }
 
-    /// Addresses a peer may reach this node at, as put in [`invite`](Node::invite).
+    /// Addresses a peer may reach this node at, as put in [`invite`](Node::invite):
+    /// the public address from STUN, any public address connected peers have
+    /// reported, and the bound address (or, when bound to any interface, the LAN
+    /// and loopback addresses).
     pub fn addresses(&self) -> Vec<SocketAddr> {
-        let port = self.local.port();
-        let mut out = Vec::new();
-        if self.local.ip().is_unspecified() {
-            let v6 = self.local.is_ipv6();
-            if let Some(ip) = primary_ip(v6) {
-                out.push(SocketAddr::new(ip, port));
-            }
-            let lo = if v6 { IpAddr::V6(Ipv6Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::LOCALHOST) };
-            out.push(SocketAddr::new(lo, port));
-        } else {
-            out.push(self.local);
-        }
-        for a in &self.observed {
-            if !out.contains(a) {
-                out.push(*a);
-            }
-        }
-        out
+        self.trav.candidates()
+    }
+
+    /// The public address STUN reported for this socket, once a server has answered.
+    pub fn public_addr(&self) -> Option<SocketAddr> {
+        self.trav.public_addr().copied()
+    }
+
+    /// What STUN says about this node's NAT.
+    pub fn nat_type(&self) -> NatType {
+        self.trav.nat_type()
     }
 
     /// Dials the peer named in an invite, at every address it lists (and through any
-    /// listed relay this node is already connected to). Returns the peer's id; an
+    /// listed relay this node is already connected to). With a signaling carrier it
+    /// also sends the peer this node's addresses, so the peer dials back and the
+    /// handshake punches through NATs on both sides. Returns the peer's id; an
     /// [`Event::Connected`] or [`Event::ConnectFailed`] follows from [`poll`](Node::poll).
     pub fn connect(&mut self, invite: &str) -> Result<PeerId, Error> {
         let inv: Invite<SocketAddr> = Invite::parse(invite).ok_or(Error::InvalidInvite)?;
@@ -136,11 +202,43 @@ impl Node {
                 targets.push(Path::Direct(*addr));
             }
         }
-        self.ep.connect_with(self.now(), inv.peer, &targets).map_err(Error::Connect)?;
+        let now = self.now();
+        self.ep.connect_with(now, inv.peer, &targets).map_err(Error::Connect)?;
         if !self.ep.is_connected(&inv.peer) {
             self.status.insert(inv.peer, Status::Connecting);
+            if self.signaling.is_some() {
+                self.trav.introduce(now, &self.ep, inv.peer);
+                self.pump_signals();
+            }
         }
         Ok(inv.peer)
+    }
+
+    /// Joins room `room` of application `app_id` on the signaling carrier, as a mesh
+    /// [`Role::Peer`]: this node connects to every other peer in it, and keeps
+    /// announcing itself for those that join later. Leaves any other room. Needs a
+    /// [`signaling`](Builder::signaling) carrier; without one nobody hears it.
+    pub fn join_room(&mut self, app_id: &str, room: &str) {
+        self.join_room_as(app_id, room, Role::Peer);
+    }
+
+    /// [`join_room`](Node::join_room) with a role: a [`Role::Host`] links with clients
+    /// and peers, a [`Role::Client`] with hosts only (a star, as a game server).
+    pub fn join_room_as(&mut self, app_id: &str, room: &str, role: Role) {
+        let now = self.now();
+        self.trav.join_room(now, app_id, room, role);
+        self.pump_signals();
+    }
+
+    /// Leaves the room: stops announcing and dialling. Links stay up.
+    pub fn leave_room(&mut self) {
+        self.trav.leave_room();
+        self.pump_signals();
+    }
+
+    /// Why the last dial to `peer` failed, after an [`Event::ConnectFailed`].
+    pub fn failure(&self, peer: &PeerId) -> Option<Failure> {
+        self.trav.failure(peer)
     }
 
     /// Queues a message for `peer`; it goes out on the next [`poll`](Node::poll). Never
@@ -183,9 +281,9 @@ impl Node {
     }
 
     /// Does all pending work without blocking: reads every datagram waiting on the
-    /// socket, fires due timers, sends what is queued and queues the resulting
-    /// events. Call it often (every frame, or when [`next_timeout`](Node::next_timeout)
-    /// expires or the socket is readable).
+    /// socket and every signaling message, fires due timers, sends what is queued
+    /// and queues the resulting events. Call it often (every frame, or when
+    /// [`next_timeout`](Node::next_timeout) expires or the socket is readable).
     pub fn poll(&mut self) {
         self.poll_at(Instant::now());
     }
@@ -202,7 +300,11 @@ impl Node {
         let mut drained = false;
         for _ in 0..MAX_READS_PER_POLL {
             match self.sock.recv_from(&mut self.buf[..]) {
-                Ok((n, from)) => self.ep.handle_datagram(now, from, &self.buf[..n]),
+                Ok((n, from)) => {
+                    if !self.trav.handle_stun(&from, &self.buf[..n]) {
+                        self.ep.handle_datagram(now, from, &self.buf[..n]);
+                    }
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     drained = true;
                     break;
@@ -211,14 +313,25 @@ impl Node {
                 Err(_) => continue,
             }
         }
+        if let Some(sig) = self.signaling.as_mut() {
+            for _ in 0..MAX_SIGNALS_PER_POLL {
+                let Some((topic, payload)) = sig.poll() else { break };
+                self.trav.handle_signal(now, &mut self.ep, topic, &payload);
+            }
+        }
         if self.ep.poll_timeout().is_some_and(|t| t <= now) {
             self.ep.handle_timeout(now);
         }
-        self.flush(now);
+        if self.trav.poll_timeout().is_some_and(|t| t <= now) {
+            self.trav.handle_timeout(now, &mut self.ep);
+        }
         while let Some(e) = self.ep.poll_event() {
+            self.trav.handle_event(now, &mut self.ep, &e);
             self.track(&e);
             self.events.push_back(e);
         }
+        self.flush(now);
+        self.pump_signals();
         drained
     }
 
@@ -229,9 +342,15 @@ impl Node {
 
     /// How long until a timer needs [`poll`](Node::poll), if one is armed. A host that
     /// sleeps should wake at this or when the socket is readable, whichever is first.
+    /// With a signaling carrier it is at most 50 ms, as carriers are polled.
     pub fn next_timeout(&self) -> Option<Duration> {
         let now = self.at(Instant::now());
-        self.ep.poll_timeout().map(|t| t.saturating_duration_since(now))
+        let t = [self.ep.poll_timeout(), self.trav.poll_timeout()].into_iter().flatten().min();
+        let t = t.map(|t| t.saturating_duration_since(now));
+        match self.signaling {
+            Some(_) => Some(t.map_or(SIGNAL_POLL, |t| t.min(SIGNAL_POLL))),
+            None => t,
+        }
     }
 
     /// The UDP socket, for hosts that wait on its readiness (it is non-blocking).
@@ -254,12 +373,24 @@ impl Node {
                 return;
             }
         }
-        while let Some(t) = self.ep.poll_transmit(now) {
+        while let Some(t) = self.ep.poll_transmit(now).or_else(|| self.trav.poll_transmit()) {
             if !self.try_send(&t) {
                 if self.pending.len() >= MAX_PENDING_SENDS {
                     self.pending.pop_front();
                 }
                 self.pending.push_back(t);
+            }
+        }
+    }
+
+    /// Hands the traversal's signaling actions to the carrier (dropped without one).
+    fn pump_signals(&mut self) {
+        while let Some(s) = self.trav.poll_signal() {
+            let Some(sig) = self.signaling.as_mut() else { continue };
+            match s {
+                Signal::Subscribe(t) => sig.subscribe(t),
+                Signal::Unsubscribe(t) => sig.unsubscribe(t),
+                Signal::Publish(t, payload) => sig.publish(t, &payload),
             }
         }
     }
@@ -280,17 +411,30 @@ impl Node {
             Event::Disconnected { peer, .. } | Event::ConnectFailed { peer } => {
                 self.status.remove(peer);
             }
-            Event::AddrObserved { addr, .. } => {
-                if !addr.ip().is_loopback() && !self.observed.contains(addr) {
-                    if self.observed.len() >= MAX_OBSERVED {
-                        self.observed.remove(0);
-                    }
-                    self.observed.push(*addr);
-                }
-            }
-            Event::Message { .. } | Event::PathChanged { .. } => {}
+            Event::Message { .. } | Event::PathChanged { .. } | Event::AddrObserved { .. } => {}
         }
     }
+}
+
+/// The socket's own addresses: the bound one, or, when bound to any interface, the
+/// LAN address of the default route and loopback.
+fn local_addresses(local: SocketAddr) -> Vec<SocketAddr> {
+    if !local.ip().is_unspecified() {
+        return vec![local];
+    }
+    let (port, v6) = (local.port(), local.is_ipv6());
+    let mut out: Vec<SocketAddr> = primary_ip(v6).map(|ip| SocketAddr::new(ip, port)).into_iter().collect();
+    let lo = if v6 { IpAddr::V6(Ipv6Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::LOCALHOST) };
+    out.push(SocketAddr::new(lo, port));
+    out
+}
+
+/// Resolves `host:port` names, keeping the first address of the socket's family.
+fn resolve(servers: &[String], v6: bool) -> Vec<SocketAddr> {
+    servers
+        .iter()
+        .filter_map(|s| s.to_socket_addrs().ok()?.find(|a| a.is_ipv6() == v6))
+        .collect()
 }
 
 /// The address of the interface the default route leaves by. `connect` on a UDP
@@ -311,15 +455,21 @@ fn primary_ip(v6: bool) -> Option<IpAddr> {
 mod tests {
     use super::*;
 
+    fn quiet(addr: &str) -> Node {
+        Node::builder().stun_servers(Vec::<String>::new()).bind(addr).unwrap()
+    }
+
     #[test]
     fn invite_round_trips_and_lists_loopback() {
-        let n = Node::bind("0.0.0.0:0").unwrap();
+        let n = quiet("0.0.0.0:0");
         let inv: Invite<SocketAddr> = Invite::parse(&n.invite()).unwrap();
         assert_eq!(inv.peer, n.peer_id());
         let port = n.local_addr().port();
         assert!(inv.addrs.contains(&SocketAddr::from(([127, 0, 0, 1], port))));
         let bound = Node::bind("127.0.0.1:0").unwrap();
         assert_eq!(bound.addresses(), vec![bound.local_addr()]);
+        assert_eq!((bound.public_addr(), bound.nat_type()), (None, NatType::Unknown));
+        assert_eq!(bound.next_timeout(), None, "no STUN on loopback, no signaling: nothing to wake for");
     }
 
     #[test]

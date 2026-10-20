@@ -1,5 +1,5 @@
 //! Two tokio-driven nodes over real loopback UDP.
-use nobaas::{AsyncNode, Event, Lane, Status};
+use nobaas::{AsyncNode, Event, Lane, Node, Status};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -20,7 +20,8 @@ async fn echo(mut host: AsyncNode) -> usize {
 
 #[tokio::test(flavor = "current_thread")]
 async fn connect_and_echo_without_polling() {
-    let host = AsyncNode::bind("0.0.0.0:0").await.unwrap();
+    let host = Node::builder().stun_servers(Vec::<String>::new()).bind("0.0.0.0:0").unwrap();
+    let host = AsyncNode::from_node(host).unwrap();
     let mut guest = AsyncNode::bind("127.0.0.1:0").await.unwrap();
     let h = host.peer_id();
     let invite = host.invite();

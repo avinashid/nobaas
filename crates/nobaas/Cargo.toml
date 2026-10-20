@@ -9,6 +9,10 @@ description = "Nobaas: peer-to-peer nodes over UDP, with no server"
 [dependencies]
 nobaas-core = { path = "../nobaas-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Deterministic randomness in the sans-IO traversal (already used by nobaas-sim and nobaas-ffi).
+rand_chacha = "0.3"
+# SHA-256 for signaling topics, as nostr.js computes them (already in the tree through k256).
+sha2 = "0.10"
 # Optional async host; the sync Node needs no runtime.
 tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "macros", "rt"] }
 
@@ -16,6 +20,7 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 tokio = ["dep:tokio"]
 
 [dev-dependencies]
+nobaas-core = { path = "../nobaas-core" }
 # Tests and examples cover the async host too.
 nobaas = { path = ".", features = ["tokio"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }

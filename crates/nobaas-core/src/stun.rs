@@ -29,6 +29,45 @@ pub fn binding_request(tx: &TxId) -> Vec<u8> {
     v
 }
 
+/// A Binding success response telling the requester it was seen at `addr`
+/// (XOR-MAPPED-ADDRESS): what a STUN server sends, for tests and simulators.
+pub fn binding_response(tx: &TxId, addr: SocketAddr) -> Vec<u8> {
+    let mut key = [0u8; 16];
+    key[..4].copy_from_slice(&MAGIC.to_be_bytes());
+    key[4..].copy_from_slice(tx);
+    let mut attr = vec![0, 0];
+    let port = addr.port().to_be_bytes();
+    attr.extend_from_slice(&[port[0] ^ key[0], port[1] ^ key[1]]);
+    let ip = match addr.ip() {
+        IpAddr::V4(ip) => {
+            attr[1] = 1;
+            ip.octets().to_vec()
+        }
+        IpAddr::V6(ip) => {
+            attr[1] = 2;
+            ip.octets().to_vec()
+        }
+    };
+    attr.extend(ip.iter().zip(key).map(|(b, k)| b ^ k));
+    let mut v = Vec::with_capacity(24 + attr.len());
+    v.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+    v.extend_from_slice(&(4 + attr.len() as u16).to_be_bytes());
+    v.extend_from_slice(&MAGIC.to_be_bytes());
+    v.extend_from_slice(tx);
+    v.extend_from_slice(&ATTR_XOR_MAPPED.to_be_bytes());
+    v.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+    v.extend_from_slice(&attr);
+    v
+}
+
+/// Whether `b` is a Binding request; returns its transaction id.
+pub fn parse_binding_request(b: &[u8]) -> Option<TxId> {
+    if !is_stun(b) || u16::from_be_bytes([b[0], b[1]]) != BINDING_REQUEST {
+        return None;
+    }
+    b[8..20].try_into().ok()
+}
+
 /// The reflexive address in a Binding success response to transaction `tx`.
 pub fn parse_binding_response(b: &[u8], tx: &TxId) -> Option<SocketAddr> {
     if !is_stun(b) || u16::from_be_bytes([b[0], b[1]]) != BINDING_SUCCESS || &b[8..20] != tx {
@@ -114,6 +153,18 @@ mod tests {
             parse_binding_response(&msg, &tx),
             Some("[2001:db8:1234:5678:11:2233:4455:6677]:32853".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn response_round_trips() {
+        for addr in ["198.51.100.7:4242", "[2001:db8::9]:65535"] {
+            let (tx, addr) = ([3; 12], addr.parse().unwrap());
+            assert_eq!(parse_binding_request(&binding_request(&tx)), Some(tx));
+            let r = binding_response(&tx, addr);
+            assert_eq!(parse_binding_request(&r), None);
+            assert_eq!(parse_binding_response(&r, &tx), Some(addr));
+            assert_eq!(parse_binding_response(&r, &[4; 12]), None);
+        }
     }
 
     #[test]

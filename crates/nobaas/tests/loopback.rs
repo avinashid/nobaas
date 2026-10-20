@@ -33,7 +33,7 @@ fn connected(ev: &[Event], peer: PeerId) -> bool {
 
 #[test]
 fn connect_by_invite_and_exchange_messages() {
-    let mut host = Node::bind("0.0.0.0:0").unwrap();
+    let mut host = Node::builder().stun_servers(Vec::<String>::new()).bind("0.0.0.0:0").unwrap();
     let mut guest = Node::bind("127.0.0.1:0").unwrap();
     let (h, g) = (host.peer_id(), guest.peer_id());
     assert_eq!(guest.connect(&host.invite()).unwrap(), h);

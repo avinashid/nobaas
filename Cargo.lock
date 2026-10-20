@@ -417,7 +417,9 @@ version = "0.1.0"
 dependencies = [
  "nobaas",
  "nobaas-core",
+ "rand_chacha",
  "rand_core",
+ "sha2",
  "tokio",
 ]
 
