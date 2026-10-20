@@ -227,9 +227,15 @@ traversal privacy_modes_matrix -- --nocapture`:
   - the node's candidate addresses, as its privacy mode allows (in `Direct`, **LAN addresses** too);
   - **up to 8 PeerIds** it is linked to (only its relay, under `RelayOnly`).
 
-  In a room, only members (or peers it dialled) get this, and members already know each other. A host answering
-  invite joins tells each joiner who else is connected. The invite key is a capability: anyone holding the
-  invite has it, and it doesn't rotate yet.
+  Only room members proved by the room key, peers the node dialled itself, and peers whose dial to it failed (they
+  may need a relay) get both. Anyone else it answers, such as a stranger holding its invite, gets its **public
+  addresses only and no PeerIds** (NB-033(b)). The invite itself still carries LAN addresses in `Direct`: use
+  `PublicOnly` to keep them out of both. The invite key is a capability: anyone holding the invite has it, and it
+  doesn't rotate yet. So an invite works as a ticket to make the node dial back and link, and a PeerId does not.
+- **Addresses a node dials or adopts** from offers, from peers' OBSERVED frames and from STUN are never port 0,
+  unspecified, multicast, broadcast or link-local, and loopback only if the node is bound to loopback (NB-033(a)).
+  An offer can't turn a node into a prober of its own host. It can still name LAN addresses, which the node dials
+  with Noise handshakes: at most 8 per accepted offer.
 - **Peers linked directly** see each other's source IP:port, whatever the mode; `Event::Connected { path }`,
   `PathChanged` and `Node::path` show it. Only `RelayOnly` avoids direct links. A relay sees both ends.
 - **Replay.** A captured offer is dropped once it is older than 60 s or its nonce was seen. Within that window, a
