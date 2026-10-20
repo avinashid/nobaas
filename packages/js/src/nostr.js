@@ -18,6 +18,7 @@ import { isPeerId } from './nobaas.js';
 const KIND = 25059;
 const MAX_CONTENT = 64 * 1024; // event content we are willing to decode (base64 characters)
 export const MAX_SEEN = 4096; // event ids remembered for de-duplication; the oldest is forgotten first
+const EVENT_ID = /^[0-9a-f]{64}$/; // NIP-01: the event hash in lowercase hex, so `seen` stays ~256 KiB
 export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
 
 const enc = new TextEncoder();
@@ -93,7 +94,7 @@ export class NostrSignaling {
     }
     if (m[0] !== 'EVENT') return;
     const ev = m[2];
-    if (!ev || ev.kind !== KIND || typeof ev.id !== 'string' || this.seen.has(ev.id) || ev.pubkey === this.pubkey) return;
+    if (!ev || ev.kind !== KIND || typeof ev.id !== 'string' || !EVENT_ID.test(ev.id) || this.seen.has(ev.id) || ev.pubkey === this.pubkey) return;
     // Anyone who knows the room name can publish, so the set is bounded (a Set iterates in insertion order).
     this.seen.add(ev.id);
     if (this.seen.size > MAX_SEEN) this.seen.delete(this.seen.values().next().value);
