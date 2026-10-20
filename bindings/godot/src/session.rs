@@ -540,12 +540,12 @@ impl Session {
                     self.status = Status::Disconnected;
                 }
             }
-            Event::Message { peer, data, .. } => self.on_message(peer, &data),
+            Event::Message { peer, lane, data } => self.on_message(peer, lane, &data),
             Event::PathChanged { .. } | Event::AddrObserved { .. } => {}
         }
     }
 
-    fn on_message(&mut self, peer: PeerId, data: &[u8]) {
+    fn on_message(&mut self, peer: PeerId, lane: Lane, data: &[u8]) {
         match decode(data) {
             Some(Frame::Assign(id)) => {
                 if !self.host && Some(peer) == self.host_peer && self.my_id == 0 {
@@ -556,6 +556,11 @@ impl Session {
                 }
             }
             Some(Frame::Data { mode, channel, seq, payload }) => {
+                // The mode byte is the sender's word: it must match the lane the frame came on,
+                // or get_packet_mode() would report a guarantee the packet never had (N29-1).
+                if mode.lane() != lane {
+                    return;
+                }
                 let Some(from) = self.ids.id(&peer) else { return };
                 if mode == Mode::UnreliableOrdered && !self.in_seq.accept(from, channel, seq) {
                     return;
@@ -917,7 +922,7 @@ mod tests {
         for n in 0..20u8 {
             let mut data = big.clone();
             data[0] = n;
-            host.on_message(p, &encode_data(Mode::Reliable, 0, 0, &data));
+            host.on_message(p, Lane::Reliable, &encode_data(Mode::Reliable, 0, 0, &data));
         }
         assert_eq!(host.available(), MAX_INBOX_BYTES / MAX_RELIABLE);
         assert_eq!(host.inbox_bytes, MAX_INBOX_BYTES);
@@ -976,6 +981,38 @@ mod tests {
         assert_eq!(a.node.privacy(), Privacy::RelayOnly { via: Some(host.public_key()) });
         let inv = Invite::<SocketAddr>::parse(&a.invite()).unwrap();
         assert_eq!((inv.addrs.len(), inv.relays.iter().map(|r| r.0).collect::<Vec<_>>()), (0, vec![host.public_key()]));
+    }
+
+    /// NB-029 (SEC-10, N29-1): only the dialled host assigns an id, once; frames from
+    /// peers with no id are dropped; and a frame's mode must match the lane it came on.
+    #[test]
+    fn spoofed_frames_are_dropped() {
+        let (h, mallory) = (peer(1, 1), peer(2, 2));
+        let mut j = Session::new(local(), false);
+        j.host_peer = Some(h);
+        let data = |mode| encode_data(mode, 0, 1, b"x");
+        j.on_message(h, Lane::Reliable, &data(Mode::Reliable));
+        assert_eq!(j.available(), 0, "nothing from the host before it assigns an id");
+        j.on_message(mallory, Lane::Reliable, &encode_assign(5));
+        assert_eq!((j.my_id, j.status()), (0, Status::Connecting), "only the host assigns");
+        j.on_message(h, Lane::Reliable, &encode_assign(5));
+        j.on_message(h, Lane::Reliable, &encode_assign(6));
+        assert_eq!((j.my_id, j.status(), j.peer_ids()), (5, Status::Connected, vec![HOST_ID]), "once");
+        j.on_message(mallory, Lane::Reliable, &data(Mode::Reliable));
+        assert_eq!(j.available(), 0, "not from a peer with no id");
+        j.on_message(h, Lane::Unreliable, &data(Mode::Reliable));
+        j.on_message(h, Lane::Reliable, &data(Mode::Unreliable));
+        j.on_message(h, Lane::Reliable, &data(Mode::UnreliableOrdered));
+        assert_eq!(j.available(), 0, "mode and lane disagree");
+        for mode in [Mode::Reliable, Mode::Unreliable, Mode::UnreliableOrdered] {
+            j.on_message(h, mode.lane(), &data(mode));
+        }
+        let got: Vec<(i32, Mode)> = std::iter::from_fn(|| j.pop()).map(|p| (p.from, p.mode)).collect();
+        assert_eq!(got, [Mode::Reliable, Mode::Unreliable, Mode::UnreliableOrdered].map(|m| (HOST_ID, m)));
+
+        let mut host = Session::host(local());
+        host.on_message(mallory, Lane::Reliable, &encode_assign(5));
+        assert_eq!((host.unique_id(), host.available()), (HOST_ID, 0), "a host takes no id");
     }
 
     #[test]
