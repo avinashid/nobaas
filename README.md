@@ -384,7 +384,7 @@ never see each other's addresses in any mode. Browsers: `privacy: 'public-only'`
 | Anyone who knows a PeerId (not the invite) | the PeerId | make the node dial back, or learn its addresses |
 | Peer relay (`Path::Via`) | that A and B talk, both their IP addresses, packet sizes and timing | read, modify or inject session traffic |
 | On-path attacker | ciphertext | impersonate a PeerId, replay data packets |
-| Room member, or invite holder | candidate addresses: all (`Direct`), public only (`PublicOnly`), none (`RelayOnly`, unless it is the relay); the source IP of a direct link. An invite holder the node didn't dial, and whose dial hasn't failed, gets public addresses only and none of the node's linked PeerIds in offers | pose as another PeerId |
+| Room member, or invite holder | candidate addresses: all (`Direct`), public only (`PublicOnly`), none (`RelayOnly`, unless it is the relay); the source IP of a direct link. An invite holder the node didn't dial gets public addresses only and none of the node's linked PeerIds in offers, even after its dial failed | pose as another PeerId |
 
 Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 

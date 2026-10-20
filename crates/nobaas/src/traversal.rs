@@ -240,6 +240,9 @@ struct Remote {
     member: Option<Role>,
     nat: NatType,
     failure: Option<Failure>,
+    /// The links it named in its last offer acted on: if one links with us later,
+    /// we dial it through that one (we never name ours to it to make that happen).
+    relays: Vec<PeerId>,
     seen_at: Instant,
     /// Its offers acted on.
     offers: Bucket,
@@ -534,6 +537,19 @@ impl<A: Address> Traversal<A> {
                     let room = self.room_role(&p).is_some();
                     self.offer(now, ep, p, true, room);
                 }
+                // A peer that named this link as a relay is still waiting: dial it through
+                // the link (a relay-only node dials only through its relay, below).
+                if !matches!(self.privacy, Privacy::RelayOnly { .. }) {
+                    let waiting: Vec<PeerId> = self
+                        .remotes
+                        .iter()
+                        .filter(|(p, r)| r.heard && r.relays.contains(peer) && !ep.is_connected(p))
+                        .map(|(p, _)| *p)
+                        .collect();
+                    for p in waiting {
+                        let _ = ep.connect_with(now, p, &[Path::Via(*peer)]);
+                    }
+                }
                 // A relay-only node's relay just linked: dial the peers waiting for it.
                 if self.relay() == Some(*peer) {
                     let waiting: Vec<PeerId> =
@@ -692,6 +708,7 @@ impl<A: Address> Traversal<A> {
         self.nonces.insert((from, o.nonce), now);
         let r = self.remotes.entry(from).or_default();
         (r.heard, r.nat, r.seen_at, r.offers) = (true, o.nat, now, mine);
+        r.relays = o.relays.iter().filter(|p| **p != from && **p != self.id).take(MAX_RELAYS).copied().collect();
         if room {
             r.member = Some(o.role);
         }
@@ -762,11 +779,12 @@ impl<A: Address> Traversal<A> {
             (_, false, None) => (Proof::None, None, b""),
         };
         // A relay-only node names only its relay, not every peer it links with. Others
-        // name their links and LAN addresses only to a room member, a peer they dialled,
-        // or one whose dial failed (it may need a relay); anyone else, such as a stranger
-        // holding our invite, gets public addresses only.
-        let r = self.remotes.get(&to);
-        let full = room || r.is_some_and(|r| r.invited || r.failure.is_some());
+        // name their links and LAN addresses only to a room member or a peer they
+        // dialled; anyone else, such as a stranger holding our invite, gets public
+        // addresses only, even after its dial failed (a holder can make that happen).
+        // Relay fallback for it still works: it names its links, and we dial through
+        // whichever of them we link with (`handle_event`).
+        let full = room || self.remotes.get(&to).is_some_and(|r| r.invited);
         let (addrs, relays) = match self.privacy {
             Privacy::RelayOnly { .. } => {
                 let relay = self.relay().filter(|r| *r != to && ep.is_connected(r));
@@ -1412,9 +1430,9 @@ mod tests {
         assert!(ep.is_connected(&peer.peer_id()));
     }
 
-    /// NB-033(b): a node names its links and LAN addresses only to a room member, a
-    /// peer it dialled, or one whose dial failed. An invite holder it never dialled
-    /// gets its public addresses and no relays.
+    /// NB-033(b): a node names its links and LAN addresses only to a room member or a
+    /// peer it dialled. An invite holder it never dialled gets its public addresses
+    /// and no relays.
     #[test]
     fn invite_holders_get_public_addresses_and_no_relays() {
         let ia = id(1);
@@ -1439,18 +1457,105 @@ mod tests {
         // A peer this node dials gets everything.
         t.introduce(now, &ep, dialled.peer_id(), None);
         assert_eq!(answer(&mut t, &dialled), (vec![public, lan], vec![relay.peer_id()]));
-        // Once a dial to the holder fails, the next offer (when a link comes up) may name relays.
-        t.handle_event(now, &mut ep, &Event::ConnectFailed { peer: holder.peer_id() });
-        let later = now + OFFER_GAP;
-        let up = Event::Connected { peer: relay.peer_id(), path: Path::Direct(lan), initiator: true };
-        t.handle_event(later, &mut ep, &up);
-        assert_eq!(answer(&mut t, &holder), (vec![public, lan], vec![relay.peer_id()]));
         // Room members get everything too.
         let (mut t, mut ep) = in_room(Role::Peer, None, lan);
         link(&mut ep, lan, &relay, "198.51.100.3:9".parse().unwrap(), now);
         let key = room_key(ROOM.0, ROOM.1);
         t.handle_signal(now, &mut ep, Topic::peer(&me), &offer_from(&holder, &me, Some(&key), 1, Role::Peer, vec![]));
         assert_eq!(answer(&mut t, &holder), (vec![lan], vec![relay.peer_id()]));
+    }
+
+    /// NB-033 N33-1: an invite holder can make its own dial fail (an address that never
+    /// answers), and still gets public addresses and no relays afterwards, both in
+    /// answers and in the re-offer when a link comes up.
+    #[test]
+    fn invite_holder_cannot_force_full_offer() {
+        let ia = id(1);
+        let me = ia.peer_id();
+        let (lan, public): (SocketAddr, SocketAddr) =
+            ("10.0.0.1:7000".parse().unwrap(), "203.0.113.5:7000".parse().unwrap());
+        let (relay, holder) = (id(3), id(2));
+        let mut ep = Endpoint::new(&ia, Config::default(), [1; 32]);
+        let mut t = Traversal::new(&ia, [3; 32], 0, vec![lan], vec![]);
+        let mut now = Instant::from_millis(10);
+        link(&mut ep, lan, &relay, "198.51.100.3:9".parse().unwrap(), now);
+        t.handle_event(now, &mut ep, &Event::AddrObserved { by: relay.peer_id(), addr: public });
+        let k = t.invite_key();
+        let dead: SocketAddr = "192.0.2.77:9".parse().unwrap();
+        let o = proved_offer(&holder, &me, Some((Proof::Invite, &k)), 1, Role::Peer, vec![dead]);
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &o);
+        let answer = |t: &mut Traversal<SocketAddr>| {
+            let o = sent_offers(t, &holder);
+            assert_eq!(o.len(), 1);
+            (o[0].addrs.clone(), o[0].relays.clone())
+        };
+        assert_eq!(answer(&mut t), (vec![public], vec![]));
+        // The real endpoint gives up on the dead address.
+        let mut failed = false;
+        while !failed {
+            now = ep.poll_timeout().expect("a dial pending");
+            ep.handle_timeout(now);
+            while ep.poll_transmit(now).is_some() {}
+            while let Some(e) = ep.poll_event() {
+                failed |= matches!(e, Event::ConnectFailed { peer } if peer == holder.peer_id());
+                t.handle_event(now, &mut ep, &e);
+            }
+        }
+        assert!(t.failure(&holder.peer_id()).is_some() && ep.is_connected(&relay.peer_id()));
+        let o = proved_offer(&holder, &me, Some((Proof::Invite, &k)), 2, Role::Peer, vec![dead]);
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &o);
+        assert_eq!(answer(&mut t), (vec![public], vec![]), "a failed dial opens nothing");
+        let up = Event::Connected { peer: relay.peer_id(), path: Path::Direct(lan), initiator: true };
+        t.handle_event(now + OFFER_GAP, &mut ep, &up);
+        assert_eq!(answer(&mut t), (vec![public], vec![]), "nor does the re-offer");
+    }
+
+    /// NB-033 N33-1: an invite holder that named R as a relay is dialled through R
+    /// as soon as this node links with R, though R was not linked when the offer came.
+    #[test]
+    fn holder_is_dialled_via_a_relay_it_listed_once_linked() {
+        let ia = id(1);
+        let me = ia.peer_id();
+        let lan: SocketAddr = "10.0.0.1:7000".parse().unwrap();
+        let (relay, holder, other) = (id(3), id(2), id(4));
+        let (at_relay, at_other): (SocketAddr, SocketAddr) =
+            ("198.51.100.3:9".parse().unwrap(), "198.51.100.4:9".parse().unwrap());
+        let mut ep = Endpoint::new(&ia, Config::default(), [1; 32]);
+        let mut t = Traversal::new(&ia, [3; 32], 0, vec![lan], vec![]);
+        let now = Instant::from_millis(10);
+        let k = t.invite_key();
+        let relays = vec![relay.peer_id()];
+        let o: Offer<SocketAddr> = Offer {
+            kind: Proof::Invite,
+            reply: false,
+            role: Role::Peer,
+            nat: NatType::Cone,
+            ts: 0,
+            nonce: 1,
+            addrs: vec![],
+            predict: None,
+            relays,
+        };
+        let mut body = o.encode();
+        body.extend(mac(&k, &[b"nb-invite", holder.peer_id().as_bytes(), me.as_bytes(), &body]));
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed::seal(&holder, &me, [7; 32], &body).unwrap());
+        assert_eq!(dials(&mut ep, now), vec![], "nothing to dial yet");
+        // A link it didn't name changes nothing.
+        link(&mut ep, lan, &other, at_other, now);
+        t.handle_event(
+            now,
+            &mut ep,
+            &Event::Connected { peer: other.peer_id(), path: Path::Direct(at_other), initiator: true },
+        );
+        assert_eq!(dials(&mut ep, now), vec![]);
+        // R links: the holder is dialled through it.
+        link(&mut ep, lan, &relay, at_relay, now);
+        t.handle_event(
+            now,
+            &mut ep,
+            &Event::Connected { peer: relay.peer_id(), path: Path::Direct(at_relay), initiator: true },
+        );
+        assert_eq!(dials(&mut ep, now), vec![at_relay]);
     }
 
     /// The offers `t` published, opened with `to`'s key and decoded.
