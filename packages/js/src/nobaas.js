@@ -135,7 +135,14 @@ export class Endpoint {
     this.onTransmit = () => {};
     this.onEvent = () => {};
     this.timer = null;
+    this.closed = false;
     this.transmitErrors = 0; // datagrams lost because onTransmit threw
+  }
+  // close() frees the wasm handle and buffers, so nothing may reach them afterwards:
+  // send and connect* throw, receive and setRelayOnly do nothing, queries return null or false
+  // (stats() returns the counters as they were at close).
+  live(what) {
+    if (this.closed) throw new Error(`${what}: endpoint closed`);
   }
   // Throws on anything but a valid PeerId, before touching wasm memory.
   setPeer(id) {
@@ -143,6 +150,7 @@ export class Endpoint {
     return this.peerBuf;
   }
   secret() {
+    if (this.closed) return null;
     const out = this.nb.x.nb_alloc(32);
     this.nb.x.nb_secret(this.h, out);
     const s = this.nb.mem().slice(out, out + 32);
@@ -150,6 +158,7 @@ export class Endpoint {
     return s;
   }
   connect(addr, peer) {
+    this.live('connect');
     const r = this.nb.x.nb_connect(this.h, nowUs(), addr, this.setPeer(peer));
     this.pump();
     return r;
@@ -158,9 +167,11 @@ export class Endpoint {
   // punch to a direct path, relays forward our packets without our address, and
   // a direct handshake is answered only from a peer we are dialling directly.
   setRelayOnly(on) {
+    if (this.closed) return;
     this.nb.x.nb_set_relay_only(this.h, on ? 1 : 0);
   }
   connectVia(relay, peer) {
+    this.live('connectVia');
     const x = this.nb.x;
     const pp = this.setPeer(peer);
     const rp = this.nb.put(peerBytes(relay));
@@ -170,6 +181,7 @@ export class Endpoint {
     return r;
   }
   stats() {
+    if (this.closed) return { ...this.finalStats };
     const x = this.nb.x;
     const out = x.nb_alloc(128);
     x.nb_stats(this.h, out);
@@ -182,6 +194,7 @@ export class Endpoint {
   }
   // Encrypts to `peer`, authenticated as us (Noise X). See nobaas_core::sealed.
   seal(peer, bytes) {
+    if (this.closed) return null;
     const x = this.nb.x;
     const pp = this.setPeer(peer);
     bytes = bytesOf(bytes);
@@ -196,6 +209,7 @@ export class Endpoint {
   }
   // Returns { from, data } or null if it isn't for us or was tampered with.
   open(bytes) {
+    if (this.closed) return null;
     const x = this.nb.x;
     bytes = bytesOf(bytes);
     const p = this.nb.put(bytes);
@@ -208,14 +222,18 @@ export class Endpoint {
     return r;
   }
   isConnected(peer) {
+    if (this.closed) return false;
     return this.nb.x.nb_is_connected(this.h, this.setPeer(peer)) === 1;
   }
   rttMs(peer) {
+    if (this.closed) return null;
     const us = this.nb.x.nb_rtt_us(this.h, this.setPeer(peer));
     return us < 0n ? null : Number(us) / 1000;
   }
   // Returns 0, or a negative NB_ERR code (-1 not connected, -2 too large, -3 would block).
+  // Throws after close(): a send on a closed endpoint is a bug in the app, not a lost packet.
   send(peer, data, lane = Lane.Reliable) {
+    this.live('send');
     const pp = this.setPeer(peer);
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : bytesOf(data);
     const p = this.nb.put(bytes);
@@ -225,7 +243,9 @@ export class Endpoint {
     return r;
   }
   // Feed a datagram that arrived on transport handle `addr`. Over MAX_DATAGRAM is never ours: dropped.
+  // After close() a late datagram is normal and is dropped too.
   receive(addr, bytes) {
+    if (this.closed) return;
     bytes = bytesOf(bytes);
     if (bytes.length > MAX_DATAGRAM) return;
     const p = this.nb.put(bytes);
@@ -295,6 +315,7 @@ export class Endpoint {
   }
   close() {
     if (this.closed) return; // a second close would free the handle twice
+    this.finalStats = this.stats();
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     const x = this.nb.x;

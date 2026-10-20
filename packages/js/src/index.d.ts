@@ -199,22 +199,33 @@ export declare class Endpoint {
   onEvent: (event: EndpointEvent) => void;
   /** Datagrams lost because `onTransmit` threw; the endpoint keeps running and retransmits. */
   readonly transmitErrors: number;
-  secret(): Uint8Array;
+  /** The 32-byte identity secret; null after `close()`. */
+  secret(): Uint8Array | null;
+  /** Throws `Error('connect: endpoint closed')` after `close()`. */
   connect(addr: number, peer: PeerId | Uint8Array): number;
+  /** Throws `Error('connectVia: endpoint closed')` after `close()`. */
   connectVia(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): number;
   /** Relayed links never punch to a direct path, relays forward without our address, and a
    * direct handshake is answered only from a peer we are dialling directly. */
   setRelayOnly(on: boolean): void;
+  /** After `close()`, the counters as they were when it closed. */
   stats(): EndpointStats;
+  /** seal, open and rttMs return null, and isConnected false, after `close()`. */
   seal(peer: PeerId | Uint8Array, bytes: Uint8Array): Uint8Array | null;
   open(bytes: Uint8Array): { from: PeerId; data: Uint8Array } | null;
   isConnected(peer: PeerId | Uint8Array): boolean;
   rttMs(peer: PeerId | Uint8Array): number | null;
-  /** 0, or a negative NB_ERR code (-1 not connected, -2 too large, -3 would block). */
+  /** 0, or a negative NB_ERR code (-1 not connected, -2 too large, -3 would block).
+   * Throws `Error('send: endpoint closed')` after `close()`: that is a bug in the app, not a lost packet. */
   send(peer: PeerId | Uint8Array, data: string | Uint8Array, lane?: number): number;
+  /** Ignored after `close()`: late datagrams are normal. */
   receive(addr: number, bytes: Uint8Array): void;
   pump(): void;
+  /** Frees the endpoint; a second call does nothing. Close the transport first, so that no
+   * datagram arrives for a closed endpoint (`room.leave()` does this). */
   close(): void;
+  /** True once `close()` has run. */
+  readonly closed: boolean;
 }
 
 export declare function decodeEvent(bytes: Uint8Array): EndpointEvent;

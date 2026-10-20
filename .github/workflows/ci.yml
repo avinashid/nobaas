@@ -58,5 +58,7 @@ jobs:
       - run: node packages/js/test/peer_id.mjs
       - run: node packages/js/test/nostr_bounds.mjs
       - run: node packages/js/test/room_proof.mjs
+      - run: node packages/js/test/pump_rearm.mjs
+      - run: node packages/js/test/endpoint_closed.mjs
 
   # Next: a `godot` job building the GDExtension (NB-020) goes here, Linux only to start.
