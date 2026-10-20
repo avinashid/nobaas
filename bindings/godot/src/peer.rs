@@ -142,8 +142,11 @@ impl NobaasMultiplayerPeer {
         }
     }
 
-    /// `"open"` (no NAT), `"cone"` (punching works), `"symmetric"` (punching works only
-    /// towards cone or open peers) or `"unknown"` (no STUN answer from two servers yet).
+    /// `"open"` (no NAT), `"cone"` (one public port for every peer: punching usually
+    /// works, but not against a symmetric NAT if this router filters by port, which
+    /// STUN can't see), `"symmetric"` (a new port per peer: punching works towards
+    /// open and most cone peers, never towards another symmetric one) or `"unknown"`
+    /// (no STUN answer from two servers yet).
     #[func]
     fn get_nat_type(&self) -> GString {
         let nat = self.session.as_ref().map_or(NatType::Unknown, Session::nat_type);
@@ -155,16 +158,28 @@ impl NobaasMultiplayerPeer {
         })
     }
 
-    /// After `connection_failed`: `"symmetric"` if NATs on both sides made punching
-    /// impossible (no TURN relay, by design), `"unreachable"` if the host never
-    /// answered, or `""`.
+    /// After `connection_failed`: `"symmetric"` if one side's NAT is symmetric and
+    /// the other's router filters by port, so punching can't work (no TURN relay,
+    /// by design), `"unreachable"` if the host never answered, or `""`.
+    /// `get_connect_error_message()` says which side.
     #[func]
     fn get_connect_error(&self) -> GString {
         GString::from(match self.session.as_ref().and_then(Session::connect_failure) {
-            Some(Failure::Symmetric) => "symmetric",
+            Some(Failure::Symmetric(_)) => "symmetric",
             Some(Failure::Unreachable) => "unreachable",
             None => "",
         })
+    }
+
+    /// After `connection_failed`: why, as a sentence to show the player, e.g. "the
+    /// peer's NAT is symmetric (...) and this side's router only lets in packets
+    /// from ports it has sent to, ...". `""` if nothing failed.
+    #[func]
+    fn get_connect_error_message(&self) -> GString {
+        match self.session.as_ref().and_then(Session::connect_failure) {
+            Some(f) => GString::from(f.to_string().as_str()),
+            None => GString::new(),
+        }
     }
 
     /// Starts hosting on UDP `port` (0 picks a free one) and returns the invite to

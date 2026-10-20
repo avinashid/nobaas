@@ -13,6 +13,15 @@ use snow::{HandshakeState, StatelessTransportState};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
+/// Most port guesses kept per link (see [`Endpoint::set_guesses`]).
+pub const MAX_GUESSES: usize = 64;
+/// While relayed, guesses are probed every this many punch rounds: there are many.
+const GUESS_ROUNDS: u32 = 5;
+/// Handshake sends, or punch rounds, that probe a new set of guesses. A punch to a
+/// predicted port lands within the first second or never; later rounds would only
+/// spray the peer's IP.
+const GUESS_PROBES: u32 = 3;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Send a PING if nothing was sent for this long (also keeps NAT mappings open).
@@ -240,6 +249,7 @@ struct Punch {
     token: u64,
     next_at: Instant,
     until: Instant,
+    round: u32,
 }
 
 struct Link {
@@ -324,6 +334,10 @@ struct Session<A> {
     relay: Option<PeerId>,
     /// Direct addresses to try while relayed.
     candidates: Vec<A>,
+    /// Addresses only probed (port predictions), never taken as the path unless answered from.
+    guesses: Vec<A>,
+    /// Probes of `guesses` left: handshake sends while dialling, punch rounds while relayed.
+    guess_probes: u32,
     punch: Option<Punch>,
     last_direct: Instant,
     /// The address this peer last said it sees us at.
@@ -592,6 +606,8 @@ impl<A: Address> Endpoint<A> {
                 state: State::Dialing(dial),
                 relay,
                 candidates,
+                guesses: Vec::new(),
+                guess_probes: 0,
                 punch: None,
                 last_direct: now,
                 seen_as: None,
@@ -636,12 +652,54 @@ impl<A: Address> Endpoint<A> {
         let until = now + self.config.punch_duration;
         let token = self.rng.next_u64();
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
-        if !matches!(sess.path, Path::Via(_)) || sess.candidates.is_empty() || !matches!(sess.state, State::Live(_)) {
+        let nothing = sess.candidates.is_empty() && sess.guesses.is_empty();
+        if !matches!(sess.path, Path::Via(_)) || nothing || !matches!(sess.state, State::Live(_)) {
             return;
         }
         match &mut sess.punch {
             Some(p) => p.until = until,
-            None => sess.punch = Some(Punch { token, next_at: now, until }),
+            None => sess.punch = Some(Punch { token, next_at: now, until, round: 0 }),
+        }
+    }
+
+    /// Aims handshakes and punches for `peer` at `addrs` too: guesses at the
+    /// address a symmetric NAT in front of the peer will pick for its packets to
+    /// us (port prediction). Unlike candidates, guesses are only probed, three
+    /// times: on the first handshake sends while dialling, or every few punch
+    /// rounds while relayed. One becomes the link's path only when the peer
+    /// answers from it. Replaces the peer's earlier guesses; keeps at most
+    /// [`MAX_GUESSES`]. The same guesses again change nothing, and new ones are
+    /// sent to at once without repeating the old. Ignored for a peer a relay-only
+    /// endpoint reaches through a relay, or linked directly.
+    pub fn set_guesses(&mut self, now: Instant, peer: &PeerId, addrs: &[A]) {
+        let Some(&idx) = self.peers.get(peer).or_else(|| self.dialing.get(peer)) else { return };
+        let relay_only = self.relay_only;
+        let Some(sess) = self.sessions.get_mut(&idx) else { return };
+        let relayed = match &sess.state {
+            State::Dialing(d) => d.targets.iter().any(|t| matches!(t, Path::Via(_))),
+            State::Live(_) => matches!(sess.path, Path::Via(_)),
+        };
+        let direct = matches!(sess.state, State::Live(_)) && !relayed;
+        if (relay_only && relayed) || direct {
+            return;
+        }
+        let known = |a: &A| sess.candidates.contains(a) || sess.path.direct() == Some(a);
+        let guesses: Vec<A> = addrs.iter().filter(|a| !known(a)).take(MAX_GUESSES).cloned().collect();
+        let fresh: Vec<A> = guesses.iter().filter(|g| !sess.guesses.contains(g)).cloned().collect();
+        sess.guesses = guesses;
+        if fresh.is_empty() {
+            return;
+        }
+        sess.guess_probes = GUESS_PROBES;
+        if let State::Dialing(d) = &sess.state {
+            // The send now is the first probe; retries carry the rest.
+            sess.guess_probes -= 1;
+            let hs1 = d.hs1.clone();
+            for g in fresh {
+                self.emit(Path::Direct(g), *peer, hs1.clone());
+            }
+        } else {
+            self.start_punch(now, idx);
         }
     }
 
@@ -810,6 +868,8 @@ impl<A: Address> Endpoint<A> {
                 state: State::Live(Box::new(link)),
                 relay,
                 candidates: inherited.1,
+                guesses: Vec::new(),
+                guess_probes: 0,
                 punch: None,
                 last_direct: now,
                 seen_as: None,
@@ -849,8 +909,11 @@ impl<A: Address> Endpoint<A> {
         link.confirm_at = now + self.config.handshake_retry;
         mark_ready(&mut self.ready, receiver, &mut link);
         sess.state = State::Live(Box::new(link));
-        if let Path::Via(r) = &from {
-            sess.relay.get_or_insert(*r);
+        match &from {
+            Path::Via(r) => {
+                sess.relay.get_or_insert(*r);
+            }
+            Path::Direct(_) => sess.guesses.clear(),
         }
         sess.path = from;
         self.sessions.insert(receiver, sess);
@@ -967,6 +1030,7 @@ impl<A: Address> Endpoint<A> {
         if let Some(a) = upgraded {
             sess.path = Path::Direct(a);
             sess.punch = None;
+            sess.guesses.clear();
             sess.last_direct = now;
             self.stats.punch_succeeded += 1;
             path_changed = true;
@@ -1118,8 +1182,10 @@ impl<A: Address> Endpoint<A> {
                     d.attempts += 1;
                     let backoff = self.config.handshake_retry.saturating_mul(1 << (d.attempts - 1).min(4));
                     d.resend_at = now + backoff;
-                    for t in &d.targets {
-                        resend.push((t.clone(), sess.peer, d.hs1.clone()));
+                    let guessed = if sess.guess_probes > 0 { &sess.guesses[..] } else { &[] };
+                    sess.guess_probes = sess.guess_probes.saturating_sub(1);
+                    for t in d.targets.iter().cloned().chain(guessed.iter().cloned().map(Path::Direct)) {
+                        resend.push((t, sess.peer, d.hs1.clone()));
                     }
                 }
                 State::Live(link) => {
@@ -1131,14 +1197,18 @@ impl<A: Address> Endpoint<A> {
                             p.next_at = now + self.config.punch_interval;
                             let mut f = Vec::with_capacity(9);
                             wire::put_punch(&mut f, false, p.token);
-                            for c in &sess.candidates {
-                                let guesses = std::iter::once(Some(c.clone())).chain((1..=spray).map(|k| c.port_offset(k)));
-                                for dst in guesses.flatten() {
-                                    if let Some(payload) = seal(link, &f) {
-                                        self.stats.tx_packets += 1;
-                                        self.stats.punches_sent += 1;
-                                        self.outbox.push_back(Transmit { dst, payload });
-                                    }
+                            let probe = p.round % GUESS_ROUNDS == 0 && sess.guess_probes > 0;
+                            let guessed = if probe { &sess.guesses[..] } else { &[] };
+                            sess.guess_probes -= probe as u32;
+                            p.round += 1;
+                            let sprayed = sess.candidates.iter().flat_map(|c| {
+                                std::iter::once(Some(c.clone())).chain((1..=spray).map(|k| c.port_offset(k))).flatten()
+                            });
+                            for dst in sprayed.chain(guessed.iter().cloned()) {
+                                if let Some(payload) = seal(link, &f) {
+                                    self.stats.tx_packets += 1;
+                                    self.stats.punches_sent += 1;
+                                    self.outbox.push_back(Transmit { dst, payload });
                                 }
                             }
                         }

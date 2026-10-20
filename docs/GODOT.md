@@ -61,8 +61,9 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `join_room_host(app_id, room, host_key) -> Error` | `join_room`, accepting only the host whose `get_public_key()` is `host_key` (32 bytes) |
 | `get_invite() -> String` | This peer's invite again (public address first, once STUN answered) |
 | `get_public_address() -> String` | `ip:port` STUN reported, `""` until a server answers |
-| `get_nat_type() -> String` | `open`, `cone`, `symmetric` or `unknown` (needs answers from two STUN servers) |
-| `get_connect_error() -> String` | After `connection_failed`: `symmetric` (NATs make punching impossible), `unreachable`, or `""` |
+| `get_nat_type() -> String` | `open`, `cone`, `symmetric` or `unknown` (needs answers from two STUN servers). `cone` doesn't promise a punch: see [Through NATs](#through-nats) |
+| `get_connect_error() -> String` | After `connection_failed`: `symmetric` (one side's NAT is symmetric and the other's router filters by port, so punching can't work), `unreachable`, or `""` |
+| `get_connect_error_message() -> String` | After `connection_failed`: the reason as a sentence to show the player, naming the symmetric side; `""` if nothing failed |
 | `set_stun_servers(PackedStringArray)` | `host:port` list, from the next host/join. Default Google + Cloudflare; empty: off |
 | `set_signaling_relays(PackedStringArray)` | Nostr relay URLs, from the next host/join. Default `wss://relay.damus.io`, `wss://nos.lol`; empty: off |
 | `set_privacy_mode(mode: int)` | Which addresses this peer gives out: `PRIVACY_DIRECT` (default), `PRIVACY_PUBLIC_ONLY`, `PRIVACY_RELAY_ONLY`. From the next host/join, and for the running session's next invites and offers; links already up are kept. See [Privacy](#privacy) |
@@ -87,10 +88,21 @@ GDScript.
    from the host (its addresses, encrypted to the joiner's key) and answers with its own. Both then dial each
    other at once, which opens both NATs: the handshake goes through. `join(invite)` does the same over the host's
    own topic, so invites punch too.
-3. Cone NATs (most home routers, `cone` above) punch every time. A `symmetric` NAT against a port-restricted or
-   symmetric one cannot, and Godot's star has no third peer both sides are linked to, so `join*()` fails with
-   `get_connect_error() == "symmetric"`. Nobaas runs no TURN relay, by design. The Rust `Node` relays such pairs
-   through any peer connected to both.
+3. Two cone NATs (most home routers) punch every time, and so does anything against an open or full-cone peer.
+4. A `symmetric` NAT picks a new public port for each peer, so the port it reported isn't the one the other side
+   sees. If it hands ports out in sequence, the peer predicts the next one and the other side probes the ports
+   around it, which punches restricted and port-restricted cones too.
+5. What still fails: two symmetric NATs, or a symmetric NAT with random ports against a *port-restricted* cone,
+   one that only lets in packets from ports it has sent to. STUN reports all cones as `cone`, so
+   `get_nat_type() == "cone"` doesn't promise a punch. Godot's star has no third peer both sides are linked to, so
+   `join*()` fails with `get_connect_error() == "symmetric"`, and `get_connect_error_message()` says which side
+   is symmetric, e.g. "the peer's NAT is symmetric (a new public port per destination) and this side's router
+   only lets in packets from ports it has sent to, ...". Nobaas runs no TURN relay, by design. The Rust `Node`
+   relays such pairs through any peer connected to both.
+
+```gdscript
+multiplayer.connection_failed.connect(func(): print("could not reach the host: ", peer.get_connect_error_message()))
+```
 
 The simulator covers the whole NAT matrix (`crates/nobaas-sim/tests/traversal.rs`). Real carrier-grade NATs across
 two networks still need testing on real devices.
@@ -232,8 +244,9 @@ binary:
 
 ## Limits
 
-- **NATs.** Cone NATs punch; a symmetric NAT against a port-restricted or symmetric one fails with
-  `get_connect_error() == "symmetric"` (no TURN; see [Through NATs](#through-nats)). Some networks block UDP or
+- **NATs.** Cone NATs punch, and sequential symmetric NATs mostly do; two symmetric NATs, or a random-port
+  symmetric one against a port-restricted cone, fail with `get_connect_error() == "symmetric"` (no TURN; see
+  [Through NATs](#through-nats)). Some networks block UDP or
   Nostr's websockets altogether.
 - **Rooms have no size limit or host election.** One host per room: a second `host_room` with the same name is
   found by some joiners and not others.
