@@ -1,0 +1,61 @@
+name: CI
+
+# Runs every step of scripts/gate.sh --strict except the browser tests and the public-relay Nostr tests.
+# Linux only, two jobs, cached builds, superseded runs cancelled.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  WASM_MAX_BYTES: 358400  # same default as scripts/gate.sh (350 KiB)
+
+jobs:
+  rust:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --release
+
+  wasm:
+    name: wasm + node
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/web"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: ./packages/js/build.sh
+      - name: Size (<= WASM_MAX_BYTES) and zero imports
+        run: node .github/scripts/wasm-check.mjs packages/js/pkg/nobaas_ffi.wasm "$WASM_MAX_BYTES"
+      - run: node packages/js/test/node_pair.mjs
+      - run: node packages/js/test/privacy.mjs
+      - run: node packages/js/test/room_node.mjs
+      - run: node packages/js/test/peer_id.mjs
+      - run: node packages/js/test/room_proof.mjs
+
+  # Next: a `godot` job building the GDExtension (NB-020) goes here, Linux only to start.

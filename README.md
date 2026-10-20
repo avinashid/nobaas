@@ -5,6 +5,7 @@
 **No backend as a service.** Peer-to-peer networking for games, whiteboards, meetings and chat:<br>
 encrypted, NAT-traversing and real-time, with no server to run and no relay to pay for.
 
+[![CI](https://github.com/avinashid/nobaas/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/avinashid/nobaas/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 2021](https://img.shields.io/badge/rust-2021-orange.svg)](Cargo.toml)
 [![WebAssembly: 300 KB, 0 imports](https://img.shields.io/badge/wasm-300%20KB%2C%200%20imports-654ff0.svg)](docs/PERFORMANCE.md)
