@@ -1,6 +1,7 @@
 // joinRoom in Node: three peers in one process meet over BroadcastChannel and,
 // with no WebRTC here, send datagrams over it too (LocalTransport). Checks
-// joins, presence, every message type, targeted sends and leaving.
+// joins, presence, every message type, targeted sends, leaving, and the
+// pull-style poll()/receive() path.
 //
 //   node packages/js/test/room_node.mjs
 import { joinRoom } from '../src/index.js';
@@ -66,6 +67,25 @@ try {
 } catch (e) {
   if (!(e instanceof RangeError)) throw e;
 }
+
+// Pull-style, as Godot uses it: plain events from poll()/receive(), sendTo().
+const q = await joinRoom({ ...opts, presence: { name: 'gd' }, queue: true });
+await until('pull peer to join', () => q.peers.length === 3 && [a, b, c].every((r) => r.peers.includes(q.self)));
+const joins = q.poll().filter((e) => e.type === 'peer-join');
+if (joins.length !== 3 || !joins.every((e) => typeof e.peer === 'string' && e.presence.name)) fail(`pull joins ${JSON.stringify(joins)}`);
+if (q.receive() !== null) fail('empty receive');
+a.sendTo(q.self, 'to godot');
+a.sendTo(q.self, Uint8Array.of(9, 8), 'unreliable');
+b.sendTo(null, { hp: 3 });
+await until('pulled messages', () => q.queue.length >= 3);
+const pulled = [q.receive(), ...q.poll()];
+const [p1, p2, p3] = pulled;
+if (p1.data !== 'to godot' || p1.kind !== 'text' || p1.peer !== a.self) fail(`pull text ${JSON.stringify(p1)}`);
+if (!(p2.data instanceof ArrayBuffer) || new Uint8Array(p2.data).join() !== '9,8' || p2.lane !== 'unreliable') fail('pull bytes');
+if (p3.kind !== 'json' || p3.data.hp !== 3 || p3.peer !== b.self) fail('pull json');
+await q.leave();
+await until('pull peer to leave', () => a.peers.length === 2);
+console.log('pull-style poll/receive/sendTo: ok');
 
 await c.leave();
 await until('peer-leave', () => a.peers.length === 1 && b.peers.length === 1);

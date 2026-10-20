@@ -74,6 +74,27 @@ await room.leave();                             // peers see 'peer-leave' at onc
 - **Identity:** `room.endpoint.secret()` returns 32 bytes; pass them back as
   `secret` to keep the same PeerId.
 
+### Pull-style, for game engines
+
+Hosts that handle callbacks poorly, such as Godot's web export through
+`JavaScriptBridge`, can poll once a frame instead. Events are plain objects:
+string ids, `ArrayBuffer` bytes, JSON values, and no class instances.
+
+```js
+const room = await joinRoom({ appId: 'my-game', roomId: 'match-1', queue: true });
+// every frame:
+for (const e of room.poll()) {   // or room.receive(): the next event, or null
+  // { type: 'peer-join' | 'presence', peer, presence }
+  // { type: 'peer-leave', peer, reason }
+  // { type: 'message', peer, data, kind: 'text' | 'bytes' | 'json', lane }
+}
+room.sendTo('', 'x,y', 'unreliable');   // '' or null: everyone; else a peer id
+```
+
+`queue: true` keeps events from the moment you join. Without it, the queue starts
+at the first `poll()` or `receive()`, so callback-only apps never build one up. A
+started queue grows until you drain it. `demo/poll.html` runs this way.
+
 Types are in `src/index.d.ts`.
 
 ## Files
@@ -88,6 +109,7 @@ Types are in `src/index.d.ts`.
 | `src/local.js` | `LocalTransport`: datagrams over the BroadcastChannel, for Node and tests. |
 | `src/index.d.ts` | TypeScript types. |
 | `demo/index.html` | Mesh chat on the low-level API: every tab links to every other. |
+| `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
 
 Signalling is untrusted by design: whatever carries the offers, the Nobaas Noise
@@ -107,9 +129,12 @@ Run these with Node and the Playwright install on this host:
 
 - `node packages/js/test/node_pair.mjs`: two endpoints in Node, checks the glue.
 - `node packages/js/test/room_node.mjs`: `joinRoom` with three peers in Node: presence,
-  message types, lanes, targeted sends, backpressure, leaving.
+  message types, lanes, targeted sends, backpressure, leaving, a late joiner and
+  the pull-style `poll()`/`receive()`/`sendTo()` path.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
+- `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
+  every tab must see every other, and a closed tab must leave.
 - `node packages/js/test/browser.mjs [tabs] [shot.png]`: mesh of tabs, RTT and throughput.
 - `node packages/js/test/arena.mjs [players] [secs] [shot.png|-]`: the arena. `LOSS=0.1`
   drops datagrams. Checks that every island agrees on its lockstep state.

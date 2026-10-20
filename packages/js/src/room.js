@@ -9,6 +9,10 @@
 // Every room message starts with one tag byte (see T). Presence travels over
 // the encrypted links, never through signalling: a peer counts as joined once
 // its presence has arrived, so 'peer-join' always carries it.
+//
+// Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
+// room.poll() / room.receive() return queued events as plain objects (strings,
+// numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
 
 import { loadNobaas, Lane } from './nobaas.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
@@ -49,11 +53,23 @@ function laneOf(lane) {
   return n;
 }
 
+// A queued event: only strings, numbers, plain JSON values and ArrayBuffers.
+function plainEvent(type, args) {
+  if (type === 'message') {
+    const [data, peer, { kind, lane }] = args;
+    return { type, peer, data: data instanceof Uint8Array ? data.slice().buffer : data, kind, lane };
+  }
+  const [peer, x] = args;
+  if (type === 'peer-leave') return { type, peer, reason: x };
+  return { type, peer, presence: x };
+}
+
 export async function joinRoom({
   appId,
   roomId,
   signaling = 'local',
   presence = {},
+  queue = false,
   secret,
   wasm,
   relays,
@@ -86,6 +102,7 @@ export async function joinRoom({
     throw new Error('no WebRTC in this runtime: pass RTCPeerConnection (e.g. from node-datachannel) or use signaling: \'local\'');
   }
   const room = new Room(endpoint, sig, transport, presence);
+  if (queue) room.queue = [];
   await sig.ready;
   sig.hello();
   return room;
@@ -102,7 +119,8 @@ export class Room {
     this.handlers = new Map(); // event -> Set of fns
     this.outbox = new Map(); // peer -> [frame, lane] waiting for send window
     this.left = false;
-    this.helloAt = 0;
+    this.queue = null; // events for poll()/receive(), once asked for
+    this.greeted = new Set(); // peers whose hello we answered
     this.transport = makeTransport((peer, state) => {
       if (state === 'closed') this.lost(peer, 'closed');
     });
@@ -128,6 +146,7 @@ export class Room {
   }
 
   emit(event, ...args) {
+    if (this.queue) this.queue.push(plainEvent(event, args));
     for (const fn of this.handlers.get(event) ?? []) {
       try {
         fn(...args);
@@ -149,6 +168,26 @@ export class Room {
     const targets = to === undefined ? this.peers : [to].flat().filter((p) => this.members.has(p));
     for (const p of targets) this.write(p, f, l);
     return targets.length;
+  }
+
+  // send() without an options object: `peer` '' or null means everyone.
+  sendTo(peer, data, lane = 'reliable') {
+    return this.send(data, peer ? { to: peer, lane } : { lane });
+  }
+
+  // Every event since the last call, oldest first. The first call starts the
+  // queue (or pass `queue: true` to joinRoom to catch events from the start).
+  poll() {
+    if (!this.queue) this.queue = [];
+    const q = this.queue;
+    this.queue = [];
+    return q;
+  }
+
+  // The next event, or null.
+  receive() {
+    if (!this.queue) this.queue = [];
+    return this.queue.shift() ?? null;
   }
 
   getPresence(peer = this.self) {
@@ -186,10 +225,9 @@ export class Room {
 
   onHello(peer) {
     if (this.left || this.transport.has(peer)) return;
-    // Answer a newcomer's hello so it learns about us too (at most once a second).
-    const now = Date.now();
-    if (now - this.helloAt > 1000) {
-      this.helloAt = now;
+    // Answer a newcomer's hello once, so it learns about us too.
+    if (!this.greeted.has(peer)) {
+      this.greeted.add(peer);
       this.signaling.hello();
     }
     // One side dials: the smaller id.
@@ -238,13 +276,15 @@ export class Room {
         return;
       }
     } else return;
-    this.emit('message', value, peer, { lane: lane === Lane.Unreliable ? 'unreliable' : 'reliable' });
+    const kind = tag === T.Bytes ? 'bytes' : tag === T.Text ? 'text' : 'json';
+    this.emit('message', value, peer, { lane: lane === Lane.Unreliable ? 'unreliable' : 'reliable', kind });
   }
 
   lost(peer, reason) {
     this.transport.drop(peer);
     this.linked.delete(peer);
     this.outbox.delete(peer);
+    this.greeted.delete(peer);
     if (this.members.delete(peer)) this.emit('peer-leave', peer, reason);
   }
 

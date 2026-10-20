@@ -45,6 +45,8 @@ export interface JoinRoomOptions {
   signaling?: 'local' | 'nostr' | ((ctx: SignalingContext) => SignalingAdapter);
   /** Shared with every peer when it joins; change it with `room.setPresence`. Default `{}`. */
   presence?: Presence;
+  /** Queue events for `room.poll()`/`room.receive()` from the start; otherwise the first call starts the queue. */
+  queue?: boolean;
   /** 32 bytes restoring an identity from `room.endpoint.secret()`; a fresh one by default. */
   secret?: Uint8Array;
   /** Where to load `nobaas_ffi.wasm` from: a URL, a file path (Node) or the bytes. Default: next to this package. */
@@ -60,7 +62,16 @@ export interface JoinRoomOptions {
 
 export interface MessageInfo {
   lane: 'reliable' | 'unreliable';
+  /** How it was sent: a string, bytes, or any other value as JSON. */
+  kind: 'text' | 'bytes' | 'json';
 }
+
+/** A queued event from `room.poll()`/`room.receive()`: plain values only, for hosts such as Godot's JavaScriptBridge. */
+export type RoomEvent =
+  | { type: 'peer-join'; peer: PeerId; presence: Presence }
+  | { type: 'presence'; peer: PeerId; presence: Presence }
+  | { type: 'peer-leave'; peer: PeerId; reason: string }
+  | { type: 'message'; peer: PeerId; data: string | ArrayBuffer | any; kind: 'text' | 'bytes' | 'json'; lane: 'reliable' | 'unreliable' };
 
 export interface RoomEvents {
   /** A peer connected and shared its presence. */
@@ -93,6 +104,12 @@ export declare class Room {
   /** Sends to every joined peer, or to `to`. Returns how many peers it was queued for.
    * Throws RangeError if the message can't fit the lane (unreliable: one datagram). */
   send(data: RoomData, options?: SendOptions): number;
+  /** `send` with positional arguments; `peer` '' or null sends to everyone. */
+  sendTo(peer: PeerId | '' | null, data: RoomData, lane?: LaneName | number): number;
+  /** Every queued event, oldest first, and clears the queue. The first call starts queueing. */
+  poll(): RoomEvent[];
+  /** The next queued event, or null. The first call starts queueing. */
+  receive(): RoomEvent | null;
   /** Our presence, or a joined peer's. */
   getPresence(peer?: PeerId): Presence | undefined;
   setPresence(presence: Presence): void;

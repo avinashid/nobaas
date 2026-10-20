@@ -22,6 +22,6 @@
   "scripts": {
     "build": "./build.sh",
     "prepack": "./build.sh",
-    "test": "node test/node_pair.mjs && node test/room_node.mjs && node test/readme.mjs"
+    "test": "node test/node_pair.mjs && node test/room_node.mjs && node test/readme.mjs && node test/poll.mjs"
   }
 }
