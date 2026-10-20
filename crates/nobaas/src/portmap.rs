@@ -772,6 +772,7 @@ fn run(mut m: Mapper, sock: UdpSocket, stop: &AtomicBool, states: &mpsc::Sender<
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use nobaas_sim::fuzz::{cases, mutate, run, Rng};
     use std::net::TcpListener;
     use std::sync::Mutex;
 
@@ -1475,5 +1476,166 @@ pub(crate) mod tests {
         assert!(start.elapsed() < STOP_WAIT, "{:?}", start.elapsed());
         assert_eq!(actions.lock().unwrap().last().map(String::as_str), Some("DeletePortMapping"));
         assert!(held.lock().unwrap().is_empty(), "deleted on the router");
+    }
+
+    fn chunked(body: &str, rng: &mut Rng) -> Vec<u8> {
+        let mut b = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let mut rest = body.as_bytes();
+        while !rest.is_empty() {
+            let n = (1 + rng.below(40)).min(rest.len());
+            b.extend(format!("{n:x}\r\n").bytes());
+            b.extend(&rest[..n]);
+            b.extend(b"\r\n");
+            rest = &rest[n..];
+        }
+        b.extend(b"0\r\n\r\n");
+        b
+    }
+
+    /// A gateway's answer to `req` (the last datagram sent), maybe mutated: of
+    /// kind `want.0` with body `want.1` half the time if given, else of any kind.
+    fn fuzz_answer(rng: &mut Rng, req: &[u8], want: Option<(usize, usize)>) -> Vec<u8> {
+        let any = Ipv4Addr::from(rng.u32());
+        let ext = SocketAddrV4::new(*rng.pick(&[EXT, CGNAT, any]), rng.u32() as u16);
+        let mut fake = [0u8; 60];
+        fake[36] = UDP;
+        fake[40..42].copy_from_slice(&PORT.to_be_bytes());
+        let pcp_req = if req.len() >= 60 { req } else { &fake[..] };
+        let map_req = if req.len() >= 12 { req.to_vec() } else { natpmp_request(PORT, PORT, LIFETIME) };
+        let urls =
+            ["http://192.168.1.1:5000/rootDesc.xml", "http://192.168.1.66/d", "http://203.0.113.7/a", "http://x/"];
+        let bodies = [DESC, "<NewExternalIPAddress>203.0.113.7</NewExternalIPAddress>", "<errorCode>718</errorCode>"];
+        let (kind, body) = match want.filter(|_| rng.one_in(2)) {
+            Some(w) => w,
+            None => (rng.below(9), rng.below(bodies.len())),
+        };
+        let mut b = match kind {
+            0 => pcp_answer(pcp_req, *rng.pick(&[0, 1, 2]), rng.edgy_u32(), ext),
+            1 => natpmp_addr_answer(rng.below(4) as u16, *ext.ip()),
+            2 => natpmp_map_answer(&map_req, rng.below(3) as u16, ext.port(), rng.edgy_u32()),
+            3 => ssdp_answer(if rng.one_in(2) { urls[0] } else { rng.pick(&urls) }),
+            4 => http_answer(rng.pick(&["200 OK", "500 Internal Server Error"]), bodies[body]),
+            5 => chunked(bodies[body], rng),
+            6 => soap_error(*rng.pick(&[718, 725, 0])),
+            // Lengths and chunk sizes at the integer limits.
+            7 => {
+                let n = rng.pick(&["18446744073709551615", "18446744073709551612", "ffffffffffffffff", "-1", "0"]);
+                match rng.one_in(2) {
+                    true => format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n{DESC}").into_bytes(),
+                    false => format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{n}\r\nab\r\n0\r\n\r\n")
+                        .into_bytes(),
+                }
+            }
+            _ => {
+                let n = rng.below(200);
+                rng.bytes(n)
+            }
+        };
+        if rng.below(3) != 0 {
+            mutate(rng, &mut b, 4096);
+        }
+        b
+    }
+
+    /// NB-014: every parser of gateway answers (PCP, NAT-PMP, SSDP, URLs, IGD
+    /// descriptions, HTTP), on mutated real answers and noise.
+    #[test]
+    fn fuzz_gateway_answers() {
+        let at: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+        let mut req = vec![0u8; 60];
+        req[24..36].copy_from_slice(&[5; 12]);
+        req[36] = UDP;
+        req[40..42].copy_from_slice(&PORT.to_be_bytes());
+        let mut found = [0usize; 4];
+        run(
+            "gateway",
+            cases(40_000),
+            |rng| fuzz_answer(rng, &req, None),
+            |b| {
+                if let Some(Pcp::Mapped { addr, lifetime }) = pcp_response(b, &[5; 12], PORT) {
+                    assert!(addr.port() != 0 && lifetime != 0);
+                    found[0] += 1;
+                }
+                let _ = natpmp_address(b);
+                if let Some(Ok((port, lifetime))) = natpmp_mapping(b, PORT) {
+                    assert!(port != 0 && lifetime != 0);
+                }
+                if let Some((to, path)) = ssdp_location(b, at) {
+                    assert!(to.ip() == at.ip() && !is_public(&to) && safe(&path) && path.starts_with('/'));
+                    found[1] += 1;
+                }
+                let s = String::from_utf8_lossy(b);
+                if let Some((_, path)) = parse_url(s.trim()) {
+                    assert!(safe(&path));
+                }
+                if let Some(igd) = find_igd(&s, at) {
+                    assert!(safe(&igd.control) && igd.at == at);
+                    assert!(igd.service.bytes().all(|c| c.is_ascii_alphanumeric() || b":.-".contains(&c)));
+                    found[2] += 1;
+                }
+                let _ = tag(&s, "errorCode");
+                let _ = http_complete(b);
+                found[3] += parse_http(b).is_some() as usize;
+            },
+        );
+        println!("fuzz gateway: {found:?} (PCP mapped, SSDP, IGD, HTTP)");
+        assert!(found.iter().all(|&n| n > 0), "the generator must reach every parser");
+    }
+
+    /// NB-014: a hostile gateway, and other LAN hosts answering the SSDP search,
+    /// answer every step with mutated real answers. The mapper never panics,
+    /// sends datagrams only to the gateway or the SSDP group, makes HTTP requests
+    /// only to private hosts, and every request head is printable (no header
+    /// injection from a description or a URL).
+    #[test]
+    fn fuzz_mapper() {
+        let mut rng = Rng::for_target("mapper");
+        let (mut mapped, mut requests) = (0usize, 0usize);
+        for round in 0..cases(400) {
+            let mut m = mapper();
+            let (mut now, mut last) = (0u64, Vec::new());
+            if rng.one_in(2) {
+                to_search(&mut m); // straight to UPnP
+                now = 3;
+            }
+            for _ in 0..30 {
+                for (to, b) in sent(&mut m) {
+                    assert!(to == GW || to == SSDP, "round {round}: datagram to {to}");
+                    last = b;
+                }
+                while let Some(req) = m.poll_http() {
+                    assert!(!is_public(&req.to), "round {round}: HTTP to {}", req.to);
+                    let end = req.bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let head = std::str::from_utf8(&req.bytes[..end]).unwrap();
+                    assert!(head.bytes().all(|c| c == b'\r' || c == b'\n' || (b' '..=b'~').contains(&c)));
+                    assert!(head.split("\r\n").all(|l| !l.contains(['\r', '\n'])));
+                    assert_eq!(head.lines().next().unwrap().split(' ').count(), 3, "round {round}: {head}");
+                    requests += 1;
+                    let want = match m.step {
+                        Step::Describe(_) => (4, 0),
+                        Step::IgdAddr(_) => (5, 1),
+                        _ => (6, 0),
+                    };
+                    let answer = (!rng.one_in(6)).then(|| fuzz_answer(&mut rng, &[], Some(want)));
+                    m.handle_http(t(now), answer.as_deref());
+                }
+                let from = if rng.one_in(4) { "192.168.1.66:1900".parse().unwrap() } else { GW };
+                let want = match m.step {
+                    Step::Pcp => 0,
+                    Step::NatPmpAddr => 1,
+                    Step::NatPmpMap(_) => 2,
+                    _ => 3,
+                };
+                m.handle_datagram(t(now), from, &fuzz_answer(&mut rng, &last, Some((want, 0))));
+                let span = if rng.one_in(10) { 400_000 } else { 400 }; // now and then past a lease or retry
+                now += rng.below(span) as u64;
+                m.handle_timeout(t(now));
+            }
+            mapped += matches!(m.state(), PortMapping::Mapped { .. }) as usize;
+            m.stop();
+            let _ = sent(&mut m);
+        }
+        println!("fuzz mapper: {mapped} rounds ended mapped, {requests} HTTP requests");
+        assert!(mapped > 0 && requests > 0);
     }
 }

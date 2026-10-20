@@ -496,6 +496,7 @@ dependencies = [
  "k256",
  "nobaas",
  "nobaas-core",
+ "nobaas-sim",
  "rand_chacha",
  "rand_core",
  "rustls",
@@ -511,6 +512,7 @@ name = "nobaas-core"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "nobaas-sim",
  "rand_chacha",
  "rand_core",
  "snow",
