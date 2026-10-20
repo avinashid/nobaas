@@ -166,6 +166,7 @@ export class Endpoint {
     nb.free(out, 32);
     // Scratch buffers that live as long as the endpoint.
     this.peerBuf = x.nb_alloc(32);
+    this.peerHex = null; // the id peerBuf holds, when it was given as text
     this.txBuf = x.nb_alloc(MAX_DATAGRAM);
     this.rxBuf = x.nb_alloc(MAX_DATAGRAM);
     this.sendBuf = x.nb_alloc(SEND_SCRATCH);
@@ -189,9 +190,13 @@ export class Endpoint {
   live(what) {
     if (this.closed) throw new Error(`${what}: endpoint closed`);
   }
-  // Throws on anything but a valid PeerId, before touching wasm memory.
+  // Throws on anything but a valid PeerId, before touching wasm memory. Only this
+  // writes peerBuf, so the same id as text again (strings can't change) needs no copy.
   setPeer(id) {
+    if (typeof id === 'string' && id === this.peerHex) return this.peerBuf;
+    this.peerHex = null;
     this.nb.mem().set(peerBytes(id), this.peerBuf);
+    if (typeof id === 'string') this.peerHex = id;
     return this.peerBuf;
   }
   secret() {
@@ -293,7 +298,8 @@ export class Endpoint {
     this.live('send');
     const pp = this.setPeer(peer);
     const r = this.sendBytes(pp, lane, data, true);
-    this.schedule();
+    // A message that would block queued nothing: no pump for it (a drain retries on every ACK).
+    if (r !== WOULD_BLOCK) this.schedule();
     return r;
   }
   unkeep() {

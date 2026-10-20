@@ -80,6 +80,22 @@ check(toHex(new Uint8Array(0)) === '' && fromHex('abc').length === 1 && fromHex(
 const odd = ['zz', '1g', 'g1', '0x10', ' 1', '1 ', 'éé', 'abšc'];
 check(odd.every((s) => same(fromHex(s), oldFromHex(s))), `fromHex reads non-hex input as the old code did (${odd.map((s) => toHex(fromHex(s))).join(' ')})`);
 
+// setPeer remembers the last id given as text, and skips the copy when it comes again:
+// whatever came in between (another id, bytes, an invalid id), peerBuf must hold the id asked for.
+const held = () => toHex(nb.mem().slice(a.peerBuf, a.peerBuf + 32));
+const idX = toHex(bytes(32, 21));
+const idY = toHex(bytes(32, 22));
+const seq = [[idX, idX], [idY, idY], [idY, idY], [fromHex(idX), idX], [idY, idY], ['bad', null], [idY, idY], [fromHex(idY), idY], [idX, idX]];
+const seen = seq.map(([id, want]) => {
+  try {
+    a.setPeer(id);
+  } catch {
+    return want === null;
+  }
+  return held() === want;
+});
+check(seen.every(Boolean), `setPeer holds the id asked for after text, repeats, bytes and an invalid id (${seen.map((v) => (v ? 1 : 0)).join('')})`);
+
 // sendRetry (PERF-4): a message over the send buffer that would block stays in wasm
 // memory, so trying it again copies nothing; it is freed once sent, or at close().
 got.length = 0;
