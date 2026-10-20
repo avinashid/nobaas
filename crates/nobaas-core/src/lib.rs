@@ -39,3 +39,8 @@ pub use identity::{Identity, PeerId};
 pub use invite::Invite;
 pub use time::Instant;
 pub use wire::{MAX_DATAGRAM, MAX_UNRELIABLE};
+
+// The README examples run as doc tests (`cargo test --doc`).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

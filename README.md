@@ -439,9 +439,10 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | [`crates/nobaas-ffi`](crates/nobaas-ffi) | C ABI: one surface for WebAssembly and native FFI |
 | [`crates/nobaas-sim`](crates/nobaas-sim) | Deterministic network simulator (latency, jitter, loss, NAT types, uplink limits) and the arena benchmark |
 | [`crates/nobaas-game`](crates/nobaas-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep timing constants |
+| [`crates/nobaas-peer`](crates/nobaas-peer) | Optional always-on peer (binary): one identity across restarts, relays for linked peers; see [docs/DOCKER.md](docs/DOCKER.md) |
 | [`packages/js`](packages/js) | JavaScript package: wasm glue, WebRTC transport, Nostr signaling, browser demos |
 | [`examples`](examples) | Rust examples (echo, async echo, a local Nostr relay) and the Godot demo |
-| [`docs`](docs) | Architecture, NAT traversal, Godot, performance, test plan, comparison |
+| [`docs`](docs) | Architecture, NAT traversal, Godot, Docker, performance, test plan, comparison |
 | [`scripts/gate.sh`](scripts/gate.sh) | The release gate: every check a change must pass |
 
 ## Building and testing

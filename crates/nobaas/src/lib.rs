@@ -76,3 +76,8 @@ pub type Event = nobaas_core::Event<std::net::SocketAddr>;
 
 /// How a link reaches its peer: a UDP address, or through a relaying peer.
 pub type Path = nobaas_core::Path<std::net::SocketAddr>;
+
+// The README examples run as doc tests (`cargo test --doc`).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
