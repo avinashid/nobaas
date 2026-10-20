@@ -55,7 +55,26 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
+**Status as of `ccc3b79`.**
+
+| Finding | Status |
+|---|---|
+| SEC-1 (High) | **Fixed** in NB-021 (`ccc3b79`), with its review findings N21-1 and N21-2 |
+| SEC-2 (Medium) | Narrowed by NB-031/NB-037: hellos need the room key; PeerId still readable by name holders |
+| SEC-3 (Medium) | Fixed for rooms (NB-031 Rust, NB-037 JS); open for a bare `WebRtcTransport` |
+| SEC-4…SEC-8 | Open (NB-024…NB-028) |
+| SEC-9…SEC-11 | Requirements met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 open |
+| SEC-12 (Info) | Accepted, no card |
+
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
+
+**Status: fixed** in NB-021 (merged `ccc3b79`). Every fixed-size copy into wasm
+memory checks its length first (`peerBytes`, `exact`), every variable-size one
+takes bytes only (`bytesOf`), and the signaling adapters (`nostr.js`, `webrtc.js`,
+`local.js`, `room.js`) drop a `from` that is not 64 lowercase hex characters. The
+reproduction below now throws a `TypeError` and the module stays healthy
+(`packages/js/test/peer_id.mjs`, in the gate). The C ABI peer-length argument is
+a separate defence-in-depth card.
 
 `packages/js/nobaas.js` `Endpoint.setPeer(id)` copies `id` into the fixed 32-byte
 `peerBuf` with `mem().set(..., this.peerBuf)` and performs no length check;
@@ -80,6 +99,23 @@ runs past `peerBuf` and a subsequent `nb.endpoint()` allocation traps the module
 Defence in depth: the C ABI could take an explicit peer-length argument, but the
 JS-side check is the necessary fix.
 
+The review of the fix found two more unbounded inputs, both fixed in the same
+merge:
+
+- **N21-1 (Medium) — fixed.** `webrtc.js` passed DataChannel messages to
+  `new Uint8Array(e.data)`. `binaryType = 'arraybuffer'` covers binary messages
+  only, so a peer could send a *string* such as `"2147483648"`, which became a
+  length: one 10-byte message made the tab allocate 2 GB and aborted the module
+  in `nb_alloc` (`"100000000"` grew wasm memory to ~101 MB, never returned). It
+  needed only an open DataChannel, before the Noise handshake. Now `onmessage`
+  accepts only an `ArrayBuffer` of at most `MAX_DATAGRAM` (1232) bytes, and
+  `Endpoint.receive` drops anything larger before allocating, which also covers
+  `local.js` and custom transports.
+- **N21-2 (Low) — fixed.** `nostr.js` decoded and opened event content of any
+  size, so a hostile relay could push multi-MB events, each costing about twice
+  its size in wasm memory. Content that is not a string or is over 64 KiB is now
+  skipped before decoding.
+
 ### SEC-2 — Room `hello` discloses the long-term PeerId in cleartext (Medium) — NB-022
 
 `nostr.js` `hello()` publishes `{ t:'hello', from:<full PeerId>, meta }` as plain
@@ -97,6 +133,14 @@ hello and exchange the real PeerId inside the sealed channel; (c) at minimum
 document that room membership reveals every member's identity to anyone who knows
 the room name, so room names must be treated as secrets.
 
+**Status: narrowed, open (NB-022).** Since NB-031 (Rust) and NB-037 (JS) a room
+key, separate from the topic, is derived from the name, and a hello is acted on
+only with its HMAC proof, so someone without the name can no longer get dialled.
+But the JS hello still carries `from` in plain base64, and the topic is an
+unsalted hash of the name, so anyone who knows or guesses the name still reads
+every member's PeerId. Option (c) is done: the docs say private room names need
+at least 128 random bits (`randomRoomId()` in JS). Options (a)/(b) are not.
+
 ### SEC-3 — Sealed-offer probe reveals IP candidates to anyone who knows your PeerId (Medium) — NB-023
 
 Because a valid offer only requires the target's PeerId (a public value), any
@@ -112,6 +156,13 @@ per source, and gate candidate disclosure on some proof the peer belongs in the
 room (a room-scoped shared secret, or an allow-list the app supplies). Document
 the residual "known PeerId ⇒ discoverable IP" exposure for apps that publish
 PeerIds widely.
+
+**Status: fixed for rooms, open elsewhere (NB-023).** In Rust (NB-031), room
+offers are acted on only with a verified room-key MAC, and a plain offer only
+from a peer we invited. In JS (NB-037), `joinRoom` gives `WebRtcTransport` an
+`offerProof`, and an offer without a valid room proof gets no answer, so no
+candidates. A `WebRtcTransport` built directly without `offerProof` still answers
+any sealed offer, so the finding stays open for that use.
 
 ### SEC-4 — Half-open handshake table exhaustion (Medium) — NB-024
 
@@ -296,6 +347,19 @@ treats as an authority corrupts every client.
 - The binding should not auto-relay packets between peers on behalf of the Godot
   layer unless the app opts in (Nobaas relay is already gated and rate-limited;
   don't bypass it).
+
+**Status of SEC-9…SEC-11 as of `ccc3b79`.** The binding shipped (NB-020) and was
+hardened (NB-030). `docs/GODOT.md` (Security) now states each requirement: keep
+`allow_object_decoding` off (the demo asserts it), treat `@rpc("any_peer")`
+arguments as attacker-controlled, ids are labels (the host renumbers collisions,
+only the dialled host is 1, authorize by `get_peer_key`), and Godot's authority
+is only as trustworthy as the peer made authority (use the host, or lockstep on
+`nobaas-game`). SEC-11 is a design property: it stays a documented residual, not
+a bug. NB-037's room-key proof does not change it. It only limits who can join a
+room to holders of the room key, and any of them can still be malicious. Godot's
+`server_relay` is on by default; `docs/GODOT.md` names its cost, how to turn it
+off, and that a relayed packet's sender id is the host's word (the host can forge
+it). NB-029 is still open to confirm these against the code.
 
 ## Relation to the Protocol Zero red-team notes
 

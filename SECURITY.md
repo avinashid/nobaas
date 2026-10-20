@@ -43,4 +43,6 @@ its trust boundaries, and the standing findings.
 The first review (NB-013, commit `cf9cbb0`) found no issues in the core wire,
 invite and STUN parsers, the relay gating, or the handshake authentication. It did
 find a memory-safety bug at the JS/FFI boundary (SEC-1) and the signaling-privacy
-and DoS items above; all are tracked as NB tasks.
+and DoS items above; all are tracked as NB tasks. SEC-1 is fixed (NB-021), and
+room-key proofs (NB-031, NB-037) stop room offers from strangers revealing your
+addresses (SEC-3, for rooms). THREAT-MODEL.md lists each finding's status.
