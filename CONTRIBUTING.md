@@ -1,6 +1,7 @@
 # Contributing
 
-1. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+1. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). AI coding agents: read [AGENTS.md](AGENTS.md) (Claude Code
+   loads it through [CLAUDE.md](CLAUDE.md)).
 2. Work on a branch named `<area>/NB-XXX-slug`, where `NB-XXX` is the task or issue number.
 3. Run the gate before opening a PR:
 
