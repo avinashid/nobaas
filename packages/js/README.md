@@ -177,6 +177,10 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/scratch_buffers.mjs`: `send` and `receive` reuse the endpoint's
   buffers: messages arrive intact back to back and after wasm memory grows, with no
   allocation per message up to 16 KiB.
+- `node packages/js/test/room_drain.mjs`: 6 MiB through a Room at once, over the send
+  window: the outbox is flushed as ACKs arrive (`Endpoint.onDrain`), the timer is a fallback.
+- `node packages/js/test/room_throttled.mjs --ab=<other packages/js>`: benchmark, not a test.
+  Room send throughput when the sender's timers are throttled like a background tab's.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

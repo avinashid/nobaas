@@ -64,7 +64,8 @@ async function side(label, dir) {
   try {
     commit = execSync('git rev-parse --short HEAD', { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
   } catch {}
-  return { label, lib: dir, commit, wasmBytes: readFileSync(wasm).length, mod, nb: await mod.loadNobaas(wasm) };
+  const room = await import(pathToFileURL(`${dir}/src/room.js`));
+  return { label, lib: dir, commit, wasm, wasmBytes: readFileSync(wasm).length, mod, room, nb: await mod.loadNobaas(wasm) };
 }
 // Run order: A (baseline) first, then B; without --ab there is only B.
 const sides = AB ? [await side('A', AB), await side('B', LIB)] : [await side('B', LIB)];
@@ -193,6 +194,41 @@ for (const [name, lane, size, count] of [
   });
 }
 
+// Room: 6 MiB in one go between two rooms in this process (BroadcastChannel signalling
+// and datagrams), over the 4 MiB reliable send window, so the rest waits in the room's
+// outbox until ACKs free the window. Messages/s here is per 128 KiB message.
+const ROOM_SIZE = 128 << 10;
+const ROOM_COUNT = 48;
+CASES.push({
+  name: 'room 6 MiB (128 KiB msgs)',
+  unit: 'msg/s',
+  info: { lane: 'reliable', size: ROOM_SIZE, count: ROOM_COUNT },
+  setup: async (s) => {
+    const opts = { appId: 'nobaas-bench', roomId: `room-${s.label}-${process.pid}`, wasm: s.wasm };
+    const [a, b] = await Promise.all([s.room.joinRoom(opts), s.room.joinRoom(opts)]);
+    while (a.peers.length !== 1 || b.peers.length !== 1) await new Promise((r) => setTimeout(r, 10));
+    return { a, b, msg: new Uint8Array(ROOM_SIZE).fill(7) };
+  },
+  run: async ({ a, b, msg }) => {
+    let got = 0;
+    let done;
+    const all = new Promise((r) => (done = r));
+    const off = b.on('message', () => ++got === ROOM_COUNT && done());
+    const t0 = performance.now();
+    for (let i = 0; i < ROOM_COUNT; i++) a.send(msg);
+    await all;
+    off();
+    return { ms: performance.now() - t0, got };
+  },
+  done: async ({ a, b }) => {
+    const retransmits = a.stats().retransmits;
+    await Promise.all([a.leave(), b.leave()]);
+    return { retransmits };
+  },
+  units: (r) => r.got,
+  mb: (r) => (r.got * ROOM_SIZE) / 1e3 / r.ms,
+});
+
 // decodeEvent on its own: the per-event cost the host pays before onEvent.
 function eventBuf(kind, tail) {
   const b = new Uint8Array(33 + tail.length);
@@ -255,7 +291,7 @@ for (const c of CASES) {
       if (i >= WARMUP) rounds[k].push(r);
     }
   }
-  const extra = states.map((st, k) => c.done(st, sides[k]));
+  const extra = await Promise.all(states.map((st, k) => c.done(st, sides[k])));
   await new Promise((r) => setTimeout(r, 50)); // let the GC observer deliver
   const per = rounds.map((rs, k) => ({ ...stats(c, rs), ...extra[k] }));
   if (!AB) {

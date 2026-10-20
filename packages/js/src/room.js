@@ -150,6 +150,8 @@ export class Room {
       if (state === 'closed') this.lost(peer, 'closed');
     });
     endpoint.onEvent = (e) => this.onEvent(e);
+    // ACKs free send window: flush the outbox as they arrive (the timer is a fallback).
+    endpoint.onDrain = () => this.outbox.size && this.flush('drain');
     signaling.onHello = (peer, meta) => this.onHello(peer, meta);
     this.helloTimer = setInterval(() => this.hello(), HELLO_EVERY_MS);
     this.onPageHide = () => this.leave();
@@ -238,6 +240,7 @@ export class Room {
     if (this.left) return;
     this.left = true;
     clearInterval(this.helloTimer);
+    clearTimeout(this.flushTimer);
     globalThis.removeEventListener?.('pagehide', this.onPageHide);
     for (const p of this.linked) this.endpoint.send(p, Uint8Array.of(T.Bye), Lane.Reliable);
     this.endpoint.pump();
@@ -368,7 +371,7 @@ export class Room {
   write(peer, f, lane) {
     const q = this.outbox.get(peer);
     if (q) return void q.push([f, lane]);
-    const r = this.endpoint.send(peer, f, lane);
+    const r = this.endpoint.sendRetry(peer, f, lane);
     if (r === WOULD_BLOCK) {
       this.outbox.set(peer, [[f, lane]]);
       this.flushSoon();
@@ -379,16 +382,27 @@ export class Room {
     }
   }
 
+  // Sends what the send window takes, oldest first. `from` says who asked: 'drain'
+  // (the endpoint handled incoming datagrams, ACKs among them) or 'timer'.
+  flush(from) {
+    if (this.left) return;
+    for (const [peer, q] of this.outbox) {
+      while (q.length && this.endpoint.sendRetry(peer, q[0][0], q[0][1]) !== WOULD_BLOCK) q.shift();
+      if (!q.length) this.outbox.delete(peer);
+    }
+    if (!this.outbox.size) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+  }
+
+  // The fallback while the outbox holds frames, should no datagram arrive to drain it.
   flushSoon() {
     if (this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      if (this.left) return;
-      for (const [peer, q] of this.outbox) {
-        while (q.length && this.endpoint.send(peer, q[0][0], q[0][1]) !== WOULD_BLOCK) q.shift();
-        if (!q.length) this.outbox.delete(peer);
-      }
-      if (this.outbox.size) this.flushSoon();
+      this.flush('timer');
+      if (this.outbox.size && !this.left) this.flushSoon();
     }, 2);
   }
 }

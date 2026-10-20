@@ -8,6 +8,7 @@ export const EventKind = { Connected: 1, Message: 2, Disconnected: 3, ConnectFai
 const REASONS = ['timeout', 'closed', 'replaced', 'violation'];
 // The largest datagram the core sends or accepts; transports drop anything bigger.
 export const MAX_DATAGRAM = 1232;
+const WOULD_BLOCK = -3;
 // Each endpoint keeps a send buffer this size; bigger messages get a buffer of their own.
 const SEND_SCRATCH = 16 * 1024;
 const encoder = new TextEncoder();
@@ -173,6 +174,11 @@ export class Endpoint {
     this.evBuf = x.nb_alloc(this.evCap);
     this.onTransmit = () => {};
     this.onEvent = () => {};
+    // Called at the end of a pump that handled incoming datagrams: ACKs may have
+    // freed send window, so a sender that got -3 (would block) can try again.
+    this.onDrain = null;
+    this.received = false;
+    this.kept = null; // { data, p, n }: see sendRetry
     this.timer = null;
     this.closed = false;
     this.transmitErrors = 0; // datagrams lost because onTransmit threw
@@ -274,15 +280,33 @@ export class Endpoint {
   send(peer, data, lane = Lane.Reliable) {
     this.live('send');
     const pp = this.setPeer(peer);
-    const r = this.sendBytes(pp, lane, data);
+    const r = this.sendBytes(pp, lane, data, false);
     this.schedule();
     return r;
+  }
+  // send() for a caller that tries the same message again after -3 (would block), as
+  // Room does with its outbox: a message over the 16 KiB send buffer then stays in
+  // wasm memory between tries instead of being copied in on every try. `data` is
+  // matched by identity, so it must not change between tries. One message is kept
+  // at a time, until it is sent, another one replaces it, or close().
+  sendRetry(peer, data, lane = Lane.Reliable) {
+    this.live('send');
+    const pp = this.setPeer(peer);
+    const r = this.sendBytes(pp, lane, data, true);
+    this.schedule();
+    return r;
+  }
+  unkeep() {
+    if (!this.kept) return;
+    this.nb.free(this.kept.p, this.kept.n);
+    this.kept = null;
   }
   // Messages up to SEND_SCRATCH go through the endpoint's send buffer: strings are
   // encoded straight into it (encodeInto stops short when one doesn't fit), bytes
   // copied in. Bigger ones get a buffer of their own.
-  sendBytes(pp, lane, data) {
+  sendBytes(pp, lane, data, keep) {
     const x = this.nb.x;
+    if (keep && this.kept?.data === data) return this.sendKept(pp, lane);
     let bytes;
     if (typeof data === 'string') {
       const { read, written } = encoder.encodeInto(data, this.nb.mem().subarray(this.sendBuf, this.sendBuf + SEND_SCRATCH));
@@ -295,9 +319,19 @@ export class Endpoint {
         return x.nb_send(this.h, pp, lane, this.sendBuf, bytes.length);
       }
     }
+    if (keep) {
+      this.unkeep();
+      this.kept = { data, p: this.nb.put(bytes), n: bytes.length };
+      return this.sendKept(pp, lane);
+    }
     const p = this.nb.put(bytes);
     const r = x.nb_send(this.h, pp, lane, p, bytes.length);
     this.nb.free(p, bytes.length);
+    return r;
+  }
+  sendKept(pp, lane) {
+    const r = this.nb.x.nb_send(this.h, pp, lane, this.kept.p, this.kept.n);
+    if (r !== WOULD_BLOCK) this.unkeep();
     return r;
   }
   // Feed a datagram that arrived on transport handle `addr`. Over MAX_DATAGRAM is never ours: dropped.
@@ -308,6 +342,7 @@ export class Endpoint {
     if (bytes.length > MAX_DATAGRAM) return;
     this.nb.mem().set(bytes, this.rxBuf);
     this.nb.x.nb_handle_datagram(this.h, nowUs(), addr, this.rxBuf, bytes.length);
+    this.received = true;
     this.schedule();
   }
   // Sends made in the same JS task share packets: flush once, after the task.
@@ -353,6 +388,10 @@ export class Endpoint {
         this.onEvent(decodeEvent(this.nb.mem().slice(this.evBuf, this.evBuf + n)));
         if (this.closed) return;
       }
+      if (this.received) {
+        this.received = false;
+        this.onDrain?.();
+      }
     } finally {
       this.arm();
     }
@@ -374,6 +413,7 @@ export class Endpoint {
   close() {
     if (this.closed) return; // a second close would free the handle twice
     this.finalStats = this.stats();
+    this.unkeep();
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     const x = this.nb.x;

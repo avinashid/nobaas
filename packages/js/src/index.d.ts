@@ -197,6 +197,9 @@ export declare class Endpoint {
   /** Called with (transport handle, datagram) for each datagram to send. */
   onTransmit: (addr: number, bytes: Uint8Array) => void;
   onEvent: (event: EndpointEvent) => void;
+  /** Called at the end of a pump that handled incoming datagrams: ACKs may have freed send
+   * window, so a sender that got -3 (would block) can try again. Room flushes its outbox here. */
+  onDrain: (() => void) | null;
   /** Datagrams lost because `onTransmit` threw; the endpoint keeps running and retransmits. */
   readonly transmitErrors: number;
   /** The 32-byte identity secret; null after `close()`. */
@@ -218,6 +221,10 @@ export declare class Endpoint {
   /** 0, or a negative NB_ERR code (-1 not connected, -2 too large, -3 would block).
    * Throws `Error('send: endpoint closed')` after `close()`: that is a bug in the app, not a lost packet. */
   send(peer: PeerId | Uint8Array, data: string | Uint8Array, lane?: number): number;
+  /** send() for a caller that tries the same message again after -3: a message over 16 KiB stays
+   * in wasm memory between tries instead of being copied in each time. `data` is matched by
+   * identity and must not change between tries; one message is kept at a time. */
+  sendRetry(peer: PeerId | Uint8Array, data: string | Uint8Array, lane?: number): number;
   /** Ignored after `close()`: late datagrams are normal. */
   receive(addr: number, bytes: Uint8Array): void;
   pump(): void;
