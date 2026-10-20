@@ -78,6 +78,7 @@ check(b.open(sealed) === null, 'open() is null');
 check(b.isConnected(a.id) === false, 'isConnected() is false');
 check(b.rttMs(a.id) === null, 'rttMs() is null');
 check(b.setRelayOnly(true) === undefined, 'setRelayOnly() does nothing');
+check(b.disconnect(a.id) === undefined, 'disconnect() does nothing');
 const after = b.stats();
 check(Object.keys(after).join() === Object.keys(before).join() && after.txPackets >= before.txPackets && after.rxPackets >= before.rxPackets,
   `stats() returns the counters at close (txPackets ${after.txPackets})`);

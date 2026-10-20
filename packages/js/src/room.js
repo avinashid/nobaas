@@ -235,16 +235,22 @@ export class Room {
     return this.endpoint.stats();
   }
 
-  // Says goodbye to every peer, so they see 'peer-leave' at once, then closes.
+  // Says goodbye to every peer, so they see 'peer-leave' at once, then closes. All of it
+  // happens before this returns, with no timer or await, because on pagehide the page
+  // may be gone before either runs. The Bye goes on the unreliable lane, which no full
+  // send window or unacknowledged reliable data holds back, and the core's sealed close
+  // follows it; each is handed to the transport (dc.send) by the pump in the same call.
   async leave() {
     if (this.left) return;
     this.left = true;
     clearInterval(this.helloTimer);
     clearTimeout(this.flushTimer);
     globalThis.removeEventListener?.('pagehide', this.onPageHide);
-    for (const p of this.linked) this.endpoint.send(p, Uint8Array.of(T.Bye), Lane.Reliable);
+    const bye = Uint8Array.of(T.Bye);
+    for (const p of this.linked) this.endpoint.send(p, bye, Lane.Unreliable);
     this.endpoint.pump();
-    await new Promise((r) => setTimeout(r, 50));
+    for (const p of this.linked) this.endpoint.disconnect(p);
+    this.outbox.clear();
     this.transport.close();
     this.endpoint.close();
     this.members.clear();

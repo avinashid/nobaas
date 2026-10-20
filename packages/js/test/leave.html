@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nobaas leave test</title>
+<p id="state">joining</p>
+<script type="module">
+  // A room member for test/leave.mjs: records when each peer's leave arrives,
+  // and with ?load=1 keeps its reliable send window full (16 KiB messages to every peer).
+  import { joinRoom } from '../src/index.js';
+
+  const params = new URLSearchParams(location.search);
+  const room = await joinRoom({ appId: 'nobaas-test', roomId: `leave/${params.get('room')}` });
+  const leaves = [];
+  room.on('peer-leave', (peer, reason) => leaves.push({ peer, reason, at: Date.now() }));
+  let sent = 0;
+  const load = () => {
+    if (room.left) return;
+    // Top up whenever less than 2 MiB waits in the outbox, so the send buffer stays full.
+    const waiting = [...room.outbox.values()].reduce((n, q) => n + q.length, 0);
+    for (let i = waiting; i < 128 && room.peers.length; i++) sent += room.send(new Uint8Array(16384));
+    setTimeout(load, 20);
+  };
+  window.t = {
+    id: room.self,
+    peers: () => room.peers.length,
+    leaves: () => leaves,
+    load: () => load(),
+    sent: () => sent,
+  };
+  document.getElementById('state').textContent = 'joined';
+</script>

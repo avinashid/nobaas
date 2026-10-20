@@ -179,12 +179,17 @@ Run these with Node and the Playwright install on this host:
   allocation per message up to 16 KiB.
 - `node packages/js/test/room_drain.mjs`: 6 MiB through a Room at once, over the send
   window: the outbox is flushed as ACKs arrive (`Endpoint.onDrain`), the timer is a fallback.
+- `node packages/js/test/room_leave.mjs`: a room leaving with a full send window reaches
+  its peers at once, before `leave()` returns; with the Bye lost, the core's close still does.
 - `node packages/js/test/room_throttled.mjs --ab=<other packages/js>`: benchmark, not a test.
   Room send throughput when the sender's timers are throttled like a background tab's.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
   every tab must see every other, and a closed tab must leave.
+- `node packages/js/test/leave.mjs [--runs=10] [--stress=N] [--crash=1]`: closes a streaming
+  tab and times the others' peer-leave (under 5 s each run); a crashed tab may take the 30 s
+  idle timeout. `--stress=N` adds N busy loops for a loaded host.
 - `node packages/js/test/browser.mjs [tabs] [shot.png]`: mesh of tabs, RTT and throughput.
 - `node packages/js/test/arena.mjs [players] [secs] [shot.png|-]`: the arena. `LOSS=0.1`
   drops datagrams. Checks that every island agrees on its lockstep state.
