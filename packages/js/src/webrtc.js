@@ -27,13 +27,18 @@ export class WebRtcTransport {
   //     else; reach others with endpoint.connectVia(relay, peer), which stays
   //     relayed. Browsers have no relay but a peer: with no TURN server there is
   //     no relay-only path to a peer that isn't linked to `relay`.
-  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
+  // `offerProof`: { sign(to), check(from, p) }, both async. Offers carry
+  //   `p: await sign(to)`, and an offer is answered (with our addresses) only if
+  //   check(from, p) holds. joinRoom passes a room-key proof (see proof.js).
+  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
     if (privacy === 'relay-only' && !relay) throw new Error("privacy 'relay-only' needs a relay peer id");
     this.ep = endpoint;
     this.Pc = RTCPeerConnection;
     this.privacy = privacy;
     this.relay = relay;
+    this.offerProof = offerProof;
+    this.checking = new Map(); // peer hex -> signals that came while its offer was checked
     if (privacy === 'relay-only') endpoint.setRelayOnly(true);
     this.trickle = trickle;
     this.dropped = 0;
@@ -97,11 +102,29 @@ export class WebRtcTransport {
     l.dialer = true;
     await l.pc.setLocalDescription(await l.pc.createOffer());
     await this.gathered(l.pc);
-    this.sig.send(peer, { kind: 'offer', sdp: this.description(l.pc) });
+    const p = this.offerProof ? await this.offerProof.sign(peer) : undefined;
+    this.sig.send(peer, { kind: 'offer', sdp: this.description(l.pc), p });
   }
 
   async onSignal(from, msg) {
     if (!this.allowed(from)) return;
+    const held = this.checking.get(from);
+    if (held) return void held.push(msg);
+    if (msg.kind === 'offer' && this.offerProof && !this.byPeer.has(from)) {
+      // Hold what follows (trickled candidates) until the proof is checked.
+      this.checking.set(from, []);
+      const ok = await this.offerProof.check(from, msg.p).catch(() => false);
+      const rest = this.checking.get(from) ?? [];
+      this.checking.delete(from);
+      if (!ok) return;
+      await this.apply(from, msg);
+      for (const m of rest) await this.onSignal(from, m);
+      return;
+    }
+    await this.apply(from, msg);
+  }
+
+  async apply(from, msg) {
     // Only an offer opens a link; answers and candidates for a dropped one are stale.
     if (msg.kind !== 'offer' && !this.byPeer.has(from)) return;
     if (msg.kind === 'offer') {
@@ -151,6 +174,7 @@ export class WebRtcTransport {
   }
 
   close() {
+    this.checking.clear();
     for (const l of this.links.values()) {
       l.dc.onclose = null;
       l.pc.close();
