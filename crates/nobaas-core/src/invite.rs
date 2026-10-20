@@ -147,7 +147,9 @@ mod b64 {
 
     #[test]
     fn rfc4648_vectors() {
-        for (raw, enc) in [("", ""), ("f", "Zg"), ("fo", "Zm8"), ("foo", "Zm9v"), ("foob", "Zm9vYg"), ("fooba", "Zm9vYmE")] {
+        for (raw, enc) in
+            [("", ""), ("f", "Zg"), ("fo", "Zm8"), ("foo", "Zm9v"), ("foob", "Zm9vYg"), ("fooba", "Zm9vYmE")]
+        {
             assert_eq!(encode(raw.as_bytes()), enc);
             assert_eq!(decode(enc).unwrap(), raw.as_bytes());
         }

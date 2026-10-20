@@ -17,9 +17,11 @@
 
 mod nat;
 
-pub use nat::{Dependence, NatConfig, NatStats, PortAlloc};
 use nat::Nat;
-use nobaas_core::{stun, Address, Config, ConnectError, Endpoint, Event, Identity, Instant, Lane, Path, PeerId, SendError};
+pub use nat::{Dependence, NatConfig, NatStats, PortAlloc};
+use nobaas_core::{
+    stun, Address, Config, ConnectError, Endpoint, Event, Identity, Instant, Lane, Path, PeerId, SendError,
+};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use std::cmp::Ordering;
@@ -54,7 +56,8 @@ impl Address for SimAddr {
     }
 
     fn decode(b: &[u8]) -> Option<Self> {
-        (b.len() == 6).then(|| SimAddr::new(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), u16::from_le_bytes([b[4], b[5]])))
+        (b.len() == 6)
+            .then(|| SimAddr::new(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), u16::from_le_bytes([b[4], b[5]])))
     }
 
     fn port_offset(&self, delta: i32) -> Option<Self> {
@@ -333,7 +336,13 @@ impl Sim {
     }
 
     /// Dials `to` through `relay`, with `candidates` as direct addresses to try.
-    pub fn connect_via(&mut self, from: usize, relay: usize, to: usize, candidates: &[SimAddr]) -> Result<(), ConnectError> {
+    pub fn connect_via(
+        &mut self,
+        from: usize,
+        relay: usize,
+        to: usize,
+        candidates: &[SimAddr],
+    ) -> Result<(), ConnectError> {
         let (r, p) = (self.peer_id(relay), self.peer_id(to));
         self.touch(from);
         self.nodes[from].endpoint.connect_via(self.now, r, p, candidates)

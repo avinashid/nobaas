@@ -23,9 +23,9 @@ use nobaas::{
     Event, Failure, Invite, Lane, NatType, Node, NostrSignaling, PeerId, PeerStats, Privacy, Role, SendError,
     MAX_UNRELIABLE,
 };
-use std::net::SocketAddr;
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::net::SocketAddr;
 
 /// The host's Godot peer id.
 pub const HOST_ID: i32 = 1;
@@ -485,7 +485,8 @@ impl Session {
         match e {
             Event::Connected { peer, .. } => {
                 if !self.host {
-                    if self.host_peer.is_none() && self.room.is_some() && self.node.room_role(&peer) == Some(Role::Host) {
+                    if self.host_peer.is_none() && self.room.is_some() && self.node.room_role(&peer) == Some(Role::Host)
+                    {
                         // The first peer to link that proved it hosts this room is ours.
                         self.host_peer = Some(peer);
                         self.set_privacy(self.node.privacy()); // a relay-only client keeps it as its relay
@@ -791,7 +792,10 @@ mod tests {
         assert_eq!(host.pop(), None);
         let mut from_a: Vec<Packet> = std::iter::from_fn(|| a.pop()).collect();
         from_a.sort_by_key(|p| p.mode as u8);
-        assert_eq!(from_a[0], Packet { from: HOST_ID, channel: 3, mode: Mode::UnreliableOrdered, data: b"pos".to_vec() });
+        assert_eq!(
+            from_a[0],
+            Packet { from: HOST_ID, channel: 3, mode: Mode::UnreliableOrdered, data: b"pos".to_vec() }
+        );
         assert_eq!(from_a[1], Packet { from: HOST_ID, channel: 3, mode: Mode::Reliable, data: b"hello all".to_vec() });
         assert_eq!(b.pop().unwrap().data, b"hello all");
 
@@ -912,7 +916,8 @@ mod tests {
         let mut impostor = node();
         let mut side = hub.connect();
         let hex: String = impostor.peer_id().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let forged = format!(r#"{{"t":"hello","from":"{hex}","meta":{{"nb":1,"role":"host","p":"{}"}}}}"#, "00".repeat(32));
+        let forged =
+            format!(r#"{{"t":"hello","from":"{hex}","meta":{{"nb":1,"role":"host","p":"{}"}}}}"#, "00".repeat(32));
         side.publish(Topic::room("nb-test", "secret-room"), forged.as_bytes());
         impostor.connect(&a.invite()).unwrap();
         let end = Instant::now() + Duration::from_millis(1500);

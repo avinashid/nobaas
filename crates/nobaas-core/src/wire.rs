@@ -86,16 +86,10 @@ pub(crate) fn parse(b: &[u8]) -> Option<Packet<'_>> {
     }
     match b[0] & 0x0f {
         HS1 if b.len() > 5 => Some(Packet::Hs1 { sender: u32le(&b[1..]), noise: &b[5..] }),
-        HS2 if b.len() > 9 => Some(Packet::Hs2 {
-            sender: u32le(&b[1..]),
-            receiver: u32le(&b[5..]),
-            noise: &b[9..],
-        }),
-        DATA if b.len() >= DATA_HEADER + TAG => Some(Packet::Data {
-            receiver: u32le(&b[1..]),
-            nonce: u64le(&b[5..]),
-            ciphertext: &b[DATA_HEADER..],
-        }),
+        HS2 if b.len() > 9 => Some(Packet::Hs2 { sender: u32le(&b[1..]), receiver: u32le(&b[5..]), noise: &b[9..] }),
+        DATA if b.len() >= DATA_HEADER + TAG => {
+            Some(Packet::Data { receiver: u32le(&b[1..]), nonce: u64le(&b[5..]), ciphertext: &b[DATA_HEADER..] })
+        }
         _ => None,
     }
 }
@@ -130,14 +124,28 @@ pub(crate) fn encode_data_header(receiver: u32, nonce: u64, out: &mut Vec<u8>) {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Frame<'a> {
     Ping,
-    Ack { cum: u32, bits: u64 },
-    Reliable { seq: u32, fin: bool, data: &'a [u8] },
+    Ack {
+        cum: u32,
+        bits: u64,
+    },
+    Reliable {
+        seq: u32,
+        fin: bool,
+        data: &'a [u8],
+    },
     Unreliable(&'a [u8]),
     Close,
     Observed(&'a [u8]),
     /// `tag`: the relay may tell `to` the address it sees the sender at.
-    Fwd { to: PeerId, packet: &'a [u8], tag: bool },
-    Relayed { addr: &'a [u8], packet: &'a [u8] },
+    Fwd {
+        to: PeerId,
+        packet: &'a [u8],
+        tag: bool,
+    },
+    Relayed {
+        addr: &'a [u8],
+        packet: &'a [u8],
+    },
     Punch(u64),
     PunchAck(u64),
 }
@@ -164,9 +172,7 @@ impl<'a> Iterator for Frames<'a> {
         let (frame, used) = match b[0] {
             F_PING => (Frame::Ping, 1),
             F_CLOSE => (Frame::Close, 1),
-            F_ACK if b.len() >= ACK_LEN => {
-                (Frame::Ack { cum: u32le(&b[1..]), bits: u64le(&b[5..]) }, ACK_LEN)
-            }
+            F_ACK if b.len() >= ACK_LEN => (Frame::Ack { cum: u32le(&b[1..]), bits: u64le(&b[5..]) }, ACK_LEN),
             F_REL if b.len() >= REL_OVERHEAD => {
                 let len = u16::from_le_bytes([b[6], b[7]]) as usize;
                 if b.len() < REL_OVERHEAD + len || b[5] & !1 != 0 {
@@ -354,7 +360,6 @@ mod tests {
             }
         }
     }
-
 
     #[test]
     fn packet_parse_bounds() {

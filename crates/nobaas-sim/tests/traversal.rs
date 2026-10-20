@@ -274,7 +274,14 @@ fn nat_matrix_through_signaling() {
             let cell = match (o.connected, o.failures) {
                 (true, _) => format!("{} {}", if o.direct { "D" } else { "R?" }, o.t_connect.as_millis()),
                 (false, (Some(Failure::Symmetric(side)), _)) => {
-                    format!("F S{}", match side { Side::Ours => "<", Side::Theirs => "^", Side::Both => "2" })
+                    format!(
+                        "F S{}",
+                        match side {
+                            Side::Ours => "<",
+                            Side::Theirs => "^",
+                            Side::Both => "2",
+                        }
+                    )
                 }
                 (false, _) => "F U".to_string(),
             };
@@ -332,8 +339,12 @@ fn nat_matrix_through_signaling() {
 /// punches though the cone side filters by port. Either side may dial first.
 #[test]
 fn sequential_symmetric_nats_punch_port_restricted_peers() {
-    let pairs =
-        [("sym-seq", "port-restr"), ("sym-seq", "cgnat(pr+pr)"), ("cgnat(pr+sym)", "port-restr"), ("cgnat(pr+sym)", "full-cone")];
+    let pairs = [
+        ("sym-seq", "port-restr"),
+        ("sym-seq", "cgnat(pr+pr)"),
+        ("cgnat(pr+sym)", "port-restr"),
+        ("cgnat(pr+sym)", "full-cone"),
+    ];
     let mut times = Vec::new();
     for (a, b) in pairs {
         for seed in 0..10 {
@@ -345,7 +356,12 @@ fn sequential_symmetric_nats_punch_port_restricted_peers() {
         }
     }
     times.sort();
-    println!("{} pairs direct, connect median {:?}, max {:?}", times.len(), times[times.len() / 2], times[times.len() - 1]);
+    println!(
+        "{} pairs direct, connect median {:?}, max {:?}",
+        times.len(),
+        times[times.len() / 2],
+        times[times.len() - 1]
+    );
     // Random ports can't be predicted: no prediction, so no probing.
     let mut w = World::new(3);
     let (r, s) = (w.add(&kind("sym-random")), w.add(&kind("sym-seq")));
@@ -466,7 +482,10 @@ fn privacy_modes_matrix() {
             pairs.push(Some((a, b)));
         }
     }
-    println!("\nroom of a public host and two peers A, B in each mode: A-B links ({} pairs of NAT kinds + one LAN pair)", pairs.len() - 1);
+    println!(
+        "\nroom of a public host and two peers A, B in each mode: A-B links ({} pairs of NAT kinds + one LAN pair)",
+        pairs.len() - 1
+    );
     let modes = [Privacy::Direct, Privacy::PublicOnly, Privacy::RelayOnly { via: None }];
     let mut lan = Vec::new();
     for mode in modes {

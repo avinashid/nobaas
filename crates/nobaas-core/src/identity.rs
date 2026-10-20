@@ -14,9 +14,7 @@ impl PeerId {
     /// The X25519 (Montgomery) form of this identity, used as the Noise static key.
     /// `None` if the bytes are not a valid Ed25519 point.
     pub(crate) fn noise_static(&self) -> Option<[u8; 32]> {
-        VerifyingKey::from_bytes(&self.0)
-            .ok()
-            .map(|vk| vk.to_montgomery().to_bytes())
+        VerifyingKey::from_bytes(&self.0).ok().map(|vk| vk.to_montgomery().to_bytes())
     }
 
     /// Verifies an Ed25519 signature made by this peer.
@@ -89,9 +87,7 @@ mod tests {
             let id = Identity::generate(&mut rng);
             let resolver = snow::resolvers::DefaultResolver;
             use snow::resolvers::CryptoResolver;
-            let mut dh = resolver
-                .resolve_dh(&snow::params::DHChoice::Curve25519)
-                .unwrap();
+            let mut dh = resolver.resolve_dh(&snow::params::DHChoice::Curve25519).unwrap();
             dh.set(&id.noise_private());
             assert_eq!(dh.pubkey(), &id.peer_id().noise_static().unwrap()[..]);
         }

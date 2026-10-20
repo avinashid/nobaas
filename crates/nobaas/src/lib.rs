@@ -58,14 +58,14 @@ pub mod traversal;
 
 #[cfg(feature = "tokio")]
 pub use async_node::AsyncNode;
+pub use nobaas_core::{
+    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
+};
 pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
 pub use traversal::{Failure, NatType, Privacy, Role, Side};
-pub use nobaas_core::{
-    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
-};
 
 /// An event from a [`Node`]: a peer connected or left, a message arrived, a link moved.
 pub type Event = nobaas_core::Event<std::net::SocketAddr>;

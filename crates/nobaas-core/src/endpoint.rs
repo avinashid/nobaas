@@ -122,16 +122,35 @@ pub enum DisconnectReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event<A> {
-    Connected { peer: PeerId, path: Path<A>, initiator: bool },
-    Message { peer: PeerId, lane: Lane, data: Vec<u8> },
-    Disconnected { peer: PeerId, reason: DisconnectReason },
-    ConnectFailed { peer: PeerId },
+    Connected {
+        peer: PeerId,
+        path: Path<A>,
+        initiator: bool,
+    },
+    Message {
+        peer: PeerId,
+        lane: Lane,
+        data: Vec<u8>,
+    },
+    Disconnected {
+        peer: PeerId,
+        reason: DisconnectReason,
+    },
+    ConnectFailed {
+        peer: PeerId,
+    },
     /// A link moved: relayed to direct after a hole punch, direct to relayed
     /// after the direct path went silent, or to a new address (roaming).
-    PathChanged { peer: PeerId, path: Path<A> },
+    PathChanged {
+        peer: PeerId,
+        path: Path<A>,
+    },
     /// A directly connected peer reports the address it sees us at (our
     /// public, server-reflexive address when we are behind a NAT).
-    AddrObserved { by: PeerId, addr: A },
+    AddrObserved {
+        by: PeerId,
+        addr: A,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1401,9 +1420,7 @@ fn initiator_hs(
     peer: &PeerId,
 ) -> Result<(HandshakeState, Vec<u8>), snow::Error> {
     let remote_static = peer.noise_static().ok_or(snow::Error::Input)?;
-    let mut hs = crypto::builder(seed, local_private)?
-        .remote_public_key(&remote_static)?
-        .build_initiator()?;
+    let mut hs = crypto::builder(seed, local_private)?.remote_public_key(&remote_static)?.build_initiator()?;
     let mut buf = [0u8; 256];
     let n = hs.write_message(me.as_bytes(), &mut buf)?;
     Ok((hs, buf[..n].to_vec()))

@@ -204,7 +204,13 @@ pub unsafe extern "C" fn nb_stats(h: *const NbEndpoint, out: *mut u64) {
 
 /// `lane`: 0 reliable, 1 unreliable, 2 urgent (reliable, each fragment sent twice).
 #[no_mangle]
-pub unsafe extern "C" fn nb_send(h: *mut NbEndpoint, peer_id: *const u8, lane: u32, data: *const u8, len: usize) -> i32 {
+pub unsafe extern "C" fn nb_send(
+    h: *mut NbEndpoint,
+    peer_id: *const u8,
+    lane: u32,
+    data: *const u8,
+    len: usize,
+) -> i32 {
     let Some(p) = peer(peer_id) else { return NB_ERR_INVALID };
     let lane = match lane {
         0 => Lane::Reliable,
@@ -238,7 +244,13 @@ pub unsafe extern "C" fn nb_poll_timeout(h: *const NbEndpoint) -> i64 {
 /// Writes the next datagram into `buf` (at least `MAX_DATAGRAM` = 1232 bytes)
 /// and its destination handle into `out_addr`. Returns its length, 0 if none.
 #[no_mangle]
-pub unsafe extern "C" fn nb_poll_transmit(h: *mut NbEndpoint, now_us: u64, out_addr: *mut u32, buf: *mut u8, cap: usize) -> i32 {
+pub unsafe extern "C" fn nb_poll_transmit(
+    h: *mut NbEndpoint,
+    now_us: u64,
+    out_addr: *mut u32,
+    buf: *mut u8,
+    cap: usize,
+) -> i32 {
     if cap < nobaas_core::MAX_DATAGRAM {
         return NB_ERR_BUFFER;
     }
@@ -328,7 +340,14 @@ pub unsafe extern "C" fn nb_poll_event(h: *mut NbEndpoint, buf: *mut u8, cap: us
 /// Seals `len` bytes to peer `to` (see `nobaas_core::sealed`). Returns the sealed
 /// length, or `-(needed)` if `cap` is too small, or NB_ERR_TOO_LARGE.
 #[no_mangle]
-pub unsafe extern "C" fn nb_seal(h: *mut NbEndpoint, to: *const u8, data: *const u8, len: usize, out: *mut u8, cap: usize) -> i32 {
+pub unsafe extern "C" fn nb_seal(
+    h: *mut NbEndpoint,
+    to: *const u8,
+    data: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> i32 {
     let Some(to) = peer(to) else { return NB_ERR_INVALID };
     let needed = len + nobaas_core::sealed::SEAL_OVERHEAD;
     if len > nobaas_core::sealed::MAX_SEALED {
@@ -353,7 +372,14 @@ pub unsafe extern "C" fn nb_seal(h: *mut NbEndpoint, to: *const u8, data: *const
 /// `out_from` and the plaintext to `out` (at least `len` bytes). Returns the
 /// plaintext length, or NB_ERR_INVALID if it isn't for us or was tampered with.
 #[no_mangle]
-pub unsafe extern "C" fn nb_open(h: *const NbEndpoint, data: *const u8, len: usize, out_from: *mut u8, out: *mut u8, cap: usize) -> i32 {
+pub unsafe extern "C" fn nb_open(
+    h: *const NbEndpoint,
+    data: *const u8,
+    len: usize,
+    out_from: *mut u8,
+    out: *mut u8,
+    cap: usize,
+) -> i32 {
     if cap < len {
         return NB_ERR_BUFFER;
     }
@@ -461,7 +487,10 @@ mod tests {
             let (mut from, mut pt) = ([0u8; 32], vec![0u8; 256]);
             assert_eq!(nb_open(b, sealed.as_ptr(), n as usize, from.as_mut_ptr(), pt.as_mut_ptr(), pt.len()), 3);
             assert_eq!((&from, &pt[..3]), (&ida, &b"sdp"[..]));
-            assert_eq!(nb_open(c, sealed.as_ptr(), n as usize, from.as_mut_ptr(), pt.as_mut_ptr(), pt.len()), NB_ERR_INVALID);
+            assert_eq!(
+                nb_open(c, sealed.as_ptr(), n as usize, from.as_mut_ptr(), pt.as_mut_ptr(), pt.len()),
+                NB_ERR_INVALID
+            );
             // Nostr keys sign verifiably.
             let (mut nsk, mut npk, mut sig) = ([0u8; 32], [0u8; 32], [0u8; 64]);
             assert_eq!(nb_nostr_keypair([5u8; 32].as_ptr(), nsk.as_mut_ptr(), npk.as_mut_ptr()), 0);

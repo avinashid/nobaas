@@ -1,7 +1,9 @@
 use crate::signaling::Signaling;
 use crate::traversal::{Failure, NatType, Privacy, Role, Signal, Traversal};
 use crate::Event;
-use nobaas_core::{Config, ConnectError, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError, Transmit};
+use nobaas_core::{
+    Config, ConnectError, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError, Transmit,
+};
 use rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -236,7 +238,8 @@ impl Node {
             }
         }
         let relay = self.trav.relay();
-        if matches!(self.privacy(), Privacy::RelayOnly { .. }) && relay != Some(inv.peer) && inv.peer != self.peer_id() {
+        if matches!(self.privacy(), Privacy::RelayOnly { .. }) && relay != Some(inv.peer) && inv.peer != self.peer_id()
+        {
             let r = relay.filter(|r| self.ep.is_connected(r)).ok_or(Error::Connect(ConnectError::NoRelay))?;
             targets = vec![Path::Via(r)];
         }
@@ -508,10 +511,7 @@ fn local_addresses(local: SocketAddr) -> Vec<SocketAddr> {
 
 /// Resolves `host:port` names, keeping the first address of the socket's family.
 fn resolve(servers: &[String], v6: bool) -> Vec<SocketAddr> {
-    servers
-        .iter()
-        .filter_map(|s| s.to_socket_addrs().ok()?.find(|a| a.is_ipv6() == v6))
-        .collect()
+    servers.iter().filter_map(|s| s.to_socket_addrs().ok()?.find(|a| a.is_ipv6() == v6)).collect()
 }
 
 /// The address of the interface the default route leaves by. `connect` on a UDP

@@ -105,7 +105,8 @@ fn port_restricted_nat_drops_unsolicited_and_expires_mappings() {
 #[test]
 fn mapping_expires_without_keepalive() {
     let mut sim = Sim::new(NetConfig::default(), 2);
-    let config = Config { keepalive: Duration::from_secs(40), idle_timeout: Duration::from_secs(120), ..Config::default() };
+    let config =
+        Config { keepalive: Duration::from_secs(40), idle_timeout: Duration::from_secs(120), ..Config::default() };
     let server = sim.add_node(config.clone());
     let nat = sim.add_nat(NatConfig::port_restricted(), None);
     let client = sim.add_node_behind(nat, config);
@@ -255,7 +256,8 @@ fn symmetric_pair_stays_relayed_and_works() {
 #[test]
 fn direct_path_failure_falls_back_to_relay() {
     let pr = Kind::Nat("pr", NatConfig::port_restricted());
-    let config = Config { keepalive: Duration::from_secs(2), direct_timeout: Duration::from_secs(5), ..Config::default() };
+    let config =
+        Config { keepalive: Duration::from_secs(2), direct_timeout: Duration::from_secs(5), ..Config::default() };
     let (mut sim, r, a, b) = trio(&pr, &pr, config, 7);
     sim.connect_via(a, r, b, &[]).unwrap();
     assert!(sim.run_until(Duration::from_secs(5), |s| connected(s, a, b) && is_direct(s, a, b)));
@@ -446,10 +448,7 @@ fn nat_matrix() {
     // Cone NATs on both sides must always go direct.
     for a in ["full-cone", "restricted", "port-restr", "cgnat(pr+pr)"] {
         for b in ["public", "full-cone", "restricted", "port-restr", "cgnat(pr+pr)"] {
-            let (ka, kb) = (
-                ks.iter().find(|k| k.name() == a).unwrap(),
-                ks.iter().find(|k| k.name() == b).unwrap(),
-            );
+            let (ka, kb) = (ks.iter().find(|k| k.name() == a).unwrap(), ks.iter().find(|k| k.name() == b).unwrap());
             assert!(run_pair(ka, kb, 0, 7).direct, "{a} x {b} should go direct");
         }
     }

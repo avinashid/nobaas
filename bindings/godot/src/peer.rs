@@ -1,9 +1,9 @@
 use crate::session::{Mode, NetOptions, PeerEvent, PutError, Session, Status};
-use nobaas::{Failure, NatType, Node, PeerId, Privacy};
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
 use godot::prelude::*;
+use nobaas::{Failure, NatType, Node, PeerId, Privacy};
 
 /// A `MultiplayerPeer` over Nobaas: Godot's `@rpc`, `MultiplayerSynchronizer` and
 /// `MultiplayerSpawner` with no server. One instance hosts (peer 1); the others

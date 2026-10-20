@@ -71,10 +71,8 @@ fn same_inputs_give_bit_identical_hashes_every_tick() {
 #[test]
 fn replay_golden_hash() {
     let hashes = replay(&mut Peer::new(None), &input_log());
-    let digest = hashes
-        .iter()
-        .flatten()
-        .fold(0u64, |acc, &(id, crc)| acc.rotate_left(5) ^ ((id as u64) << 16 | crc as u64));
+    let digest =
+        hashes.iter().flatten().fold(0u64, |acc, &(id, crc)| acc.rotate_left(5) ^ ((id as u64) << 16 | crc as u64));
     assert_eq!(hashes[TICKS - 1].len(), PLAYERS.div_ceil(MAX_ISLAND_PLAYERS));
     assert_eq!(digest, GOLDEN_DIGEST, "digest {digest:#018x}");
 }

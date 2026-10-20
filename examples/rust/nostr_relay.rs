@@ -70,7 +70,8 @@ fn handle(id: u64, text: &str, clients: &Clients) {
     match (m.first().and_then(Value::as_str), m.get(1)) {
         (Some("REQ"), Some(Value::String(sub))) => {
             let tags = m.get(2).and_then(|f| f.get("#p")).and_then(Value::as_array);
-            let tags = tags.map(|t| t.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            let tags =
+                tags.map(|t| t.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
             if let Some(c) = clients.get_mut(&id) {
                 c.subs.insert(sub.clone(), tags);
             }

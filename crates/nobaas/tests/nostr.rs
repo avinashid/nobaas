@@ -3,7 +3,7 @@
 #[path = "../../../examples/rust/nostr_relay.rs"]
 mod relay;
 
-use nobaas::{NostrSignaling, Node, Signaling, Status, Topic};
+use nobaas::{Node, NostrSignaling, Signaling, Status, Topic};
 use std::time::{Duration, Instant};
 
 fn wait(secs: u64, mut done: impl FnMut() -> bool) -> bool {

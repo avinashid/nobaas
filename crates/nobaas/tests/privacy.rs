@@ -24,7 +24,12 @@ fn mock_stun(mapped: SocketAddr) -> SocketAddr {
 }
 
 /// Polls the nodes until `done` or `secs` pass, keeping every event per node.
-fn pump(nodes: &mut [&mut Node], events: &mut [Vec<Event>], secs: u64, mut done: impl FnMut(&[&mut Node]) -> bool) -> bool {
+fn pump(
+    nodes: &mut [&mut Node],
+    events: &mut [Vec<Event>],
+    secs: u64,
+    mut done: impl FnMut(&[&mut Node]) -> bool,
+) -> bool {
     let end = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < end {
         for (n, ev) in nodes.iter_mut().zip(events.iter_mut()) {
@@ -85,7 +90,8 @@ fn public_only_invites_hold_no_lan_or_loopback_address() {
     assert!(addrs(&n.invite()).contains(&lo));
 
     // Without STUN, a public-only node bound to every interface gives out nothing.
-    let quiet = Node::builder().stun_servers(Vec::<String>::new()).privacy(Privacy::PublicOnly).bind("0.0.0.0:0").unwrap();
+    let quiet =
+        Node::builder().stun_servers(Vec::<String>::new()).privacy(Privacy::PublicOnly).bind("0.0.0.0:0").unwrap();
     assert_eq!(addrs(&quiet.invite()), vec![]);
     let all = Node::builder().stun_servers(Vec::<String>::new()).bind("0.0.0.0:0").unwrap();
     assert!(addrs(&all.invite()).iter().all(private), "only LAN and loopback to leave out");
@@ -134,10 +140,13 @@ fn relay_only_room_peers_link_through_the_host() {
     pump(&mut [&mut h, &mut a, &mut b], &mut ev, 2, |_| false);
     assert!(via_h(&a, &bid) && via_h(&b, &aid), "still relayed: never punched to a direct path");
     assert!(matches!(a.path(&hid), Some(Path::Direct(_))) && matches!(b.path(&hid), Some(Path::Direct(_))));
-    let got: Vec<&[u8]> = ev[2].iter().filter_map(|e| match e {
-        Event::Message { peer, data, .. } if *peer == aid => Some(&data[..]),
-        _ => None,
-    }).collect();
+    let got: Vec<&[u8]> = ev[2]
+        .iter()
+        .filter_map(|e| match e {
+            Event::Message { peer, data, .. } if *peer == aid => Some(&data[..]),
+            _ => None,
+        })
+        .collect();
     assert_eq!(got, vec![&b"psst"[..]]);
     // Every link event between A and B names the relay, never an address.
     for (mine, theirs) in [(1, bid), (2, aid)] {

@@ -28,7 +28,8 @@ fn run(nodes: &mut [&mut Node], ms: u64, mut each: impl FnMut(&mut [&mut Node]))
 #[test]
 fn sec_room_topic_only() {
     let hub = MemoryHub::new();
-    let node = || Node::builder().stun_servers(Vec::<String>::new()).signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
+    let node =
+        || Node::builder().stun_servers(Vec::<String>::new()).signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
     let mut client = node();
     client.join_room_as("my-game", "k3J9-xQ72-Lm0p-Zt8w-R4vB", Role::Client);
     let topic = Topic::room("my-game", "k3J9-xQ72-Lm0p-Zt8w-R4vB");
@@ -60,7 +61,8 @@ fn sec_room_topic_only() {
 #[test]
 fn room_nodes_close_links_from_non_members() {
     let hub = MemoryHub::new();
-    let node = || Node::builder().stun_servers(Vec::<String>::new()).signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
+    let node =
+        || Node::builder().stun_servers(Vec::<String>::new()).signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
     let mut member = node();
     member.join_room("app", "private");
     let mut outsider = Node::builder().stun_servers(Vec::<String>::new()).bind("127.0.0.1:0").unwrap();
@@ -87,17 +89,21 @@ fn room_nodes_close_links_from_non_members() {
 #[test]
 fn members_link_and_clients_can_pin_their_host() {
     let hub = MemoryHub::new();
-    let node = || Node::builder().stun_servers(Vec::<String>::new()).signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
+    let node =
+        || Node::builder().stun_servers(Vec::<String>::new()).signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
     let (mut h1, mut h2, mut c) = (node(), node(), node());
     h1.join_room_as("app", "room", Role::Host);
     h2.join_room_as("app", "room", Role::Host);
     c.join_room_with("app", "room", Role::Client, Some(h2.peer_id()));
     let (p1, p2) = (h1.peer_id(), h2.peer_id());
     let events = run(&mut [&mut h1, &mut h2, &mut c], 2500, |_| {});
-    let linked: Vec<_> = events.iter().filter_map(|(i, e)| match e {
-        Event::Connected { peer, .. } if *i == 2 => Some(*peer),
-        _ => None,
-    }).collect();
+    let linked: Vec<_> = events
+        .iter()
+        .filter_map(|(i, e)| match e {
+            Event::Connected { peer, .. } if *i == 2 => Some(*peer),
+            _ => None,
+        })
+        .collect();
     assert_eq!(linked, vec![p2]);
     assert_eq!((c.room_role(&p2), c.room_role(&p1)), (Some(Role::Host), None));
 }

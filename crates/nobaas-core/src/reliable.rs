@@ -346,7 +346,17 @@ impl RelSend {
             let dup_at = urgent.then_some(now + URGENT_GAP);
             self.inflight.insert(
                 seq,
-                Fragment { fin, data, sent_at: now, due: now + self.rto, tries: 1, fast: false, probed: false, urgent, dup_at },
+                Fragment {
+                    fin,
+                    data,
+                    sent_at: now,
+                    due: now + self.rto,
+                    tries: 1,
+                    fast: false,
+                    probed: false,
+                    urgent,
+                    dup_at,
+                },
             );
             sent_new = true;
             self.fragments_sent += 1;

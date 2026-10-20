@@ -115,10 +115,7 @@ impl Vec2Q16 {
     }
 
     pub const fn from_ints(x: i32, y: i32) -> Self {
-        Self {
-            x: q16_from_i32(x),
-            y: q16_from_i32(y),
-        }
+        Self { x: q16_from_i32(x), y: q16_from_i32(y) }
     }
 }
 
@@ -208,11 +205,7 @@ impl PlayerEntityQ16 {
     /// Input bitmask flags (`bit 0 = +X, bit 1 = -X, bit 2 = +Y, bit 3 = -Y, bit 4 = dash`).
     pub fn step_physics(&mut self, input_bits: u16, arena_max_q16: Q16_16) {
         self.last_input_bits = input_bits;
-        let speed = if (input_bits & 0x10) != 0 {
-            q16_from_i32(4)
-        } else {
-            q16_from_i32(2)
-        };
+        let speed = if (input_bits & 0x10) != 0 { q16_from_i32(4) } else { q16_from_i32(2) };
         let mut vx = 0;
         let mut vy = 0;
         if (input_bits & 0x01) != 0 {
@@ -304,9 +297,5 @@ pub fn find_byzantine_desync_peers(peer_crcs: &[(u16, u16)]) -> Vec<u16> {
     if maj_count * 3 < peer_crcs.len() * 2 {
         return Vec::new();
     }
-    peer_crcs
-        .iter()
-        .filter(|(_, crc)| *crc != majority_crc)
-        .map(|(pid, _)| *pid)
-        .collect()
+    peer_crcs.iter().filter(|(_, crc)| *crc != majority_crc).map(|(pid, _)| *pid).collect()
 }

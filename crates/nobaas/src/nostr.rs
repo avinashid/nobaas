@@ -399,8 +399,13 @@ fn connect(url: &str) -> io::Result<Ws> {
     } else {
         Box::new(tcp.try_clone()?)
     };
-    let config = WebSocketConfig { max_message_size: Some(MAX_MESSAGE), max_frame_size: Some(MAX_MESSAGE), ..Default::default() };
-    let (ws, _) = tungstenite::client::client_with_config(url, stream, Some(config)).map_err(|e| io::Error::other(e.to_string()))?;
+    let config = WebSocketConfig {
+        max_message_size: Some(MAX_MESSAGE),
+        max_frame_size: Some(MAX_MESSAGE),
+        ..Default::default()
+    };
+    let (ws, _) = tungstenite::client::client_with_config(url, stream, Some(config))
+        .map_err(|e| io::Error::other(e.to_string()))?;
     tcp.set_read_timeout(Some(READ_SLICE))?;
     Ok(ws)
 }
@@ -500,11 +505,22 @@ mod tests {
     fn relay_messages_are_parsed_defensively() {
         let (tx, rx) = sync_channel(4);
         let shared = Shared::default();
-        for junk in ["", "{}", "[]", r#"["EVENT"]"#, r#"["EVENT","s",{"kind":1}]"#, r#"["EVENT","s",{"kind":25059,"tags":[["e","x"]]}]"#] {
+        for junk in [
+            "",
+            "{}",
+            "[]",
+            r#"["EVENT"]"#,
+            r#"["EVENT","s",{"kind":1}]"#,
+            r#"["EVENT","s",{"kind":25059,"tags":[["e","x"]]}]"#,
+        ] {
             on_relay_message(junk, &tx, &shared);
         }
         // An id that isn't the event's hash: dropped.
-        on_relay_message(r#"["EVENT","s",{"id":"i","pubkey":"p","created_at":1,"kind":25059,"tags":[["p","t"]],"content":"c"}]"#, &tx, &shared);
+        on_relay_message(
+            r#"["EVENT","s",{"id":"i","pubkey":"p","created_at":1,"kind":25059,"tags":[["p","t"]],"content":"c"}]"#,
+            &tx,
+            &shared,
+        );
         assert!(rx.try_recv().is_err());
         let key = SigningKey::from_bytes(&[7u8; 32]).unwrap();
         let pubkey = hex(&key.verifying_key().to_bytes());
@@ -542,7 +558,9 @@ mod tests {
         let mut ws = connect(&url).unwrap();
         let err = loop {
             match ws.read() {
-                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    continue
+                }
                 other => break other,
             }
         };
