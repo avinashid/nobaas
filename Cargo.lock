@@ -464,6 +464,7 @@ dependencies = [
 name = "nobaas-sim"
 version = "0.1.0"
 dependencies = [
+ "nobaas",
  "nobaas-core",
  "nobaas-game",
  "rand_chacha",

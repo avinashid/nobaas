@@ -18,7 +18,7 @@
 //! 4. Where punching can't work (symmetric NATs on both sides), each also dials
 //!    through a peer both are connected to ([`Path::Via`]); core moves the link
 //!    off the relay if a direct path turns up. With no such peer the dial fails
-//!    with [`Failure::BothSymmetric`]: there is no TURN server, by design.
+//!    with [`Failure::Symmetric`]: there is no TURN server, by design.
 
 use crate::signaling::{hex, unhex, Topic};
 use nobaas_core::{sealed, stun, Address, Endpoint, Event, Identity, Instant, Path, PeerId, Transmit};
@@ -83,9 +83,11 @@ pub enum Role {
 pub enum Failure {
     /// No handshake answer on any address: the peer is gone, or a firewall drops UDP.
     Unreachable,
-    /// Both peers are behind symmetric NATs and no peer connected to both could
-    /// relay. Nobaas has no TURN server; a third peer in the room fixes it.
-    BothSymmetric,
+    /// One peer is behind a symmetric NAT and the other behind one that only lets
+    /// in replies (port-restricted or symmetric), so punching can't work, and no
+    /// peer connected to both could relay. Nobaas has no TURN server; a third peer
+    /// in the room that both can reach fixes it.
+    Symmetric,
 }
 
 /// Something the host must do on its signaling carrier.
@@ -277,14 +279,11 @@ impl<A: Address> Traversal<A> {
                 }
             }
             Event::ConnectFailed { peer } => {
-                let both = self.nat == NatType::Symmetric;
+                let mine = self.nat;
                 let r = self.remotes.entry(*peer).or_default();
                 r.seen_at = now;
-                r.failure = Some(if both && r.nat == NatType::Symmetric {
-                    Failure::BothSymmetric
-                } else {
-                    Failure::Unreachable
-                });
+                let sym = |a: NatType, b: NatType| a == NatType::Symmetric && b != NatType::Open;
+                r.failure = Some(if sym(mine, r.nat) || sym(r.nat, mine) { Failure::Symmetric } else { Failure::Unreachable });
             }
             Event::AddrObserved { addr, .. } => {
                 let loopback = addr.to_socket_addr().is_some_and(|s| s.ip().is_loopback());
