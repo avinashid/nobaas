@@ -4,6 +4,8 @@
 // top as usual. Every datagram is posted to the whole channel, so this suits a
 // few peers in one process or one browser, not a network.
 
+import { isPeerId } from './nobaas.js';
+
 export class LocalTransport {
   constructor(endpoint, signaling) {
     this.ep = endpoint;
@@ -16,7 +18,7 @@ export class LocalTransport {
       if (peer) signaling.send(peer, { kind: 'dg', bytes });
     };
     signaling.onMessage((from, msg) => {
-      if (msg.kind === 'dg' && msg.bytes instanceof Uint8Array) this.ep.receive(this.handle(from), msg.bytes);
+      if (isPeerId(from) && msg.kind === 'dg' && msg.bytes instanceof Uint8Array) this.ep.receive(this.handle(from), msg.bytes);
     });
   }
 
@@ -31,6 +33,7 @@ export class LocalTransport {
   }
 
   dial(peer) {
+    if (!isPeerId(peer)) throw new TypeError('dial: not a peer id (64 lowercase hex characters)');
     if (!this.byPeer.has(peer)) this.ep.connect(this.handle(peer), peer);
   }
 

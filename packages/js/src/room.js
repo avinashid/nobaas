@@ -14,7 +14,7 @@
 // room.poll() / room.receive() return queued events as plain objects (strings,
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
 
-import { loadNobaas, Lane } from './nobaas.js';
+import { loadNobaas, Lane, isPeerId } from './nobaas.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
 import { NostrSignaling } from './nostr.js';
 import { LocalTransport } from './local.js';
@@ -227,7 +227,8 @@ export class Room {
   }
 
   onHello(peer) {
-    if (this.left || this.transport.has(peer)) return;
+    // A custom signalling adapter may pass anything along: only PeerIds are dialled.
+    if (this.left || !isPeerId(peer) || peer === this.self || this.transport.has(peer)) return;
     // Answer a newcomer's hello once, so it learns about us too.
     if (!this.greeted.has(peer)) {
       this.greeted.add(peer);

@@ -77,6 +77,7 @@ step "wasm size+imports" wasm_check
 step "node glue" node packages/js/test/node_pair.mjs
 step "node privacy" node packages/js/test/privacy.mjs
 step "node room" node packages/js/test/room_node.mjs
+step "node peer ids" node packages/js/test/peer_id.mjs
 
 if [ $quick = 1 ]; then
   skip "browser" "--quick"

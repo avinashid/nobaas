@@ -13,6 +13,8 @@
 // Same interface as BroadcastSignaling: id, hello(meta), onHello, send(to, body),
 // onMessage(fn), close().
 
+import { isPeerId } from './nobaas.js';
+
 const KIND = 25059;
 export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
 
@@ -91,7 +93,8 @@ export class NostrSignaling {
     try {
       if (tag === this.roomTag) {
         const h = JSON.parse(dec.decode(unb64(ev.content)));
-        if (h.t === 'hello' && h.from !== this.id) this.onHello(h.from, h.meta);
+        // Anyone who knows the room name can publish a hello: check `from` is a PeerId.
+        if (h.t === 'hello' && isPeerId(h.from) && h.from !== this.id) this.onHello(h.from, h.meta);
       } else if (tag === this.myTag) {
         const opened = this.ep.open(unb64(ev.content));
         if (!opened) return; // not for us, or tampered: ignore
@@ -109,6 +112,7 @@ export class NostrSignaling {
   }
 
   async send(to, body) {
+    if (!isPeerId(to)) throw new TypeError('send: `to` must be a peer id (64 lowercase hex characters)');
     const sealed = this.ep.seal(to, enc.encode(JSON.stringify(body)));
     if (!sealed) return;
     await this.publish(hex(await sha256(enc.encode(`nobaas/peer/${to}`))), b64(sealed));

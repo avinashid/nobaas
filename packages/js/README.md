@@ -151,6 +151,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_node.mjs`: `joinRoom` with three peers in Node: presence,
   message types, lanes, targeted sends, backpressure, leaving, a late joiner and
   the pull-style `poll()`/`receive()`/`sendTo()` path.
+- `node packages/js/test/peer_id.mjs`: untrusted peer ids. A malformed or over-long id
+  throws a `TypeError` before any copy into wasm memory, and every signalling layer
+  drops a `from` that isn't 64 lowercase hex characters.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

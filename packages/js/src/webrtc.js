@@ -9,6 +9,8 @@
 // Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
 // messages are JSON-able objects. See BroadcastSignaling below.
 
+import { isPeerId } from './nobaas.js';
+
 // Removes `host` candidates (LAN, loopback, mDNS .local names) from an SDP, keeping
 // server-reflexive (public, from STUN) and relay ones.
 export function withoutHostCandidates(sdp) {
@@ -29,7 +31,7 @@ export class WebRtcTransport {
   //     no relay-only path to a peer that isn't linked to `relay`.
   constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
-    if (privacy === 'relay-only' && !relay) throw new Error("privacy 'relay-only' needs a relay peer id");
+    if (privacy === 'relay-only' && !isPeerId(relay)) throw new TypeError("privacy 'relay-only' needs a relay peer id");
     this.ep = endpoint;
     this.Pc = RTCPeerConnection;
     this.privacy = privacy;
@@ -91,6 +93,7 @@ export class WebRtcTransport {
 
   // Opens a DataChannel to `peer` and, once open, runs the Nobaas handshake.
   async dial(peer) {
+    if (!isPeerId(peer)) throw new TypeError('dial: not a peer id (64 lowercase hex characters)');
     if (!this.allowed(peer)) throw new Error('relay-only: reach this peer with endpoint.connectVia(relay, peer)');
     if (this.byPeer.has(peer)) return;
     const l = this.link(peer);
@@ -101,7 +104,8 @@ export class WebRtcTransport {
   }
 
   async onSignal(from, msg) {
-    if (!this.allowed(from)) return;
+    // Signalling is untrusted: a `from` that isn't a PeerId never gets a link.
+    if (!isPeerId(from) || !msg || !this.allowed(from)) return;
     // Only an offer opens a link; answers and candidates for a dropped one are stale.
     if (msg.kind !== 'offer' && !this.byPeer.has(from)) return;
     if (msg.kind === 'offer') {
@@ -172,7 +176,8 @@ export class BroadcastSignaling {
     this.onHello = () => {};
     this.ch.onmessage = (e) => {
       const m = e.data;
-      if (m.from === this.id) return;
+      // Any script on the origin can post here: drop anything without a PeerId `from`.
+      if (!m || !isPeerId(m.from) || m.from === this.id) return;
       if (m.kind === 'hello') return this.onHello(m.from, m.meta);
       if (m.to !== this.id) return;
       for (const h of this.handlers) h(m.from, m.body);
@@ -183,6 +188,7 @@ export class BroadcastSignaling {
     this.ch.postMessage({ kind: 'hello', from: this.id, meta });
   }
   send(to, body) {
+    if (!isPeerId(to)) throw new TypeError('send: `to` must be a peer id (64 lowercase hex characters)');
     this.ch.postMessage({ kind: 'msg', from: this.id, to, body });
   }
   onMessage(fn) {

@@ -181,6 +181,8 @@ export interface Nobaas {
 
 export declare function loadNobaas(source: string | URL | BufferSource): Promise<Nobaas>;
 
+/** Every method that takes a peer throws a TypeError unless it is 32 bytes or 64 lowercase hex
+ * characters: ids from signalling are untrusted and never reach wasm memory unchecked. */
 export declare class Endpoint {
   readonly peerId: Uint8Array;
   readonly id: PeerId;
@@ -210,6 +212,10 @@ export declare function toHex(bytes: Uint8Array): string;
 /** Removes `host` candidates (LAN, loopback, mDNS) from an SDP. */
 export declare function withoutHostCandidates(sdp: string): string;
 export declare function fromHex(hex: string): Uint8Array;
+/** Whether `id` is a PeerId as text: 64 lowercase hex characters. Check ids from signalling with it. */
+export declare function isPeerId(id: unknown): id is PeerId;
+/** A PeerId as 32 bytes; throws a TypeError unless `id` is 32 bytes or 64 lowercase hex characters. */
+export declare function peerBytes(id: PeerId | Uint8Array): Uint8Array;
 
 export interface Transport {
   dial(peer: PeerId): void | Promise<void>;
