@@ -8,7 +8,9 @@
 //! cargo run -p nobaas --features nostr --example natcheck -- room <name> v6   # the same, over IPv6
 //! ```
 //!
-//! Uses the default public STUN servers (Google, Cloudflare) and Nostr relays only.
+//! Uses the default public STUN servers (Google, Cloudflare) and Nostr relays only. The
+//! router check only asks the LAN gateway what it supports (SSDP search, NAT-PMP
+//! external-address query); it never creates a mapping.
 
 use nobaas::{Event, Lane, NatType, Node, NostrSignaling, Path, DEFAULT_STUN_SERVERS};
 use nobaas_core::stun;
@@ -17,21 +19,18 @@ use std::time::{Duration, Instant};
 
 /// STUN targets for the port-pattern probe. Google's hostnames all resolve to
 /// one address, so the distinct destinations come from extra ports instead:
-/// two server IPs and five IP:port pairs in all, interleaved so consecutive
-/// requests go to different IPs.
-const PROBE_SERVERS: &[&str] = &[
-    "stun.l.google.com:19302",
-    "stun.cloudflare.com:3478",
-    "stun.l.google.com:3478",
-    "stun.cloudflare.com:53",
-    "stun.cloudflare.com:443",
-];
+/// two server IPs and four IP:port pairs in all, interleaved so consecutive
+/// requests go to different IPs. Not port 53: carriers and routers intercept
+/// DNS, and in the field it went unanswered or came back from another address.
+const PROBE_SERVERS: &[&str] =
+    &["stun.l.google.com:19302", "stun.cloudflare.com:3478", "stun.l.google.com:3478", "stun.cloudflare.com:443"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     probe(false)?;
     probe(true)?;
+    router()?;
     match args.as_slice() {
         [] => Ok(()),
         ["room", room] => meet(room, false),
@@ -115,7 +114,18 @@ fn verdict(local: SocketAddr, mapped: &[(SocketAddr, SocketAddr)]) -> String {
         };
     }
     let ips: Vec<IpAddr> = mapped.iter().map(|(_, m)| m.ip()).collect();
-    let multi_ip = if ips.iter().any(|ip| *ip != ips[0]) { "; public IP varies by destination" } else { "" };
+    let mut distinct = ips.clone();
+    distinct.sort();
+    distinct.dedup();
+    if mapped.iter().all(|(_, m)| m.port() == first.port()) {
+        return format!(
+            "port kept for every destination{}, but the public IP varies across {} addresses \
+             (an address pool without paired pooling)",
+            if first.port() == local.port() { " (preserved)" } else { "" },
+            distinct.len()
+        );
+    }
+    let multi_ip = if distinct.len() > 1 { "; public IP varies by destination" } else { "" };
     // Same mapping for every port of one server IP means the NAT keys on the address only.
     let per_ip = mapped.iter().all(|(d, m)| mapped.iter().filter(|(d2, _)| d2.ip() == d.ip()).all(|(_, m2)| m2 == m));
     let shared = mapped.iter().any(|(d, _)| mapped.iter().filter(|(d2, _)| d2.ip() == d.ip()).count() > 1);
@@ -139,6 +149,99 @@ fn verdict(local: SocketAddr, mapped: &[(SocketAddr, SocketAddr)]) -> String {
         _ => format!("random ports, deltas {deltas:?}"),
     };
     format!("symmetric{keyed}; {kind}{multi_ip}")
+}
+
+/// Asks the LAN for a port-mapping service, without creating a mapping: an SSDP
+/// search for a UPnP Internet Gateway Device, and a NAT-PMP external-address
+/// query to the default gateway (a PCP-only router answers it with an error).
+fn router() -> Result<(), Box<dyn std::error::Error>> {
+    println!("== router port mapping (read-only check) ==");
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_read_timeout(Some(Duration::from_millis(300)))?;
+    for st in
+        ["urn:schemas-upnp-org:device:InternetGatewayDevice:1", "urn:schemas-upnp-org:device:InternetGatewayDevice:2"]
+    {
+        let search = format!(
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {st}\r\n\r\n"
+        );
+        sock.send_to(search.as_bytes(), "239.255.255.250:1900")?;
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < until {
+        let mut buf = [0u8; 1500];
+        let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+        let text = String::from_utf8_lossy(&buf[..n]);
+        let header = |name: &str| {
+            text.lines()
+                .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim()))
+                .unwrap_or("?")
+                .to_string()
+        };
+        let line = format!("{from}  {}  {}", header("ST"), header("LOCATION"));
+        if !seen.contains(&line) {
+            println!("  UPnP IGD:  {line}  ({})", header("SERVER"));
+            seen.push(line);
+        }
+    }
+    if seen.is_empty() {
+        println!("  UPnP IGD:  no answer (UPnP off, or not supported)");
+    }
+    match gateway() {
+        None => println!("  NAT-PMP:   no default gateway found"),
+        Some(gw) => {
+            let mut answer = None;
+            for wait in [250, 500, 1000] {
+                sock.set_read_timeout(Some(Duration::from_millis(wait)))?;
+                sock.send_to(&[0, 0], (gw, 5351))?;
+                let mut buf = [0u8; 64];
+                if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                    if from.ip() == IpAddr::V4(gw) {
+                        answer = Some(buf[..n].to_vec());
+                        break;
+                    }
+                }
+            }
+            match answer.as_deref() {
+                None => println!("  NAT-PMP:   {gw}:5351 no answer (NAT-PMP/PCP off, or not supported)"),
+                Some([0, 128, 0, 0, _, _, _, _, a, b, c, d, ..]) => {
+                    let ext = Ipv4Addr::new(*a, *b, *c, *d);
+                    let behind = ext.is_private() || ext.octets()[0] == 100 && ext.octets()[1] & 0xc0 == 64;
+                    let note = if behind { ": NOT public, so the router is itself behind another NAT" } else { "" };
+                    println!("  NAT-PMP:   {gw}:5351 supported, router's external IP {ext}{note}");
+                }
+                Some(other) => println!("  NAT-PMP:   {gw}:5351 answered {other:02x?} (likely PCP-only or refused)"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The IPv4 default gateway: from the routing table on Linux, `route` on macOS,
+/// else the conventional .1 of our own subnet.
+fn gateway() -> Option<Ipv4Addr> {
+    if let Ok(table) = std::fs::read_to_string("/proc/net/route") {
+        let gw = table.lines().skip(1).find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.get(1) == Some(&"00000000")).then(|| u32::from_str_radix(f.get(2)?, 16).ok()).flatten()
+        });
+        if let Some(gw) = gw.filter(|g| *g != 0) {
+            return Some(Ipv4Addr::from(gw.swap_bytes()));
+        }
+    }
+    if let Ok(out) = std::process::Command::new("route").args(["-n", "get", "default"]).output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(gw) = text.lines().find_map(|l| l.trim().strip_prefix("gateway:")?.trim().parse().ok()) {
+            return Some(gw);
+        }
+    }
+    match primary_ip(false)? {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            Some(Ipv4Addr::new(a, b, c, 1))
+        }
+        IpAddr::V6(_) => None,
+    }
 }
 
 fn unspecified(v6: bool) -> IpAddr {
@@ -266,6 +369,30 @@ mod tests {
         ];
         let v = verdict(a(LOCAL), &m);
         assert!(v.contains("address-dependent (one port") && v.contains("too few"), "{v}");
+    }
+
+    #[test]
+    fn field_hotspot_pool_keeps_the_port() {
+        // Jio hotspot, ab831e5 run: port kept, one destination saw another pool IP.
+        let m = [
+            (a(G1), a("152.58.117.228:60241")),
+            (a(C1), a("152.58.117.228:60241")),
+            (a(C2), a("152.58.117.166:60241")),
+        ];
+        let v = verdict(a("10.129.132.88:60241"), &m);
+        assert!(v.starts_with("port kept for every destination (preserved)") && v.contains("2 addresses"), "{v}");
+    }
+
+    #[test]
+    fn field_home_wifi_is_port_dependent_random() {
+        let m = [
+            (a(G1), a("203.145.57.120:32679")),
+            (a(C1), a("203.145.57.120:5342")),
+            (a(G2), a("203.145.57.120:24211")),
+            (a("162.159.207.0:443"), a("203.145.57.120:8499")),
+        ];
+        let v = verdict(a("192.168.1.35:45973"), &m);
+        assert!(v.contains("address-and-port-dependent") && v.contains("random"), "{v}");
     }
 
     #[test]
