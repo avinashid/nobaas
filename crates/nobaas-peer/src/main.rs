@@ -93,6 +93,13 @@ fn write_private(path: &Path, data: &[u8], new: bool) -> Res<()> {
     opts.open(path).and_then(|mut f| f.write_all(data)).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
+/// Replaces `dir/invite` through `invite.tmp` and a rename, so `check` never reads half an invite.
+fn write_invite(dir: &Path, invite: &str) -> Res<()> {
+    let (tmp, path) = (dir.join("invite.tmp"), dir.join("invite"));
+    write_private(&tmp, invite.as_bytes(), false)?;
+    fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()).into())
+}
+
 fn run() -> Res<()> {
     let bind = env("NOBAAS_BIND").unwrap_or_else(|| "127.0.0.1:7700".into());
     let max_peers: usize = env_num("NOBAAS_MAX_PEERS", 256)?;
@@ -117,12 +124,14 @@ fn run() -> Res<()> {
     let mut node = builder.bind(bind.as_str()).map_err(|e| format!("bind {bind}: {e}"))?;
     let invite = node.invite();
     if let Some(dir) = &dir {
-        write_private(&dir.join("invite"), invite.as_bytes(), false)?;
+        write_invite(dir, &invite)?;
     }
     println!("peer {} on {} (relay {relay}, max {max_peers} peers)", node.peer_id(), node.local_addr());
     println!("{invite}");
 
     let mut linked: HashSet<PeerId> = HashSet::new();
+    // Refusals are counted for the stats line, not logged one by one: a handshake flood must not fill the disk.
+    let mut refused: u64 = 0;
     let mut next_stats = Instant::now() + stats_every;
     let mut public = node.public_addr();
     loop {
@@ -131,7 +140,7 @@ fn run() -> Res<()> {
             match event {
                 Event::Connected { peer, path, .. } => {
                     if linked.len() >= max_peers {
-                        println!("refused {peer}: {max_peers} peers already linked");
+                        refused += 1;
                         node.disconnect(&peer);
                     } else {
                         linked.insert(peer);
@@ -149,7 +158,7 @@ fn run() -> Res<()> {
             public = node.public_addr();
             let invite = node.invite();
             if let Some(dir) = &dir {
-                write_private(&dir.join("invite"), invite.as_bytes(), false)?;
+                write_invite(dir, &invite)?;
             }
             println!("public address {public:?}; new invite:\n{invite}");
         }
@@ -157,8 +166,9 @@ fn run() -> Res<()> {
             next_stats += stats_every;
             let s = node.stats();
             println!(
-                "stats: {} peers, rx {} tx {} packets, relayed {} dropped {}, rx auth failed {} malformed {}",
+                "stats: {} peers, {} refused (over {max_peers}), rx {} tx {} packets, relayed {} dropped {}, rx auth failed {} malformed {}",
                 linked.len(),
+                refused,
                 s.rx_packets,
                 s.tx_packets,
                 s.relayed,

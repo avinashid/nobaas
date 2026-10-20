@@ -5,6 +5,6 @@ packages/js/pkg
 **/node_modules
 tasks
 examples/godot
-*.png
-.env
-*.key
+**/*.png
+**/.env
+**/*.key

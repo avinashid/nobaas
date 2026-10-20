@@ -38,11 +38,15 @@ data of its own:
 - First start: a new identity in `$NOBAAS_DATA/identity.key` (32 secret bytes, mode 0600). Later starts reuse it.
 - Every start: it prints its peer id and invite, and writes the invite to `$NOBAAS_DATA/invite` (0600). The invite
   carries a fresh invite key each start, so hand out the new one after a restart.
-- It accepts links from peers that hold its invite, up to `NOBAAS_MAX_PEERS`; links over that are closed. Messages
-  sent to it are dropped. It forwards packets between two peers linked to it when one asks (the core's peer relay).
+- It accepts links from anyone who knows its peer id and address (both are in the invite), up to `NOBAAS_MAX_PEERS`;
+  links over that are closed and counted. The invite key gates only signaling offers, and the peer uses no signaling
+  yet. Messages sent to it are dropped. It forwards packets between two peers linked to it when one asks (the core's peer relay).
 - `nobaas-peer check [FILE]` links to the invite in `FILE` (default `$NOBAAS_DATA/invite`) from `127.0.0.1` and exits
   0 when the handshake completes within 5 s. It is the image's `HEALTHCHECK`.
-- It logs one stats line per `NOBAAS_STATS_SECS`: links, packets, relayed and dropped, failed authentications.
+- It logs a line per link and unlink, and one stats line per `NOBAAS_STATS_SECS`: links, refused links, packets,
+  relayed and dropped, failed authentications. Refusals are only counted, so a flood of handshakes can't fill the log.
+- **The logs hold every linked peer's IP address and port**, which is personal data. Compose caps them at three
+  10 MB files per service (`logging:`); keep or ship them accordingly.
 
 | Variable | Default | |
 |---|---|---|
@@ -69,11 +73,13 @@ NOBAAS_BIND=0.0.0.0:7700 docker compose up -d peer
 ```
 
 Then it gives out its LAN/public address and loopback, learns its public address over STUN if it is behind a NAT, and
-anyone holding its invite (or its peer id and address) can link and relay through it, within the per-peer rate and
+anyone who knows its peer id and address can link and relay through it, within the per-peer rate and
 the peer cap. Relayed traffic is end-to-end encrypted between the two peers; the relay sees their addresses, packet
 sizes and timing. See [THREAT-MODEL.md](THREAT-MODEL.md).
 
-The examples server is static files only (GET and HEAD; anything else is 403). To show it on your LAN, set
+The examples server is static files only (GET and HEAD; anything else is 403; dotfiles are 403). It sends a
+Content-Security-Policy that allows only same-origin scripts, styles and wasm, `wss:` and same-origin connections, and
+no framing. To show it on your LAN, set
 `NOBAAS_EXAMPLES_PORT` and change the `127.0.0.1:` prefix of its `ports` entry; it has no TLS, so put it behind your
 own HTTPS proxy before exposing it further.
 
