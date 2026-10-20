@@ -68,6 +68,8 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `set_signaling_relays(PackedStringArray)` | Nostr relay URLs, from the next host/join. Default `wss://relay.damus.io`, `wss://nos.lol`; empty: off |
 | `set_privacy_mode(mode: int)` | Which addresses this peer gives out: `PRIVACY_DIRECT` (default), `PRIVACY_PUBLIC_ONLY`, `PRIVACY_RELAY_ONLY`. From the next host/join, and for the running session's next invites and offers; links already up are kept. See [Privacy](#privacy) |
 | `get_privacy_mode() -> int` | The mode set |
+| `set_port_mapping(on: bool)` | Ask the router to forward this peer's UDP port (PCP, NAT-PMP or UPnP), from the next host/join. **Off by default**; it opens a port on the player's router. See [Router port mapping](#router-port-mapping) |
+| `get_port_mapping() -> Dictionary` | `{state, address, protocol}`: `state` is `off`, `trying`, `mapped`, `not_public` or `unavailable`; `address` (`ip:port`) and `protocol` (`pcp`, `natpmp`, `upnp`) are `""` until the router names them. Signal `port_mapping_changed(info)` fires on each change |
 | `get_peer_key(id) -> PackedByteArray` | The 32-byte Ed25519 key that authenticated peer `id`'s link (empty if not directly connected) |
 | `set_max_peers(max: int)` / `get_max_peers()` | Host: the most joiners it keeps (default 32). Past it, a newcomer is disconnected before `peer_connected`, as with `refuse_new_connections`. Applies at once; links already up stay |
 | `get_public_key() -> PackedByteArray` | This peer's own key |
@@ -104,6 +106,40 @@ GDScript.
 ```gdscript
 multiplayer.connection_failed.connect(func(): print("could not reach the host: ", peer.get_connect_error_message()))
 ```
+
+### Router port mapping
+
+`set_port_mapping(true)` before `host*()` / `join*()` asks the player's router to forward the game's UDP port: PCP
+first, then NAT-PMP, then UPnP-IGD. Once the router says yes, the mapped `ip:port` goes into invites and offers
+like a public address. Peers can then reach this peer however its NAT maps or filters, so a host behind a
+symmetric NAT can still be reached. The mapping is renewed while the session lives and deleted on `close()` or when
+the peer is freed. The Rust side is in [`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md#router-port-mapping).
+
+```gdscript
+peer.set_port_mapping(true)                        # before host*() / join*()
+peer.port_mapping_changed.connect(func(info): print("port mapping: ", info))
+peer.host_room("my-game", room)
+# later: {state: "mapped", address: "203.0.113.7:41000", protocol: "upnp"}
+```
+
+- **When it helps:** a host on a home router with UPnP, NAT-PMP or PCP switched on, especially when the router's
+  NAT is symmetric.
+- **When it can't:**
+  - **Carrier-grade NAT** (many mobile carriers and some ISPs), where the router's own address isn't public. The
+    state goes to `not_public`, the mapping is removed and nothing is offered.
+  - **Routers with UPnP and NAT-PMP/PCP off**, and most mobile hotspots. The state goes to `unavailable`, and the
+    router is asked again every 5 minutes.
+  - **IPv6** isn't mapped.
+- **What it does to the player's network:** while the session runs, the router forwards one UDP port to the
+  player's machine from anyone on the internet, not only from peers. Anyone who finds the port reaches only the
+  Noise endpoint, the same one peers dial, but it shows up in port scans. Turn it on only when the player agrees, or behind a setting.
+  - If the game crashes, the router keeps the mapping until its lease runs out (2 hours). With a router that
+    only allows permanent UPnP leases, it keeps it until someone deletes it in the router's settings.
+  - Any device on the player's LAN can answer the mapping requests. A rogue one can report a false address, and
+    peers would then dial that address. It can't get into the game: no one can finish a handshake without the
+    peer's key.
+- **`close()` waits for the delete.** That normally takes milliseconds; against a router that stalls, it can take
+  up to 7 s.
 
 The simulator covers the whole NAT matrix (`crates/nobaas-sim/tests/traversal.rs`). Real carrier-grade NATs across
 two networks still need testing on real devices.
@@ -224,7 +260,8 @@ GODOT=godot ./examples/godot/test.sh     # headless check on loopback: invite ru
 
 `test.sh` runs a host and a joiner headless, twice: by invite, then by room through a local Nostr relay
 (`examples/rust/nostr_relay.rs`). The joiner is `--privacy=public-only` in the first run and `relay-only` in the
-second. It passes `--stun=none` and a local or no relay, so it touches no public
+second. Each host prints its port-mapping state line (`port mapping: off`; `--port-mapping` turns it on), and
+the run fails without it. It passes `--stun=none` and a local or no relay, so it touches no public
 service. The instances move by themselves and chat. Each passes once it has seen the other peer's square move and
 received its chat line:
 
@@ -251,6 +288,8 @@ binary:
 - unreliable-ordered dropping, including wrap-around;
 - a host with two joiners over loopback: id assignment, broadcast, exclude-one targeting, kick, close;
 - refusing new connections;
+- the port-mapping switch: off by default, `unavailable` on loopback, and through a fake PCP gateway on loopback
+  `mapped`, offered in the invite and deleted when the session goes;
 - a room host found by two clients (and not by a client of another room) through in-process signaling; clients
   link to the host only, and a refusing host stops being found.
 

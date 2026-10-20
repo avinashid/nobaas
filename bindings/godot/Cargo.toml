@@ -15,3 +15,7 @@ crate-type = ["cdylib"]
 nobaas = { path = "../../crates/nobaas", features = ["nostr"] }
 # 0.5.5 with the Godot 4.3 API: the extension loads in Godot 4.3 and later.
 godot = { version = "=0.5.5", features = ["api-4-3"] }
+
+[dev-dependencies]
+# Tests map a port through a fake gateway on loopback.
+nobaas = { path = "../../crates/nobaas", features = ["nostr", "testing"] }
