@@ -232,6 +232,95 @@ fn relay_refuses_when_disabled() {
     assert!(sim.nodes[r].endpoint.stats().relay_dropped > 0);
 }
 
+/// N15-1: past `max_links` the relay drops a new HS1 before its DH: the
+/// newcomer gets no answer at all, so it never gets a link to relay through.
+#[test]
+fn link_cap_refuses_a_handshake_before_answering() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut sim = Sim::new(NetConfig::default(), 12);
+    let r = sim.add_node(Config { max_links: 2, ..Config::default() });
+    let v = sim.add_node(Config::default());
+    let a = sim.add_node(Config::default());
+    let x = sim.add_node(Config::default());
+    sim.connect(v, r).unwrap();
+    sim.connect(a, r).unwrap();
+    assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, v, r) && connected(s, a, r)));
+    let (ra, xa) = (sim.addr(r), sim.addr(x));
+    let answers = Rc::new(RefCell::new(0));
+    let seen = answers.clone();
+    sim.hook = Some(Box::new(move |from, to, _| {
+        if from == ra && to == xa {
+            *seen.borrow_mut() += 1;
+        }
+        true
+    }));
+    sim.connect(x, r).unwrap();
+    sim.run_for(Duration::from_secs(30));
+    assert!(!connected(&sim, x, r));
+    assert!(sim.take_events(x).iter().any(|e| matches!(e, Event::ConnectFailed { .. })));
+    assert_eq!(*answers.borrow(), 0, "no HS2 for the third identity");
+    let st = sim.nodes[r].endpoint.stats();
+    assert!(st.rx_handshake_dropped >= 6, "{st:?}"); // every handshake attempt
+    assert_eq!(st.relayed, 0);
+    // A freed slot takes the next handshake.
+    let pa = sim.peer_id(a);
+    sim.nodes[r].endpoint.disconnect(&pa);
+    sim.run_for(Duration::from_millis(100));
+    sim.connect(x, r).unwrap();
+    assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, x, r)));
+}
+
+/// N15-2: four relay-only peers each send a victim 100 KB/s through R, under
+/// the per-link 256 KiB/s; `relay_total_rate` caps what R forwards in total.
+#[test]
+fn relay_total_rate_caps_all_links_together() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let run = |total: u64| {
+        let mut sim = Sim::new(NetConfig::default(), 13);
+        let r = sim.add_node(Config { relay_total_rate: total, ..Config::default() });
+        let v = sim.add_node(Config::default());
+        sim.connect(v, r).unwrap();
+        let senders: Vec<usize> = (0..4).map(|_| sim.add_node(Config::default())).collect();
+        for &s in &senders {
+            sim.nodes[s].endpoint.set_relay_only(true);
+            sim.connect(s, r).unwrap();
+        }
+        assert!(sim.run_until(Duration::from_secs(2), |sm| senders.iter().all(|&s| connected(sm, s, r))));
+        for &s in &senders {
+            sim.connect_via(s, r, v, &[]).unwrap();
+        }
+        assert!(sim.run_until(Duration::from_secs(2), |sm| senders.iter().all(|&s| connected(sm, s, v))));
+        let (ra, va) = (sim.addr(r), sim.addr(v));
+        let bytes = Rc::new(RefCell::new(0u64));
+        let seen = bytes.clone();
+        sim.hook = Some(Box::new(move |from, to, p| {
+            if from == ra && to == va {
+                *seen.borrow_mut() += p.len() as u64;
+            }
+            true
+        }));
+        let dropped = sim.nodes[r].endpoint.stats().relay_dropped;
+        for _ in 0..300 {
+            for &s in &senders {
+                sim.send(s, v, Lane::Unreliable, &[7; 1000]).unwrap();
+            }
+            sim.run_for(Duration::from_millis(10));
+        }
+        let got = *bytes.borrow();
+        (got, sim.nodes[r].endpoint.stats().relay_dropped - dropped)
+    };
+    let (free, free_dropped) = run(0);
+    let (capped, capped_dropped) = run(64 << 10);
+    println!("3 s at 400 KB/s offered: {free} bytes relayed uncapped, {capped} capped at 64 KiB/s");
+    assert!(free > 1_100_000 && free_dropped == 0, "{free} {free_dropped}");
+    // 3 s at 64 KiB/s plus the 16 KiB burst, and a little for R's own traffic to V.
+    assert!(capped < 3 * (64 << 10) + (16 << 10) + 20_000, "{capped}");
+    assert!(capped > 2 * (64 << 10), "{capped}");
+    assert!(capped_dropped > 500, "{capped_dropped}");
+}
+
 #[test]
 fn symmetric_pair_stays_relayed_and_works() {
     let sym = Kind::Nat("sym", NatConfig::symmetric_random());

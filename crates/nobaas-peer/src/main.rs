@@ -14,9 +14,10 @@
 //! | `NOBAAS_BIND` | `127.0.0.1:7700` | UDP address; `0.0.0.0:7700` to be reachable from other hosts |
 //! | `NOBAAS_DATA` | unset | directory for `identity.key` and `invite`; unset: a new identity each run |
 //! | `NOBAAS_STUN` | the default servers | `host:port` list, comma-separated; `none` turns STUN off. Never used on loopback |
-//! | `NOBAAS_MAX_PEERS` | `256` | links over this many are closed |
+//! | `NOBAAS_MAX_PEERS` | `256` | most links at once; handshakes past it go unanswered |
 //! | `NOBAAS_RELAY` | `1` | `0` stops relaying for others |
 //! | `NOBAAS_RELAY_RATE` | `262144` | bytes per second each peer may have relayed |
+//! | `NOBAAS_RELAY_TOTAL` | `8388608` | bytes per second relayed for all peers together; `0` no limit |
 //! | `NOBAAS_STATS_SECS` | `60` | how often to log a stats line; `0` never |
 
 use nobaas::{Config, Event, Identity, Node, PeerId, DEFAULT_STUN_SERVERS};
@@ -107,6 +108,9 @@ fn run() -> Res<()> {
     let config = Config {
         relay: env("NOBAAS_RELAY").as_deref() != Some("0"),
         relay_rate: env_num("NOBAAS_RELAY_RATE", Config::default().relay_rate)?,
+        relay_total_rate: env_num("NOBAAS_RELAY_TOTAL", 8 << 20)?,
+        // The core refuses handshakes past the cap before doing any work for them.
+        max_links: max_peers,
         ..Config::default()
     };
     let relay = config.relay;
@@ -139,6 +143,7 @@ fn run() -> Res<()> {
         while let Some(event) = node.try_recv_event() {
             match event {
                 Event::Connected { peer, path, .. } => {
+                    // A backstop: the core's `max_links` already turns these away.
                     if linked.len() >= max_peers {
                         refused += 1;
                         node.disconnect(&peer);
@@ -166,9 +171,10 @@ fn run() -> Res<()> {
             next_stats += stats_every;
             let s = node.stats();
             println!(
-                "stats: {} peers, {} refused (over {max_peers}), rx {} tx {} packets, relayed {} dropped {}, rx auth failed {} malformed {}",
+                "stats: {} peers, {} refused (over {max_peers}), {} handshakes dropped, rx {} tx {} packets, relayed {} dropped {}, rx auth failed {} malformed {}",
                 linked.len(),
                 refused,
+                s.rx_handshake_dropped,
                 s.rx_packets,
                 s.tx_packets,
                 s.relayed,

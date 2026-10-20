@@ -28,6 +28,7 @@ services:
       NOBAAS_STUN: ${NOBAAS_STUN:-}
       NOBAAS_MAX_PEERS: ${NOBAAS_MAX_PEERS:-256}
       NOBAAS_RELAY_RATE: ${NOBAAS_RELAY_RATE:-262144}
+      NOBAAS_RELAY_TOTAL: ${NOBAAS_RELAY_TOTAL:-8388608}
     volumes:
       - peer-data:/data
     init: true
