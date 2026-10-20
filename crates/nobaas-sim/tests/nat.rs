@@ -271,6 +271,69 @@ fn link_cap_refuses_a_handshake_before_answering() {
     assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, x, r)));
 }
 
+/// N15-6: half-open handshakes don't hold `max_links`. Four identities send R
+/// an HS1 and never see its HS2; a fifth peer still links.
+#[test]
+fn half_open_handshakes_dont_hold_the_link_cap() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut sim = Sim::new(NetConfig::default(), 14);
+    let r = sim.add_node(Config { max_links: 4, ..Config::default() });
+    let dead: Vec<usize> = (0..4).map(|_| sim.add_node(Config::default())).collect();
+    let l = sim.add_node(Config::default());
+    let ra = sim.addr(r);
+    let blocked: Rc<RefCell<Vec<SimAddr>>> = Rc::new(RefCell::new(dead.iter().map(|&d| sim.addr(d)).collect()));
+    let b = blocked.clone();
+    sim.hook = Some(Box::new(move |from, to, _| !(from == ra && b.borrow().contains(&to))));
+    for &d in &dead {
+        sim.connect(d, r).unwrap();
+    }
+    sim.run_for(Duration::from_millis(500));
+    sim.connect(l, r).unwrap();
+    assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, l, r)));
+    assert!(dead.iter().all(|&d| !connected(&sim, d, r)));
+    assert_eq!(sim.nodes[r].endpoint.stats().rx_handshake_dropped, 0);
+}
+
+/// N15-6: the cap is checked again when an inbound handshake completes. X and Y
+/// both pass the HS1 check for R's last slot; Y's link is announced first, so
+/// X's first data packet, which asks R to relay a dial to V, is dropped whole.
+#[test]
+fn link_cap_drops_a_handshake_that_completes_past_it() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut sim = Sim::new(NetConfig::default(), 15);
+    let r = sim.add_node(Config { max_links: 2, ..Config::default() });
+    let v = sim.add_node(Config::default());
+    let x = sim.add_node(Config::default());
+    let y = sim.add_node(Config::default());
+    sim.connect(v, r).unwrap();
+    assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, v, r)));
+    // Hold X's and Y's data packets (type 3, low nibble) to R until each is released.
+    let (ra, xa, ya) = (sim.addr(r), sim.addr(x), sim.addr(y));
+    let held = Rc::new(RefCell::new(vec![xa, ya]));
+    let h = held.clone();
+    sim.hook = Some(Box::new(move |from, to, p| !(to == ra && p[0] & 0x0f == 3 && h.borrow().contains(&from))));
+    sim.connect(x, r).unwrap();
+    sim.connect(y, r).unwrap();
+    let (pr, pv) = (sim.peer_id(r), sim.peer_id(v));
+    let both = |s: &mut Sim| s.nodes[x].endpoint.is_connected(&pr) && s.nodes[y].endpoint.is_connected(&pr);
+    assert!(sim.run_until(Duration::from_secs(2), both), "both handshakes answered");
+    held.borrow_mut().retain(|&a| a != ya);
+    sim.send(y, r, Lane::Reliable, b"hi").unwrap();
+    assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, y, r)));
+    let relayed = sim.nodes[r].endpoint.stats().relayed;
+    sim.connect_via(x, r, v, &[]).unwrap();
+    held.borrow_mut().clear();
+    sim.run_for(Duration::from_secs(5));
+    assert!(!sim.nodes[r].endpoint.is_connected(&sim.peer_id(x)));
+    assert!(!sim.nodes[v].endpoint.is_connected(&sim.peer_id(x)));
+    assert!(sim.nodes[r].endpoint.is_connected(&pv) && connected(&sim, y, r));
+    let st = sim.nodes[r].endpoint.stats();
+    assert_eq!(st.relayed, relayed, "nothing relayed for X");
+    assert_eq!(st.rx_handshake_dropped, 1, "{st:?}");
+}
+
 /// N15-2: four relay-only peers each send a victim 100 KB/s through R, under
 /// the per-link 256 KiB/s; `relay_total_rate` caps what R forwards in total.
 #[test]
@@ -319,6 +382,22 @@ fn relay_total_rate_caps_all_links_together() {
     assert!(capped < 3 * (64 << 10) + (16 << 10) + 20_000, "{capped}");
     assert!(capped > 2 * (64 << 10), "{capped}");
     assert!(capped_dropped > 500, "{capped_dropped}");
+}
+
+/// A tiny `relay_total_rate` still relays: the node bucket's burst is at least
+/// one relayed packet, though a quarter of 400 B/s is smaller than an HS1.
+#[test]
+fn relay_total_burst_holds_at_least_one_packet() {
+    let mut sim = Sim::new(NetConfig::default(), 16);
+    let r = sim.add_node(Config { relay_total_rate: 400, ..Config::default() });
+    let a = sim.add_node(Config::default());
+    let b = sim.add_node(Config::default());
+    sim.connect(a, r).unwrap();
+    sim.connect(b, r).unwrap();
+    assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, a, r) && connected(s, b, r)));
+    sim.connect_via(a, r, b, &[]).unwrap();
+    assert!(sim.run_until(Duration::from_secs(10), |s| connected(s, a, b)));
+    assert!(sim.nodes[r].endpoint.stats().relayed > 0);
 }
 
 #[test]

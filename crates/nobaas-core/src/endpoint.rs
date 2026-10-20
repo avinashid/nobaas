@@ -39,10 +39,13 @@ pub struct Config {
     pub handshake_timeout: Duration,
     /// Cap on half-open responder handshakes (flood protection).
     pub max_pending_handshakes: usize,
-    /// Cap on links: announced links plus half-open responder handshakes. Past
-    /// it a new HS1 is dropped before the responder's DH, so nothing is relayed
-    /// for it. At the cap even a linked peer that re-dials waits until its old
-    /// link times out, since its identity is only known after the DH.
+    /// Cap on announced links. At it a new HS1 is dropped before the
+    /// responder's DH, and an inbound handshake that completes once the cap is
+    /// reached is dropped on its first data packet, before any of it is acted
+    /// on, so nothing is relayed past the cap. Half-open handshakes don't count
+    /// (`max_pending_handshakes` bounds them). At the cap even a linked peer that
+    /// re-dials waits until its old link times out, since its identity is only
+    /// known after the DH. Links we dial ourselves are not capped.
     pub max_links: usize,
     pub max_message: usize,
     /// Per-link cap on reliable bytes queued or unacknowledged.
@@ -57,7 +60,7 @@ pub struct Config {
     pub relay_rate: u64,
     pub relay_burst: u64,
     /// Bytes per second we relay for all peers together, with a burst of a
-    /// quarter of that. 0: no node-wide limit.
+    /// quarter of that (at least one relayed packet). 0: no node-wide limit.
     pub relay_total_rate: u64,
     /// Relayed packets queued per outgoing link; the oldest is dropped when full.
     pub relay_queue: usize,
@@ -834,9 +837,7 @@ impl<A: Address> Endpoint<A> {
             }
             return Some(idx);
         }
-        if self.half_open.len() >= self.config.max_pending_handshakes
-            || self.peers.len() + self.half_open.len() >= self.config.max_links
-        {
+        if self.half_open.len() >= self.config.max_pending_handshakes || self.peers.len() >= self.config.max_links {
             self.stats.rx_handshake_dropped += 1;
             return None;
         }
@@ -984,6 +985,17 @@ impl<A: Address> Endpoint<A> {
             return None;
         };
         link.replay.commit(nonce);
+        // The link cap again for an inbound handshake that completed while the
+        // last slot filled: refuse it before any frame is acted on.
+        if !link.announced
+            && !link.initiator
+            && self.peers.len() >= self.config.max_links
+            && !self.peers.contains_key(&sess.peer)
+        {
+            self.stats.rx_handshake_dropped += 1;
+            self.drop_link(receiver, None);
+            return None;
+        }
         let mut path_changed = false;
         let mut reflexive = None;
         match (&from, &sess.path) {
@@ -1151,7 +1163,8 @@ impl<A: Address> Endpoint<A> {
         let total = self.config.relay_total_rate;
         if total > 0 {
             let (tokens, last) = self.relay_total;
-            let tokens = last.map_or(total / 4, |t| refill(tokens, t, now, total, total / 4));
+            let burst = (total / 4).max(MAX_RELAYED_PACKET as u64);
+            let tokens = last.map_or(burst, |t| refill(tokens, t, now, total, burst));
             self.relay_total = (tokens, Some(now));
         }
         if sl.relay_tokens < cost || (total > 0 && self.relay_total.0 < cost) {

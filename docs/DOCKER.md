@@ -55,7 +55,7 @@ data of its own:
 | `NOBAAS_BIND` | `127.0.0.1:7700` | UDP address. `0.0.0.0:7700` makes it reachable from other hosts (open that UDP port in your firewall yourself) |
 | `NOBAAS_DATA` | `/data` in the image; unset natively | where the identity and invite live; unset: a new identity each run, no files |
 | `NOBAAS_STUN` | the default servers (Google, Cloudflare) | comma-separated `host:port`; `none` turns STUN off. A loopback bind never uses STUN |
-| `NOBAAS_MAX_PEERS` | `256` | most links at once, counting handshakes under way |
+| `NOBAAS_MAX_PEERS` | `256` | most links at once (handshakes under way don't count; the core caps those at 4096) |
 | `NOBAAS_RELAY` | `1` | `0`: link but never relay |
 | `NOBAAS_RELAY_RATE` | `262144` | bytes per second each peer may have relayed (burst 64 KiB) |
 | `NOBAAS_RELAY_TOTAL` | `8388608` | bytes per second relayed for all peers together (burst a quarter of that); `0`: no limit |
