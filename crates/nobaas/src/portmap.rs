@@ -190,8 +190,17 @@ impl Mapper {
         self.send(now, Step::Pcp);
     }
 
-    /// Removes the mapping (if any) and stops: queues its delete.
+    /// Removes the mapping (if any) and stops: queues its delete. A PCP or
+    /// NAT-PMP map request still unanswered may have made one the answer to
+    /// which won't be read, so that gets a delete too, sent once.
     pub fn stop(&mut self) {
+        let unanswered = match self.step {
+            _ if self.lease.is_some() => None,
+            Step::Pcp => Some(pcp_request(self.local, self.port, &self.nonce, 0, None)),
+            Step::NatPmpMap(_) => Some(natpmp_request(self.port, 0, 0)),
+            _ => None,
+        };
+        self.transmits.extend(unanswered.map(|d| (self.gateway, d)));
         self.release();
         (self.step, self.timer) = (Step::Stopped, None);
     }
@@ -904,6 +913,38 @@ pub(crate) mod tests {
         assert_eq!(m.poll_timeout(), None);
     }
 
+    /// NPM-3: a map request sent but not answered may still have made a mapping,
+    /// so stopping then deletes it, once, by the same nonce (PCP) or port (NAT-PMP).
+    #[test]
+    fn stop_deletes_a_map_request_still_unanswered() {
+        let mut m = mapper();
+        let req = one(&mut m);
+        m.handle_timeout(t(250));
+        assert_eq!(one(&mut m), req, "retransmitted");
+        m.stop();
+        let del = one(&mut m);
+        assert_eq!((lifetime_of(&del), &del[24..42]), (0, &req[24..42]), "deleted, same nonce and port");
+        assert_eq!(m.poll_timeout(), None, "sent once");
+        m.stop();
+        assert!(sent(&mut m).is_empty(), "nothing more");
+
+        let mut m = mapper();
+        one(&mut m);
+        m.handle_datagram(t(1), GW, &[0, 129, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(one(&mut m), vec![0, 0]);
+        let mut asking_address = mapper();
+        one(&mut asking_address);
+        asking_address.handle_datagram(t(1), GW, &[0, 129, 0, 1, 0, 0, 0, 0]);
+        one(&mut asking_address);
+        asking_address.stop();
+        assert!(sent(&mut asking_address).is_empty(), "no mapping asked for yet");
+        m.handle_datagram(t(2), GW, &natpmp_addr_answer(0, EXT));
+        assert_eq!(one(&mut m), natpmp_request(PORT, PORT, LIFETIME));
+        m.stop();
+        assert_eq!(one(&mut m), natpmp_request(PORT, 0, 0), "deleted");
+        assert_eq!(m.poll_timeout(), None);
+    }
+
     #[test]
     fn natpmp_after_pcp_unsupported_version() {
         let mut m = mapper();
@@ -1189,6 +1230,26 @@ pub(crate) mod tests {
         assert_eq!(lifetime_of(&log.lock().unwrap()[1]), LIFETIME);
         drop(w);
         assert!(eventually(|| log.lock().unwrap().last().is_some_and(|r| lifetime_of(r) == 0)), "deleted on drop");
+    }
+
+    /// NPM-3: a worker stopped while its PCP request is unanswered (a router
+    /// answering in 200 ms) still deletes whatever that request mapped.
+    #[test]
+    fn worker_stopped_before_the_answer_deletes_the_request() {
+        let (gw, log) = mock_gateway(|r| {
+            (r[0] == 2 && lifetime_of(r) != 0).then(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                pcp_answer(r, 0, lifetime_of(r), SocketAddrV4::new(EXT, 41000))
+            })
+        });
+        let w = Worker::spawn(PORT, gw, "127.0.0.1:9".parse().unwrap(), [9; 20]).unwrap();
+        assert!(eventually(|| !log.lock().unwrap().is_empty()), "asked");
+        drop(w);
+        std::thread::sleep(Duration::from_secs(1));
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "the request and one delete");
+        assert_eq!(lifetime_of(&log[0]), LIFETIME);
+        assert_eq!((lifetime_of(&log[1]), &log[1][24..42]), (0, &log[0][24..42]), "deleted, same nonce");
     }
 
     #[test]
