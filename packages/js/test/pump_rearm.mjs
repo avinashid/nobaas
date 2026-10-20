@@ -15,6 +15,9 @@ const check = (ok, what) => {
 // Before the fix a throwing transport escaped from the endpoint's microtask or timer.
 let escaped = 0;
 process.on('uncaughtException', () => escaped++);
+// A swallowed exception can leave a top-level await unsettled: never exit 0 without the summary.
+let finished = false;
+process.on('exit', () => finished || (console.log('FAIL the test did not finish'), (process.exitCode = 1)));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const OUTAGE_MS = 1000; // long enough for several timer-driven retransmits to fail too
 const DEADLINE_MS = 4000; // well inside the 10 s keepalive
@@ -126,5 +129,99 @@ async function connected(a, b) {
   tb.close();
 }
 
+// 3. Security PERF1-1: a callback that closes the endpoint stops the drain at once.
+// The handle and buffers are freed by close(); polling on would read freed wasm memory.
+{
+  // Datagrams sent in one task arrive together in one later task, so one pump sees them all.
+  const link = (to, addr) => {
+    let q = null;
+    return (_, bytes) => {
+      if (!q) {
+        q = [];
+        setImmediate(() => {
+          for (const d of q.splice(0)) if (!to.closed) to.receive(addr, d);
+          q = null;
+        });
+      }
+      q.push(bytes);
+    };
+  };
+  // Counts wasm calls an endpoint makes after its close(): any is a read of its freed handle.
+  const spy = (ep) => {
+    ep.callsAfterClose = 0;
+    const x = Object.fromEntries(Object.entries(nb.x).map(([k, v]) => [k,
+      typeof v === 'function' && k !== 'nb_endpoint_free' && k !== 'nb_free'
+        ? (...args) => (ep.closed && ep.callsAfterClose++, v(...args))
+        : v]));
+    ep.nb = Object.assign(Object.create(nb), { x });
+    return ep;
+  };
+  const wire = () => {
+    const a = spy(nb.endpoint());
+    const b = spy(nb.endpoint());
+    a.onTransmit = link(b, 1);
+    b.onTransmit = link(a, 2);
+    return [a, b];
+  };
+  const big = (i) => `${i}`.padEnd(1000, '.'); // one datagram each
+
+  // close() inside onEvent, with three messages queued in one pump.
+  let [a, b] = wire();
+  a.connect(2, b.peerId);
+  check(await connected(a, b), 'close-in-onEvent pair connected');
+  let after = 0;
+  let threw = null;
+  b.onEvent = (e) => {
+    if (b.closed) after++;
+    else if (e.type === 'message') b.close();
+  };
+  b.onTransmit = () => {}; // b must not ack, so its events stay queued for one drain
+  try {
+    for (let i = 0; i < 3; i++) a.send(b.id, big(i), Lane.Reliable);
+    await sleep(100);
+  } catch (e) {
+    threw = e;
+  }
+  check(b.closed && after === 0 && b.callsAfterClose === 0 && threw === null,
+    `close() inside onEvent: ${after} events and ${b.callsAfterClose} wasm calls after it, nothing thrown`);
+  a.close();
+
+  // close() inside onTransmit, with three datagrams queued in one pump.
+  [a, b] = wire();
+  a.connect(2, b.peerId);
+  check(await connected(a, b), 'close-in-onTransmit pair connected');
+  after = 0;
+  threw = null;
+  a.onTransmit = () => (a.closed ? after++ : a.close());
+  try {
+    for (let i = 0; i < 3; i++) a.send(b.id, big(i), Lane.Reliable);
+    await sleep(100);
+  } catch (e) {
+    threw = e;
+  }
+  check(a.closed && after === 0 && a.callsAfterClose === 0 && threw === null,
+    `close() inside onTransmit: ${after} datagrams and ${a.callsAfterClose} wasm calls after it, nothing thrown`);
+  try {
+    a.close();
+    threw = null;
+  } catch (e) {
+    threw = e;
+  }
+  check(threw === null, 'a second close() is a no-op');
+  b.close();
+
+  // The module is unharmed: a fresh pair still exchanges a message.
+  [a, b] = wire();
+  const got = new Promise((r) => (b.onEvent = (e) => e.type === 'message' && r(new TextDecoder().decode(e.data))));
+  a.connect(2, b.peerId);
+  check(await connected(a, b), 'fresh pair connects afterwards');
+  a.send(b.id, 'still fine', Lane.Reliable);
+  check((await Promise.race([got, sleep(1000)])) === 'still fine', 'fresh pair exchanges a message afterwards');
+  a.close();
+  b.close();
+}
+check(escaped === 0, `no uncaught exceptions overall (${escaped})`);
+
+finished = true;
 console.log(failed ? `${failed} FAILED` : 'pump re-arm: all passed');
 process.exit(failed ? 1 : 0);

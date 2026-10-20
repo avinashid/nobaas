@@ -244,7 +244,9 @@ export class Endpoint {
   }
   // Drains datagrams and events, and always re-arms the timer: a transport or
   // handler that throws must not leave the endpoint without retransmits or keepalives.
+  // A callback may close() the endpoint: stop at once, its handle and buffers are freed.
   pump() {
+    if (this.closed) return;
     const x = this.nb.x;
     const now = nowUs();
     try {
@@ -259,6 +261,7 @@ export class Endpoint {
           // A datagram the transport couldn't take is a lost datagram; the core retransmits.
           this.transmitErrors++;
         }
+        if (this.closed) return;
       }
       for (;;) {
         let n = x.nb_poll_event(this.h, this.evBuf, this.evCap);
@@ -270,6 +273,7 @@ export class Endpoint {
           continue;
         }
         this.onEvent(decodeEvent(this.nb.mem().slice(this.evBuf, this.evBuf + n)));
+        if (this.closed) return;
       }
     } finally {
       this.arm();
@@ -290,6 +294,7 @@ export class Endpoint {
     }, delayMs);
   }
   close() {
+    if (this.closed) return; // a second close would free the handle twice
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     const x = this.nb.x;
