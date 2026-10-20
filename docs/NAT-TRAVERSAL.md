@@ -144,7 +144,13 @@ gives out. Changing it affects the next invites and offers; links already up kee
   if it hairpins, or through a relay.
 - **`RelayOnly { via }`**: no addresses at all, except to the relay, which gets the public ones (it links
   directly, so it sees the address anyway). The relay is `via`, else the room's pinned host, else the first
-  peer that proved the Host role. Offers name only the relay as a possible relay, never the node's other links.
+  peer that proved the Host role and was dialled. That pick sticks while its dial or link lasts (a later Host, of
+  any PeerId, is dialled through it, never directly) and is dropped when the dial fails, the link goes down or the
+  node joins another room. Offers name only the relay as a possible relay, never the node's other links.
+  - Without a pinned host, the relay is whoever answers first as Host, and anyone who knows the room name can do
+    that and so learn the node's IP: pin the host (`join_room_with(.., Some(host))`, Godot `join_room_host`)
+    when its key is known. The Godot binding pins `via` to the host a client adopts.
+  - The node's invite names the relay with the relay's address: its holders learn the relay's IP.
   - Offers from anyone but the relay are dialled as `Via(relay)` only. If the relay isn't linked yet, the dial
     waits and happens when it links. `Node::connect` dials `Via(relay)` only, and fails with
     `ConnectError::NoRelay` while no relay is linked. It never falls back to a direct path.
@@ -154,7 +160,8 @@ gives out. Changing it affects the next invites and offers; links already up kee
     path. Dials that name a relay drop their direct targets. A direct handshake is answered only from a peer it
     is itself dialling directly or already has a direct link with. It sends no OBSERVED frames or origin tags.
   - It sends its relayed packets in `FWD_QUIET` frames: the relay forwards them in `RELAYED` frames with no
-    origin address. (`FWD` asks the relay to say where it sees the sender, so that the far end can punch.)
+    origin address. (`FWD` asks the relay to say where it sees the sender, so that the far end can punch.) A
+    build older than `FWD_QUIET` takes frame type 11 as a protocol violation and drops the link.
   - Cost: latency `rtt(A,R) + rtt(R,B)`, and the relay uploads every relayed byte again (capped by
     `Config::relay_rate`, 256 KiB/s per requesting peer by default).
 
@@ -221,7 +228,8 @@ Crates added to `nobaas` by NAT traversal:
 - `crates/nobaas/src/traversal.rs` unit tests:
   - hello and offer round trips (versions 1 to 3), hello timestamps, truncation, browser hellos, roles;
   - offer contents in each privacy mode, the public-address classifier, relay-only dials going only through the
-    relay (and the room host as the relay), stale hellos, strangers' plain offers ignored, dialled peers answered
+    relay (and the room host as the relay), a relay-only client dialling exactly one of two Hosts directly
+    (the relay sticks), stale hellos, strangers' plain offers ignored, dialled peers answered
     once the node budget is spent;
   - room proofs: wrong key, topic used as the key, wrong role, pinned host, invited peers;
   - sealed offers turning into dials, and replay and stale drops;

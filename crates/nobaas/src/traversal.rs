@@ -233,6 +233,9 @@ pub struct Traversal<A: Address> {
     hellos: Bucket,
     offers: Bucket,
     privacy: Privacy,
+    /// The room Host a relay-only node picked as its relay (with no `via` and no
+    /// pinned host): the first it dialled. Kept while that dial or link lasts.
+    picked: Option<PeerId>,
     /// Whoever holds this, from our invite, may ask us to dial back.
     invite_key: [u8; 32],
     transmits: VecDeque<Transmit<A>>,
@@ -274,6 +277,7 @@ impl<A: Address> Traversal<A> {
             hellos: Bucket::default(),
             offers: Bucket::default(),
             privacy: Privacy::Direct,
+            picked: None,
             invite_key,
             transmits: VecDeque::new(),
             signals: VecDeque::from([Signal::Subscribe(inbox)]),
@@ -337,15 +341,12 @@ impl<A: Address> Traversal<A> {
         ep.set_relay_only(matches!(privacy, Privacy::RelayOnly { .. }));
     }
 
-    /// The peer a [`Privacy::RelayOnly`] node links through: `via`, or the room's
-    /// host (the expected one, else the first that proved the Host role).
+    /// The peer a [`Privacy::RelayOnly`] node links through: `via`, else the room's
+    /// pinned host, else the first peer that proved the Host role and was dialled.
+    /// That pick sticks while its dial or link lasts: another Host can't take over.
     pub fn relay(&self) -> Option<PeerId> {
         let Privacy::RelayOnly { via } = self.privacy else { return None };
-        let room = self.room.as_ref();
-        via.or_else(|| room?.expect).or_else(|| {
-            room?;
-            self.remotes.iter().find(|(_, r)| r.member == Some(Role::Host)).map(|(p, _)| *p)
-        })
+        via.or_else(|| self.room.as_ref()?.expect).or(self.picked)
     }
 
     /// The key this node's invites carry: an offer proved with it is from a peer
@@ -359,6 +360,7 @@ impl<A: Address> Traversal<A> {
     /// the room's name. With `host`, links with that peer only. Leaves any other room.
     pub fn join_room(&mut self, now: Instant, app_id: &str, room: &str, role: Role, host: Option<PeerId>) {
         self.leave_room();
+        self.picked = None;
         let topic = Topic::room(app_id, room);
         let key = room_key(app_id, room);
         self.signals.push_back(Signal::Subscribe(topic));
@@ -482,12 +484,16 @@ impl<A: Address> Traversal<A> {
                 }
             }
             Event::ConnectFailed { peer } => {
+                if self.picked == Some(*peer) {
+                    self.picked = None; // another Host may be tried
+                }
                 let mine = self.nat;
                 let r = self.remotes.entry(*peer).or_default();
                 r.seen_at = now;
                 let sym = |a: NatType, b: NatType| a == NatType::Symmetric && b != NatType::Open;
                 r.failure = Some(if sym(mine, r.nat) || sym(r.nat, mine) { Failure::Symmetric } else { Failure::Unreachable });
             }
+            Event::Disconnected { peer, .. } if self.picked == Some(*peer) => self.picked = None,
             Event::AddrObserved { addr, .. } => {
                 let real = dialable(addr, false); // a peer that sees us on loopback is on this host
                 if real && !self.observed.contains(addr) && !self.local.contains(addr) {
@@ -622,7 +628,11 @@ impl<A: Address> Traversal<A> {
         }
         let loopback = self.loopback;
         let addrs: Vec<A> = o.addrs.into_iter().filter(|a| dialable(a, loopback) && !self.local.contains(a)).collect();
-        let relay = self.relay();
+        let mut relay = self.relay();
+        if relay.is_none() && room && o.role == Role::Host && matches!(self.privacy, Privacy::RelayOnly { .. }) {
+            // The first proven Host this relay-only node dials becomes its relay, and stays.
+            (self.picked, relay) = (Some(from), Some(from));
+        }
         if matches!(self.privacy, Privacy::RelayOnly { .. }) && relay != Some(from) {
             // Relay-only: anyone but the relay is dialled through it, never directly
             // (or once it links, from `handle_event`).
@@ -1261,6 +1271,41 @@ mod tests {
         t.handle_signal(now, &mut ep, inbox, &offer_from(&id(5), &me, Some(&key), 1, Role::Peer, vec![there]));
         assert_eq!(dials(&mut ep, now), vec![]);
         assert_eq!(published(&mut t), 1, "answered, with no address");
+    }
+
+    /// NB-034 R1: a relay-only client's relay is the first Host it dials, and stays
+    /// so: a second Host (here with the lower PeerId, which used to win) is never
+    /// dialled directly, until the first's dial fails.
+    #[test]
+    fn relay_only_client_dials_exactly_one_host_directly() {
+        let me = id(1).peer_id();
+        let (key, inbox) = (room_key(ROOM.0, ROOM.1), Topic::peer(&me));
+        let (first_at, second_at): (SocketAddr, SocketAddr) =
+            ("198.51.100.9:4000".parse().unwrap(), "198.51.100.10:4000".parse().unwrap());
+        let (mut first, mut second) = (id(2), id(3));
+        if first.peer_id() < second.peer_id() {
+            std::mem::swap(&mut first, &mut second);
+        }
+        let (mut t, mut ep) = in_room(Role::Client, None, "10.0.0.1:7000".parse().unwrap());
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: None });
+        let now = Instant::from_millis(10);
+        t.handle_signal(now, &mut ep, inbox, &offer_from(&first, &me, Some(&key), 1, Role::Host, vec![first_at]));
+        assert_eq!(t.relay(), Some(first.peer_id()));
+        assert_eq!(dials(&mut ep, now), vec![first_at]);
+        t.handle_signal(now, &mut ep, inbox, &offer_from(&second, &me, Some(&key), 1, Role::Host, vec![second_at]));
+        assert_eq!(t.relay(), Some(first.peer_id()), "the relay doesn't switch");
+        assert_eq!(dials(&mut ep, now), vec![], "the second Host is not dialled at its address");
+        assert!(sent_offers(&mut t, &second).iter().all(|o| o.addrs.is_empty() && o.relays.is_empty()));
+        // Once the first dial fails, the next Host may be picked.
+        t.handle_event(now, &mut ep, &Event::ConnectFailed { peer: first.peer_id() });
+        assert_eq!(t.relay(), None);
+        let later = now + SENDER_REFILL;
+        t.handle_signal(later, &mut ep, inbox, &offer_from(&second, &me, Some(&key), 2, Role::Host, vec![second_at]));
+        assert_eq!(t.relay(), Some(second.peer_id()));
+        assert_eq!(dials(&mut ep, later), vec![second_at]);
+        // A pinned `via` overrides any pick.
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: Some(first.peer_id()) });
+        assert_eq!(t.relay(), Some(first.peer_id()));
     }
 
     /// NB-032: a stale or replayed-later hello is dropped.

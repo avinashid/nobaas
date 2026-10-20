@@ -177,6 +177,10 @@ peer gives out beyond that:
 | `PRIVACY_PUBLIC_ONLY` | public addresses only: no LAN or loopback address | public addresses only. Players on the host's LAN then reach it through the router (if it supports hairpinning) |
 | `PRIVACY_RELAY_ONLY` | its public addresses to the host only, and nothing to anyone else (its own invite names no address) | as `PRIVACY_PUBLIC_ONLY`: the host is the relay, and every player links to it directly |
 
+Under `PRIVACY_RELAY_ONLY` a room player's relay is the first peer that proves it hosts the room; anyone who knows
+the room name can claim that and so learn the player's IP. Use `join_room_host()` when the host's key is known. A
+player's own invite names the host as its relay, with the host's address.
+
 ```gdscript
 peer.set_privacy_mode(NobaasMultiplayerPeer.PRIVACY_PUBLIC_ONLY)   # before host*() / join*(), or any time
 ```

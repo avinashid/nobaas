@@ -288,6 +288,8 @@ frames (inside DATA, several per packet):
 
 The overhead is 13 B of header and a 16 B tag per packet, plus 3 B (unreliable) or 8 B (reliable) per message. A
 message costs about **`s + 60` bytes** natively over IPv4. Messages sent in the same tick share one packet.
+A peer that doesn't know a frame type (an older build, before `FWD_QUIET`) takes it as a protocol violation and
+drops the link: builds before 1.0 don't promise to interoperate.
 
 ### Lanes and reliability
 
@@ -356,10 +358,14 @@ as they are):
 |---|---|---|---|
 | `Privacy::Direct` (default) | every candidate: public, LAN, loopback | direct where possible | none |
 | `Privacy::PublicOnly` | public addresses only, no LAN, loopback, CGNAT or link-local | direct where possible | peers on one LAN go through their NAT (if it hairpins) or a relay |
-| `Privacy::RelayOnly { via }` | nothing; the relay (`via`, or the room host) gets the public addresses | every link but the relay's goes `Path::Via(relay)` and never punches to direct; `connect` fails with `ConnectError::NoRelay` rather than going direct | latency `rtt(A,R) + rtt(R,B)` instead of `rtt(A,B)`; the relay uploads every relayed byte again, capped at `Config::relay_rate` (256 KiB/s) per peer |
+| `Privacy::RelayOnly { via }` | nothing; the relay (`via`, or the room host: the pinned one, else the first that proved its role) gets the public addresses | every link but the relay's goes `Path::Via(relay)` and never punches to direct; `connect` fails with `ConnectError::NoRelay` rather than going direct | latency `rtt(A,R) + rtt(R,B)` instead of `rtt(A,B)`; the relay uploads every relayed byte again, capped at `Config::relay_rate` (256 KiB/s) per peer |
 
 Under `RelayOnly` the relay sees both ends' addresses (it links to both directly), and is asked, with `FWD_QUIET`,
-not to tell the far end where it sees this node. In the simulator (`privacy_modes_matrix`, a room with a public host
+not to tell the far end where it sees this node. A relay-only node's invite names its relay with the relay's
+address, so whoever holds the invite learns the relay's (the host's) IP. In a room without a pinned host
+(`join_room_with(.., Some(host))`, Godot `join_room_host`) the relay is whichever member first proves the Host role
+and is dialled: anyone who knows the room name can claim it and learn this node's IP. It stays the relay while its
+link is up, so pin the host when its key is known. In the simulator (`privacy_modes_matrix`, a room with a public host
 and 37 pairs of peers): Direct links 25 pairs directly and relays 12, PublicOnly 24 and 13 (the LAN pair goes through
 the host), RelayOnly 0 and 37. None fail. In the Godot binding, players link only with the host anyway, so they
 never see each other's addresses in any mode. Browsers: `privacy: 'public-only'` drops `host` ICE candidates;

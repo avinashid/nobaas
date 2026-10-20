@@ -488,6 +488,7 @@ impl Session {
                     if self.host_peer.is_none() && self.room.is_some() && self.node.room_role(&peer) == Some(Role::Host) {
                         // The first peer to link that proved it hosts this room is ours.
                         self.host_peer = Some(peer);
+                        self.set_privacy(self.node.privacy()); // a relay-only client keeps it as its relay
                         self.node.leave_room();
                     } else if Some(peer) != self.host_peer {
                         self.node.disconnect(&peer); // joiners only talk to the host
@@ -851,6 +852,20 @@ mod tests {
         a.target = HOST_ID;
         a.put(b"hi").unwrap();
         assert!(pump(&mut [&mut host, &mut a], |s| s[0].available() == 1));
+    }
+
+    /// NB-034 R2: a relay-only room client keeps its host as its relay once it
+    /// adopts it (and leaves the room): its invite names the host as the relay.
+    #[test]
+    fn relay_only_room_client_keeps_its_host_as_relay() {
+        let hub = MemoryHub::new();
+        let node = |p| Node::builder().signaling(hub.connect()).privacy(p).bind("127.0.0.1:0").unwrap();
+        let mut host = Session::host_room(node(Privacy::Direct), "nb-test", "godot-relay");
+        let mut a = Session::join_room(node(Privacy::RelayOnly { via: None }), "nb-test", "godot-relay", None);
+        assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
+        assert_eq!(a.node.privacy(), Privacy::RelayOnly { via: Some(host.public_key()) });
+        let inv = Invite::<SocketAddr>::parse(&a.invite()).unwrap();
+        assert_eq!((inv.addrs.len(), inv.relays.iter().map(|r| r.0).collect::<Vec<_>>()), (0, vec![host.public_key()]));
     }
 
     #[test]
