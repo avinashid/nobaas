@@ -4,3 +4,4 @@ export { loadNobaas, Endpoint, Lane, EventKind, decodeEvent, toHex, fromHex } fr
 export { WebRtcTransport, BroadcastSignaling, withoutHostCandidates } from './webrtc.js';
 export { NostrSignaling, DEFAULT_RELAYS } from './nostr.js';
 export { LocalTransport } from './local.js';
+export { randomRoomId } from './proof.js';
