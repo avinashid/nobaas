@@ -145,7 +145,7 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
   const seen = [];
   sig.onHello = (from) => seen.push(from);
   let n = 0;
-  const event = (from) => ['EVENT', 'sub', { id: `e${n++}`, kind: 25059, pubkey: 'x', tags: [['p', sig.roomTag]], content: btoa(JSON.stringify({ t: 'hello', from, meta: {} })) }];
+  const event = (from) => ['EVENT', 'sub', { id: (n++).toString(16).padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.roomTag]], content: btoa(JSON.stringify({ t: 'hello', from, meta: {} })) }];
   for (const from of hostile) sig.onRelay('test', JSON.stringify(event(from)));
   sig.onRelay('test', JSON.stringify(event(other.id)));
   check(seen.length === 1 && seen[0] === other.id, 'NostrSignaling drops hellos with bad froms, keeps a good one');
@@ -203,10 +203,10 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
   sig.onHello = (from) => hellos.push(from);
   const big = btoa(JSON.stringify({ t: 'hello', from: other.id, meta: { pad: 'x'.repeat(70000) } }));
   const before = nb.x.memory.buffer.byteLength;
-  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'big1', kind: 25059, pubkey: 'x', tags: [['p', sig.roomTag]], content: big }]));
-  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'big2', kind: 25059, pubkey: 'x', tags: [['p', sig.myTag]], content: 'A'.repeat(1 << 20) }]));
+  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'b1'.padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.roomTag]], content: big }]));
+  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'b2'.padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.myTag]], content: 'A'.repeat(1 << 20) }]));
   check(hellos.length === 0 && opens === 0 && nb.x.memory.buffer.byteLength === before, 'NostrSignaling skips content over 64 KiB (hello and sealed)');
-  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'small', kind: 25059, pubkey: 'x', tags: [['p', sig.myTag]], content: btoa('x'.repeat(200)) }]));
+  sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'c1'.padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.myTag]], content: btoa('x'.repeat(200)) }]));
   check(opens === 1, 'NostrSignaling still opens small sealed content');
   sig.close();
 }
