@@ -20,6 +20,23 @@ python3 -m http.server -d packages/js 8000     # any static server
 Signalling is untrusted by design: whatever carries the offers, the Nobaas Noise
 handshake over the DataChannel proves each side holds its PeerId.
 
+## Privacy
+
+A WebRTC peer sees the IP addresses in your ICE candidates and, once linked, the
+one your packets come from. `new WebRtcTransport(ep, sig, { privacy })` picks what
+it is given:
+
+- `'direct'` (default): every candidate.
+- `'public-only'`: no `host` candidates (LAN, loopback, mDNS `.local` names), in
+  trickled ICE and in the SDP. Only what STUN reports goes out, so two tabs on one
+  machine with no STUN server can't link this way.
+- `'relay-only'` with `relay: <peer id>`: WebRTC runs with the relay only (also
+  public-only); offers from anyone else are ignored and `dial()` to them throws.
+  Reach other peers with `endpoint.connectVia(relay, peer)`: the endpoint is
+  relay-only (`Endpoint.setRelayOnly`), so those links never punch to a direct
+  path, and the relay is asked not to pass on your address. The relay sees both
+  ends. There is no TURN: a peer not linked to the relay can't be reached.
+
 ## Trying it
 
 - Same browser: open `demo/index.html` or the arena pages in several tabs.
@@ -33,6 +50,8 @@ handshake over the DataChannel proves each side holds its PeerId.
 Run these with Node and the Playwright install on this host:
 
 - `node packages/js/test/node_pair.mjs`: two endpoints in Node, checks the glue.
+- `node packages/js/test/privacy.mjs`: host-candidate filtering, and a relay-only
+  endpoint linking through a relay and refusing a direct dial.
 - `node packages/js/test/browser.mjs [tabs] [shot.png]`: mesh of tabs, RTT and throughput.
 - `node packages/js/test/arena.mjs [players] [secs] [shot.png|-]`: the arena. `LOSS=0.1`
   drops datagrams. Checks that every island agrees on its lockstep state.

@@ -35,6 +35,15 @@
 //! punch, a peer connected to both relays. See [`traversal`]. The `nostr` feature
 //! adds `NostrSignaling`, over public Nostr relays.
 //!
+//! # Privacy
+//!
+//! Directly linked peers see each other's IP address. [`Privacy`] ([`Builder::privacy`],
+//! [`Node::set_privacy`]) picks what a node gives out besides: every address, public
+//! ones only (no LAN or loopback), or none, linking only through a relay
+//! ([`Privacy::RelayOnly`]). Invites carry a key, and a node dials back only peers
+//! that hold its invite, share its room, or that it dialled: a PeerId alone gets
+//! nothing.
+//!
 //! With the `tokio` feature, [`AsyncNode`] wraps a `Node` and waits on the socket
 //! and timers itself: `node.next_event().await`.
 
@@ -52,9 +61,9 @@ pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]
 pub use nostr::NostrSignaling;
 pub use signaling::{MemoryHub, MemorySignaling, Signaling, Topic};
-pub use traversal::{Failure, NatType, Role};
+pub use traversal::{Failure, NatType, Privacy, Role};
 pub use nobaas_core::{
-    Config, ConnectError, DisconnectReason, Identity, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
+    Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
 };
 
 /// An event from a [`Node`]: a peer connected or left, a message arrived, a link moved.

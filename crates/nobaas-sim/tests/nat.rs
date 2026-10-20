@@ -163,6 +163,58 @@ fn relayed_dial_then_punch_goes_direct() {
     println!("relayed connect {t_conn:?}, direct after {t_direct:?}, relay carried {relayed_before} packets");
 }
 
+/// NB-034: a relay-only endpoint's relayed links stay relayed, whichever side
+/// dials, though a direct path would work: no packet ever goes between the two
+/// peers' addresses, and the relay doesn't tag its packets with its address.
+#[test]
+fn relay_only_links_stay_relayed() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    for a_dials in [true, false] {
+        let mut sim = Sim::new(NetConfig::default(), 11);
+        let r = sim.add_node(Config::default());
+        let a = sim.add_node(Config::default());
+        let b = sim.add_node(Config::default());
+        sim.nodes[a].endpoint.set_relay_only(true);
+        sim.connect(a, r).unwrap();
+        sim.connect(b, r).unwrap();
+        assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, a, r) && connected(s, b, r)));
+        let (aa, ba) = (sim.addr(a), sim.addr(b));
+        let direct = Rc::new(RefCell::new(0));
+        let seen = direct.clone();
+        sim.hook = Some(Box::new(move |from, to, _| {
+            if (from == aa && to == ba) || (from == ba && to == aa) {
+                *seen.borrow_mut() += 1;
+            }
+            true
+        }));
+        let (x, y) = if a_dials { (a, b) } else { (b, a) };
+        // The dialler also offers A's address; a relay-only A still doesn't punch.
+        sim.connect_via(x, r, y, &[sim.addr(y)]).unwrap();
+        assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, a, b)));
+        for k in 0..50u32 {
+            sim.send(a, b, Lane::Reliable, &k.to_le_bytes()).unwrap();
+            sim.send(b, a, Lane::Reliable, &k.to_le_bytes()).unwrap();
+        }
+        sim.run_for(Duration::from_secs(20));
+        assert!(connected(&sim, a, b));
+        assert_eq!(sim.path(a, b), Some(Path::Via(sim.peer_id(r))), "a_dials {a_dials}");
+        assert_eq!(sim.path(b, a), Some(Path::Via(sim.peer_id(r))), "a_dials {a_dials}");
+        assert_eq!(messages(&sim.take_events(b)).len(), 50);
+        let (sa, sb) = (sim.nodes[a].endpoint.stats(), sim.nodes[b].endpoint.stats());
+        assert_eq!((sa.punches_sent, sa.punch_succeeded, sb.punch_succeeded), (0, 0, 0));
+        if a_dials {
+            // B learned no candidate for A: from the relay's tag or anywhere else.
+            assert_eq!(sb.punches_sent, 0);
+            assert_eq!(*direct.borrow(), 0, "no packet between A and B directly");
+        } else {
+            // B dialled A's address itself (it had it); A never answered there.
+            assert!(sim.nodes[a].endpoint.stats().tx_packets > 0);
+            assert_eq!(sim.path(a, b), Some(Path::Via(sim.peer_id(r))));
+        }
+    }
+}
+
 #[test]
 fn relay_refuses_when_disabled() {
     let mut sim = Sim::new(NetConfig::default(), 5);

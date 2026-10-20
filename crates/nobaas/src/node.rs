@@ -1,5 +1,5 @@
 use crate::signaling::Signaling;
-use crate::traversal::{Failure, NatType, Role, Signal, Traversal};
+use crate::traversal::{Failure, NatType, Privacy, Role, Signal, Traversal};
 use crate::Event;
 use nobaas_core::{Config, ConnectError, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError, Transmit};
 use rand_core::{OsRng, RngCore};
@@ -58,6 +58,7 @@ pub struct Builder {
     config: Config,
     stun: Vec<String>,
     signaling: Option<Box<dyn Signaling>>,
+    privacy: Privacy,
 }
 
 impl Builder {
@@ -88,6 +89,13 @@ impl Builder {
         self
     }
 
+    /// Which addresses the node gives out. Default: [`Privacy::Direct`]. See
+    /// [`Node::set_privacy`].
+    pub fn privacy(mut self, privacy: Privacy) -> Self {
+        self.privacy = privacy;
+        self
+    }
+
     /// Binds the UDP socket (`"0.0.0.0:0"` for any interface and a free port).
     pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
         let sock = UdpSocket::bind(addr)?;
@@ -96,12 +104,13 @@ impl Builder {
         let identity = self.identity.unwrap_or_else(|| Identity::generate(&mut OsRng));
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
-        let ep = Endpoint::new(&identity, self.config, seed);
+        let mut ep = Endpoint::new(&identity, self.config, seed);
         // A socket on loopback can't reach STUN servers anyway.
         let stun = if local.ip().is_loopback() { Vec::new() } else { resolve(&self.stun, local.is_ipv6()) };
         OsRng.fill_bytes(&mut seed);
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-        let trav = Traversal::new(&identity, seed, unix_ms, local_addresses(local), stun);
+        let mut trav = Traversal::new(&identity, seed, unix_ms, local_addresses(local), stun);
+        trav.set_privacy(&mut ep, self.privacy);
         let mut node = Node {
             sock,
             local,
@@ -152,6 +161,7 @@ impl Node {
             config: Config::default(),
             stun: DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
             signaling: None,
+            privacy: Privacy::Direct,
         }
     }
 
@@ -165,15 +175,34 @@ impl Node {
         self.local
     }
 
-    /// An `nb:` invite with this node's [`addresses`](Node::addresses). It holds no secret.
+    /// An `nb:` invite with this node's [`addresses`](Node::addresses) (under
+    /// [`Privacy::RelayOnly`], none: its relay instead, for joiners linked to it).
+    /// It also carries this node's invite key: a holder may ask it, over
+    /// signaling, to dial back. Share it with those you want to link with.
     pub fn invite(&self) -> String {
-        Invite { peer: self.peer_id(), addrs: self.addresses(), relays: Vec::new() }.to_link()
+        let relays = match self.trav.relay() {
+            Some(r) => self.ep.path(&r).and_then(|p| p.direct()).map(|a| (r, *a)).into_iter().collect(),
+            None => Vec::new(),
+        };
+        Invite { peer: self.peer_id(), key: Some(self.trav.invite_key()), addrs: self.addresses(), relays }.to_link()
+    }
+
+    /// Which addresses this node gives out.
+    pub fn privacy(&self) -> Privacy {
+        self.trav.privacy()
+    }
+
+    /// Changes which addresses this node gives out, from the next offer and
+    /// invite on. Links already up are kept, on the path they have: to stop a
+    /// peer knowing an address it already has, disconnect it.
+    pub fn set_privacy(&mut self, privacy: Privacy) {
+        self.trav.set_privacy(&mut self.ep, privacy);
     }
 
     /// Addresses a peer may reach this node at, as put in [`invite`](Node::invite):
     /// the public address from STUN, any public address connected peers have
     /// reported, and the bound address (or, when bound to any interface, the LAN
-    /// and loopback addresses).
+    /// and loopback addresses), as the [`Privacy`] mode allows.
     pub fn addresses(&self) -> Vec<SocketAddr> {
         self.trav.candidates()
     }
@@ -193,6 +222,10 @@ impl Node {
     /// also sends the peer this node's addresses, so the peer dials back and the
     /// handshake punches through NATs on both sides. Returns the peer's id; an
     /// [`Event::Connected`] or [`Event::ConnectFailed`] follows from [`poll`](Node::poll).
+    ///
+    /// Under [`Privacy::RelayOnly`] it dials through the relay only (the relay
+    /// itself directly), and fails with [`ConnectError::NoRelay`] while no relay
+    /// is connected: it never falls back to a direct path.
     pub fn connect(&mut self, invite: &str) -> Result<PeerId, Error> {
         let inv: Invite<SocketAddr> = Invite::parse(invite).ok_or(Error::InvalidInvite)?;
         let mut targets: Vec<Path<SocketAddr>> = inv.addrs.iter().copied().map(Path::Direct).collect();
@@ -202,12 +235,17 @@ impl Node {
                 targets.push(Path::Direct(*addr));
             }
         }
+        let relay = self.trav.relay();
+        if matches!(self.privacy(), Privacy::RelayOnly { .. }) && relay != Some(inv.peer) && inv.peer != self.peer_id() {
+            let r = relay.filter(|r| self.ep.is_connected(r)).ok_or(Error::Connect(ConnectError::NoRelay))?;
+            targets = vec![Path::Via(r)];
+        }
         let now = self.now();
         self.ep.connect_with(now, inv.peer, &targets).map_err(Error::Connect)?;
         if !self.ep.is_connected(&inv.peer) {
             self.status.insert(inv.peer, Status::Connecting);
             // Also marks the peer as welcome while in a room (the offer is dropped with no carrier).
-            self.trav.introduce(now, &self.ep, inv.peer);
+            self.trav.introduce(now, &self.ep, inv.peer, inv.key);
             self.pump_signals();
         }
         Ok(inv.peer)
@@ -349,8 +387,9 @@ impl Node {
                 Event::AddrObserved { by, .. } => Some(*by),
                 Event::ConnectFailed { .. } => None,
             };
-            if let Some(peer) = about.filter(|p| self.status(p) != Status::Connected && !self.trav.admits(p)) {
-                // In a room, a link from a peer that never proved the room key: closed unseen.
+            if let Some(peer) = about.filter(|p| self.status(p) != Status::Connected && !self.admits(p, &e)) {
+                // In a room, a link from a peer that never proved the room key, or a
+                // relay-only node's new direct link to anyone but its relay: closed unseen.
                 if matches!(e, Event::Connected { .. }) {
                     self.ep.disconnect(&peer);
                 }
@@ -411,6 +450,13 @@ impl Node {
                 self.pending.push_back(t);
             }
         }
+    }
+
+    /// Whether an event about a not yet connected `peer` belongs (see `poll_drained`).
+    fn admits(&self, peer: &PeerId, e: &Event) -> bool {
+        let direct = matches!(e, Event::Connected { path: Path::Direct(_), .. });
+        let relay_only = matches!(self.privacy(), Privacy::RelayOnly { .. });
+        self.trav.admits(peer) && !(relay_only && direct && self.trav.relay() != Some(*peer))
     }
 
     /// Hands the traversal's signaling actions to the carrier (dropped without one).
@@ -508,7 +554,12 @@ mod tests {
         assert_eq!(n.connect("hello"), Err(Error::InvalidInvite));
         let own = n.invite();
         assert_eq!(n.connect(&own), Err(Error::Connect(ConnectError::SelfConnect)));
-        let empty = Invite::<SocketAddr> { peer: Node::bind("127.0.0.1:0").unwrap().peer_id(), addrs: vec![], relays: vec![] };
+        let empty = Invite::<SocketAddr> {
+            peer: Node::bind("127.0.0.1:0").unwrap().peer_id(),
+            key: None,
+            addrs: vec![],
+            relays: vec![],
+        };
         assert_eq!(n.connect(&empty.to_link()), Err(Error::Connect(ConnectError::NoPath)));
         assert_eq!(n.status(&empty.peer), Status::Disconnected);
     }

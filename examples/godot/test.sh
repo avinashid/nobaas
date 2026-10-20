@@ -2,7 +2,8 @@
 # Runs the demo headless on loopback, twice: one Godot instance hosts and a second
 # joins, first with its invite, then by room name through a local Nostr relay
 # (examples/rust/nostr_relay.rs). Passes when, in both runs, both have seen the
-# other's square move and its chat line. No public STUN or relays are used.
+# other's square move and its chat line. The joiner runs public-only in the first,
+# relay-only in the second. No public STUN or relays are used.
 # Needs a Godot 4.3+ binary: GODOT=/path/to/godot (default: godot on PATH).
 set -e
 cd "$(dirname "$0")"
@@ -40,14 +41,14 @@ run() {
 }
 
 status=0
-run invite --host="$tmp/invite" --stun=none --relay=none -- --join="$tmp/invite" --stun=none --relay=none || status=1
+run invite --host="$tmp/invite" --stun=none --relay=none -- --join="$tmp/invite" --stun=none --relay=none --privacy=public-only || status=1
 
 ../../target/release/examples/nostr_relay 127.0.0.1:0 >"$tmp/relay.url" &
 relay=$!
 wait_for "$tmp/relay.url" "the local relay did not start"
 url=$(cat "$tmp/relay.url")
 room="test-$$"
-run room --host-room="$room" --stun=none --relay="$url" -- --join-room="$room" --stun=none --relay="$url" || status=1
+run room --host-room="$room" --stun=none --relay="$url" -- --join-room="$room" --stun=none --relay="$url" --privacy=relay-only || status=1
 
 [ $status -eq 0 ] && echo "PASS" || echo "FAIL"
 exit $status

@@ -2,22 +2,27 @@
 //! link, a QR code or a signalling message.
 //!
 //! ```text
-//! "nb:" base64url( version(1)=1 peer(32) n_addrs(u8) [alen(u8) addr]*
+//! "nb:" base64url( version(1)=1|2 peer(32) [key(32), version 2] n_addrs(u8) [alen(u8) addr]*
 //!                  n_relays(u8) [relay_peer(32) alen(u8) addr]* )
 //! ```
-//! An invite carries no secrets: the PeerId is a public key, and the
-//! handshake authenticates whoever answers at those addresses.
+//! The PeerId is a public key, and the handshake authenticates whoever answers
+//! at those addresses. The optional `key` is a capability, not a session
+//! secret: whoever holds the invite may ask the peer, over signaling, to dial
+//! back (to punch through NATs); someone who knows only the PeerId may not.
 
 use crate::addr::{Address, MAX_ADDR_LEN};
 use crate::identity::PeerId;
 
 const VERSION: u8 = 1;
+const VERSION_KEYED: u8 = 2;
 const PREFIX: &str = "nb:";
 const MAX_ENTRIES: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invite<A> {
     pub peer: PeerId,
+    /// Proves to the peer, in signaling offers, that the sender holds this invite.
+    pub key: Option<[u8; 32]>,
     /// Addresses the peer may be reachable at (LAN, public, STUN-learned).
     pub addrs: Vec<A>,
     /// Peers that will relay for this one, and where to find them.
@@ -26,8 +31,11 @@ pub struct Invite<A> {
 
 impl<A: Address> Invite<A> {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut v = vec![VERSION];
+        let mut v = vec![if self.key.is_some() { VERSION_KEYED } else { VERSION }];
         v.extend_from_slice(self.peer.as_bytes());
+        if let Some(k) = &self.key {
+            v.extend_from_slice(k);
+        }
         let put_addr = |v: &mut Vec<u8>, a: &A| {
             let start = v.len();
             v.push(0);
@@ -48,10 +56,15 @@ impl<A: Address> Invite<A> {
 
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
         let mut r = Reader(b);
-        if r.take(1)?[0] != VERSION {
+        let version = r.take(1)?[0];
+        if version != VERSION && version != VERSION_KEYED {
             return None;
         }
         let peer = r.peer()?;
+        let key = match version {
+            VERSION_KEYED => Some(r.take(32)?.try_into().ok()?),
+            _ => None,
+        };
         let n = r.take(1)?[0] as usize;
         let mut addrs = Vec::new();
         for _ in 0..n.min(MAX_ENTRIES) {
@@ -62,7 +75,7 @@ impl<A: Address> Invite<A> {
         for _ in 0..n.min(MAX_ENTRIES) {
             relays.push((r.peer()?, r.addr()?));
         }
-        r.0.is_empty().then_some(Invite { peer, addrs, relays })
+        r.0.is_empty().then_some(Invite { peer, key, addrs, relays })
     }
 
     pub fn to_link(&self) -> String {
@@ -153,8 +166,9 @@ mod tests {
     fn roundtrip_and_rejects_garbage() {
         let me = Identity::generate(&mut OsRng).peer_id();
         let relay = Identity::generate(&mut OsRng).peer_id();
-        let inv = Invite::<SocketAddr> {
+        let mut inv = Invite::<SocketAddr> {
             peer: me,
+            key: None,
             addrs: vec!["192.168.1.5:7000".parse().unwrap(), "[2001:db8::7]:7000".parse().unwrap()],
             relays: vec![(relay, "203.0.113.9:443".parse().unwrap())],
         };
@@ -170,5 +184,15 @@ mod tests {
         extra.push(0);
         assert_eq!(Invite::<SocketAddr>::from_bytes(&extra), None);
         assert_eq!(Invite::<SocketAddr>::parse("p1:AAAA"), None);
+        // Version 2 carries a key.
+        inv.key = Some([9; 32]);
+        let b = inv.to_bytes();
+        assert_eq!((b[0], Invite::from_bytes(&b)), (2, Some(inv.clone())));
+        for cut in 0..b.len() {
+            assert_eq!(Invite::<SocketAddr>::from_bytes(&b[..cut]), None);
+        }
+        let mut v3 = b.clone();
+        v3[0] = 3;
+        assert_eq!(Invite::<SocketAddr>::from_bytes(&v3), None);
     }
 }

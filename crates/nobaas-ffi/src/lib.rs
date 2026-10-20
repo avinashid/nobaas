@@ -148,6 +148,14 @@ pub unsafe extern "C" fn nb_connect_via(h: *mut NbEndpoint, now_us: u64, relay: 
     }
 }
 
+/// Relay-only (`on` != 0): relayed links stay relayed (no punching, no direct
+/// path), relays are asked not to tag our packets with our address, and a direct
+/// handshake is answered only from a peer this endpoint is dialling directly.
+#[no_mangle]
+pub unsafe extern "C" fn nb_set_relay_only(h: *mut NbEndpoint, on: u32) {
+    (*h).ep.set_relay_only(on != 0);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn nb_disconnect(h: *mut NbEndpoint, peer_id: *const u8) {
     if let Some(p) = peer(peer_id) {

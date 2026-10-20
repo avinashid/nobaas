@@ -25,7 +25,15 @@
 //! label, is known only to those given the name. Hellos and room offers carry an
 //! HMAC under that key, and a node in a room links only with peers that proved it
 //! (or that it dialled itself, from an invite). A room whose name can be guessed is
-//! a public lobby.
+//! a public lobby. Hellos carry the sender's clock and are dropped when stale.
+//!
+//! Outside rooms, a node acts on an offer only from a peer that holds its invite
+//! (the offer carries an HMAC under the invite's key) or that it dialled itself:
+//! knowing a [`PeerId`] is not enough to make a node dial back or reveal its
+//! addresses.
+//!
+//! [`Privacy`] decides which addresses a node gives out: all of them, public ones
+//! only, or none (every link but the one to its relay goes through the relay).
 
 use crate::signaling::{hex, unhex, Topic};
 use hmac::{Hmac, Mac};
@@ -67,9 +75,11 @@ const VIA_PER_DIAL: usize = 2;
 const MAX_OBSERVED: usize = 4;
 /// Peers forgotten after this long without news (unless connected).
 const FORGET: Duration = Duration::from_secs(600);
-/// Offer versions: 1 outside rooms (invites), 2 in a room, with a room proof.
+/// Offer versions: 1 plain (only to peers that dialled us), 2 in a room, with a
+/// room proof, 3 with an invite proof (from a peer dialling us from our invite).
 const OFFER: u8 = 1;
 const ROOM_OFFER: u8 = 2;
+const INVITE_OFFER: u8 = 3;
 const PROOF_LEN: usize = 32;
 
 /// What STUN says about this node's NAT.
@@ -97,6 +107,25 @@ pub enum Role {
     Host,
     /// A star leaf: connect to hosts only.
     Client,
+}
+
+/// Which of its addresses a node gives out. Peers it links with directly still see
+/// the address its packets come from; only [`Privacy::RelayOnly`] hides that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Privacy {
+    /// Every candidate (public, LAN, loopback): the lowest latency, and peers on
+    /// one LAN link over it.
+    #[default]
+    Direct,
+    /// Public addresses only: LAN, loopback, link-local, CGNAT (100.64/10) and
+    /// other private ranges are left out of invites and offers. Two peers behind
+    /// one NAT then link only if it hairpins, or through a relay.
+    PublicOnly,
+    /// No addresses at all, except to the relay: every other link goes through
+    /// it ([`Path::Via`]), and never moves to a direct path. The relay is `via`,
+    /// or, in a host/client room, the host. Costs the relay's upload (it carries
+    /// every packet twice) and a detour in latency.
+    RelayOnly { via: Option<PeerId> },
 }
 
 /// Why a dial to a peer failed.
@@ -160,8 +189,10 @@ struct Remote {
     offered_at: Option<Instant>,
     /// We received an offer from it.
     heard: bool,
-    /// We dialled it from an invite: its plain (non-room) offers are welcome in a room.
+    /// We dialled it from an invite: its plain offers are welcome (in a room too).
     invited: bool,
+    /// Its invite's key, which our offers to it prove we hold.
+    key: Option<[u8; 32]>,
     /// The role it proved in the current room (with the room key).
     member: Option<Role>,
     nat: NatType,
@@ -201,6 +232,12 @@ pub struct Traversal<A: Address> {
     nonces: HashMap<(PeerId, u64), Instant>,
     hellos: Bucket,
     offers: Bucket,
+    privacy: Privacy,
+    /// The room Host a relay-only node picked as its relay (with no `via` and no
+    /// pinned host): the first it dialled. Kept while that dial or link lasts.
+    picked: Option<PeerId>,
+    /// Whoever holds this, from our invite, may ask us to dial back.
+    invite_key: [u8; 32],
     transmits: VecDeque<Transmit<A>>,
     signals: VecDeque<Signal>,
 }
@@ -218,11 +255,14 @@ impl<A: Address> Traversal<A> {
             .map(|addr| Server { addr, tx: [0; 12], sent_at: Instant::ZERO, tries: 0, pending: false, mapped: None })
             .collect();
         let is_loopback = |a: &A| a.to_socket_addr().is_some_and(|s| s.ip().to_canonical().is_loopback());
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let mut invite_key = [0u8; 32];
+        rng.fill_bytes(&mut invite_key);
         Traversal {
             me: identity.clone(),
             id,
             inbox,
-            rng: ChaCha20Rng::from_seed(seed),
+            rng,
             unix_ms,
             loopback: !local.is_empty() && local.iter().all(is_loopback),
             local,
@@ -236,6 +276,9 @@ impl<A: Address> Traversal<A> {
             nonces: HashMap::new(),
             hellos: Bucket::default(),
             offers: Bucket::default(),
+            privacy: Privacy::Direct,
+            picked: None,
+            invite_key,
             transmits: VecDeque::new(),
             signals: VecDeque::from([Signal::Subscribe(inbox)]),
         }
@@ -256,15 +299,60 @@ impl<A: Address> Traversal<A> {
         self.remotes.get(peer).and_then(|r| r.failure)
     }
 
-    /// The addresses offered to peers: public (STUN), observed by peers, local.
+    /// The addresses given out (in invites), as [`Privacy`] allows: public (STUN),
+    /// observed by peers, local. None under [`Privacy::RelayOnly`].
     pub fn candidates(&self) -> Vec<A> {
+        match self.privacy {
+            Privacy::Direct => self.addresses(false),
+            Privacy::PublicOnly => self.addresses(true),
+            Privacy::RelayOnly { .. } => Vec::new(),
+        }
+    }
+
+    /// The addresses offered to `to`: [`candidates`](Traversal::candidates), but
+    /// a relay-only node's relay gets its public ones (it links directly).
+    fn candidates_for(&self, to: &PeerId) -> Vec<A> {
+        match self.privacy {
+            Privacy::RelayOnly { .. } if self.relay() == Some(*to) => self.addresses(true),
+            _ => self.candidates(),
+        }
+    }
+
+    fn addresses(&self, public_only: bool) -> Vec<A> {
         let mut out: Vec<A> = Vec::new();
         for a in self.public.iter().chain(&self.observed).chain(&self.local) {
-            if !out.contains(a) && out.len() < MAX_CANDIDATES {
+            if !out.contains(a) && out.len() < MAX_CANDIDATES && (!public_only || is_public(a)) {
                 out.push(a.clone());
             }
         }
         out
+    }
+
+    /// Which addresses this node gives out.
+    pub fn privacy(&self) -> Privacy {
+        self.privacy
+    }
+
+    /// Sets which addresses this node gives out from now on (offers and invites
+    /// made later), and, for [`Privacy::RelayOnly`], keeps `ep`'s relayed links
+    /// relayed. Links already up keep their path.
+    pub fn set_privacy(&mut self, ep: &mut Endpoint<A>, privacy: Privacy) {
+        self.privacy = privacy;
+        ep.set_relay_only(matches!(privacy, Privacy::RelayOnly { .. }));
+    }
+
+    /// The peer a [`Privacy::RelayOnly`] node links through: `via`, else the room's
+    /// pinned host, else the first peer that proved the Host role and was dialled.
+    /// That pick sticks while its dial or link lasts: another Host can't take over.
+    pub fn relay(&self) -> Option<PeerId> {
+        let Privacy::RelayOnly { via } = self.privacy else { return None };
+        via.or_else(|| self.room.as_ref()?.expect).or(self.picked)
+    }
+
+    /// The key this node's invites carry: an offer proved with it is from a peer
+    /// holding one, which may ask this node to dial back.
+    pub fn invite_key(&self) -> [u8; 32] {
+        self.invite_key
     }
 
     /// Joins a room: announces this node on the room topic now and now and then,
@@ -272,10 +360,11 @@ impl<A: Address> Traversal<A> {
     /// the room's name. With `host`, links with that peer only. Leaves any other room.
     pub fn join_room(&mut self, now: Instant, app_id: &str, room: &str, role: Role, host: Option<PeerId>) {
         self.leave_room();
+        self.picked = None;
         let topic = Topic::room(app_id, room);
         let key = room_key(app_id, room);
         self.signals.push_back(Signal::Subscribe(topic));
-        self.signals.push_back(Signal::Publish(topic, hello(&key, &self.id, role)));
+        self.signals.push_back(Signal::Publish(topic, hello(&key, &self.id, role, self.wall_ms(now))));
         self.room = Some(Room { topic, key, role, expect: host, next_hello: now + HELLO_FIRST, interval: HELLO_FIRST });
     }
 
@@ -304,11 +393,14 @@ impl<A: Address> Traversal<A> {
     }
 
     /// Sends `peer` an offer asking for one back, so a dial to it punches through
-    /// NATs: call it after dialling a peer from an invite. In a room, it also marks
-    /// `peer` as welcome though it never proved the room key.
-    pub fn introduce(&mut self, now: Instant, ep: &Endpoint<A>, peer: PeerId) {
+    /// NATs: call it after dialling a peer from an invite, with the invite's `key`
+    /// (without one, the peer ignores the offer unless it dialled us too). Its
+    /// offers are welcome from then on, in a room too, though it never proved the
+    /// room key.
+    pub fn introduce(&mut self, now: Instant, ep: &Endpoint<A>, peer: PeerId, key: Option<[u8; 32]>) {
+        let r = self.remotes.entry(peer).or_default();
+        (r.invited, r.key) = (true, key.or(r.key));
         self.offer(now, ep, peer, true, false);
-        self.remotes.entry(peer).or_default().invited = true;
     }
 
     /// Takes a datagram if it is STUN (returns `true`); otherwise it is for the endpoint.
@@ -331,29 +423,32 @@ impl<A: Address> Traversal<A> {
     /// Handles a message from the signaling carrier.
     pub fn handle_signal(&mut self, now: Instant, ep: &mut Endpoint<A>, topic: Topic, payload: &[u8]) {
         if let Some(room) = self.room.as_ref().filter(|r| r.topic == topic) {
-            let Some((from, role, proof)) = parse_hello(payload) else { return };
-            if mac_ok(&room.key, &[b"nb-hello", from.as_bytes(), &[role as u8]], &proof) {
+            let Some((from, role, ts, proof)) = parse_hello(payload) else { return };
+            let fresh = self.wall_ms(now).abs_diff(ts) <= FRESH_MS;
+            if fresh && mac_ok(&room.key, &[b"nb-hello", from.as_bytes(), &[role as u8], &ts.to_le_bytes()], &proof) {
                 self.on_hello(now, ep, from, role);
             }
         } else if topic == self.inbox {
             let Some((from, body)) = sealed::open(&self.me, payload) else { return };
-            // A room offer ends in an HMAC, under the room key, over sender, recipient and body.
+            // Room and invite offers end in an HMAC over sender, recipient and body,
+            // under the room key or this node's invite key.
             let (body, proof) = match body.first() {
-                Some(&ROOM_OFFER) if body.len() > PROOF_LEN => {
+                Some(&(ROOM_OFFER | INVITE_OFFER)) if body.len() > PROOF_LEN => {
                     let (b, p) = body.split_at(body.len() - PROOF_LEN);
                     (b, Some(p))
                 }
                 _ => (&body[..], None),
             };
-            let welcome = match (&self.room, proof) {
-                (Some(r), Some(p)) => mac_ok(&r.key, &[b"nb-offer", from.as_bytes(), self.id.as_bytes(), body], p),
-                (None, None) => true,
-                // In a room, plain offers only from peers this node dialled from an invite.
-                (Some(_), None) => self.remotes.get(&from).is_some_and(|r| r.invited),
-                (None, Some(_)) => false,
+            let parts = |label: &'static [u8]| [label, from.as_bytes(), self.id.as_bytes(), body];
+            let welcome = match (body.first(), proof) {
+                (Some(&ROOM_OFFER), Some(p)) => self.room.as_ref().is_some_and(|r| mac_ok(&r.key, &parts(b"nb-offer"), p)),
+                (Some(&INVITE_OFFER), Some(p)) => mac_ok(&self.invite_key, &parts(b"nb-invite"), p),
+                // Plain offers only from peers this node dialled itself.
+                (Some(&OFFER), None) => self.remotes.get(&from).is_some_and(|r| r.invited),
+                // A room or invite offer too short to carry a proof.
+                _ => false,
             };
-            // A room offer too short to carry a proof is not a room offer.
-            if let Some(offer) = Offer::decode(body).filter(|o| welcome && o.room == proof.is_some()) {
+            if let Some(offer) = Offer::decode(body).filter(|_| welcome) {
                 self.on_offer(now, ep, from, offer);
             }
         }
@@ -379,14 +474,26 @@ impl<A: Address> Traversal<A> {
                     let room = self.room_role(&p).is_some();
                     self.offer(now, ep, p, true, room);
                 }
+                // A relay-only node's relay just linked: dial the peers waiting for it.
+                if self.relay() == Some(*peer) {
+                    let waiting: Vec<PeerId> =
+                        self.remotes.iter().filter(|(p, r)| r.heard && !ep.is_connected(p)).map(|(p, _)| *p).collect();
+                    for p in waiting {
+                        let _ = ep.connect_with(now, p, &[Path::Via(*peer)]);
+                    }
+                }
             }
             Event::ConnectFailed { peer } => {
+                if self.picked == Some(*peer) {
+                    self.picked = None; // another Host may be tried
+                }
                 let mine = self.nat;
                 let r = self.remotes.entry(*peer).or_default();
                 r.seen_at = now;
                 let sym = |a: NatType, b: NatType| a == NatType::Symmetric && b != NatType::Open;
                 r.failure = Some(if sym(mine, r.nat) || sym(r.nat, mine) { Failure::Symmetric } else { Failure::Unreachable });
             }
+            Event::Disconnected { peer, .. } if self.picked == Some(*peer) => self.picked = None,
             Event::AddrObserved { addr, .. } => {
                 let real = dialable(addr, false); // a peer that sees us on loopback is on this host
                 if real && !self.observed.contains(addr) && !self.local.contains(addr) {
@@ -426,7 +533,7 @@ impl<A: Address> Traversal<A> {
         if let Some(r) = self.room.as_mut().filter(|r| now >= r.next_hello) {
             r.interval = (r.interval * 2).min(HELLO_MAX);
             r.next_hello = now + r.interval;
-            let h = hello(&r.key, &self.id, r.role);
+            let h = hello(&r.key, &self.id, r.role, self.unix_ms + now.as_micros() / 1000);
             self.signals.push_back(Signal::Publish(r.topic, h));
         }
         self.remotes.retain(|p, r| now - r.seen_at < FORGET || ep.is_connected(p));
@@ -497,14 +604,16 @@ impl<A: Address> Traversal<A> {
 
     /// An offer that opened, and whose room proof (in a room) checked out.
     fn on_offer(&mut self, now: Instant, ep: &mut Endpoint<A>, from: PeerId, o: Offer<A>) {
-        let room = o.room;
+        let room = o.kind == Proof::Room;
         let role_ok = if room { self.links_with(&from, o.role) } else { from != self.id };
         if !role_ok || self.wall_ms(now).abs_diff(o.ts) > FRESH_MS || self.nonces.contains_key(&(from, o.nonce)) {
             return; // not for us, stale, or a replay
         }
-        // The sender's own limit, then the node's; the nonce is kept only for offers acted on.
-        let mut mine = self.remotes.get(&from).map(|r| r.offers).unwrap_or_default();
-        if !mine.ready(now, SENDER_BURST, SENDER_REFILL) || !self.offers.take(now, BURST, REFILL) {
+        // The sender's own limit, then the node's, which peers we dialled don't
+        // draw on (answers to our own dials can't be crowded out); the nonce is
+        // kept only for offers acted on.
+        let (mut mine, invited) = self.remotes.get(&from).map_or((Bucket::default(), false), |r| (r.offers, r.invited));
+        if !mine.ready(now, SENDER_BURST, SENDER_REFILL) || !(invited || self.offers.take(now, BURST, REFILL)) {
             return;
         }
         mine.take(now, SENDER_BURST, SENDER_REFILL);
@@ -519,7 +628,18 @@ impl<A: Address> Traversal<A> {
         }
         let loopback = self.loopback;
         let addrs: Vec<A> = o.addrs.into_iter().filter(|a| dialable(a, loopback) && !self.local.contains(a)).collect();
-        if ep.is_connected(&from) {
+        let mut relay = self.relay();
+        if relay.is_none() && room && o.role == Role::Host && matches!(self.privacy, Privacy::RelayOnly { .. }) {
+            // The first proven Host this relay-only node dials becomes its relay, and stays.
+            (self.picked, relay) = (Some(from), Some(from));
+        }
+        if matches!(self.privacy, Privacy::RelayOnly { .. }) && relay != Some(from) {
+            // Relay-only: anyone but the relay is dialled through it, never directly
+            // (or once it links, from `handle_event`).
+            if let Some(r) = relay.filter(|r| ep.is_connected(r) && !ep.is_connected(&from)) {
+                let _ = ep.connect_with(now, from, &[Path::Via(r)]);
+            }
+        } else if ep.is_connected(&from) {
             ep.add_candidates(now, &from, &addrs);
         } else {
             let vias = o.relays.iter().filter(|p| **p != from && **p != self.id && ep.is_connected(p));
@@ -535,27 +655,34 @@ impl<A: Address> Traversal<A> {
     }
 
     /// Seals an offer to `to` and publishes it on its topic. `room`: a room offer,
-    /// with a proof under the room key (sent only while in a room).
+    /// with a proof under the room key (sent only while in a room); otherwise
+    /// one proved with `to`'s invite key, if we have it.
     fn offer(&mut self, now: Instant, ep: &Endpoint<A>, to: PeerId, reply: bool, room: bool) {
-        let key = match (&self.room, room) {
-            (Some(r), true) => Some(r.key),
-            (None, true) => return,
-            (_, false) => None,
+        let invite = self.remotes.get(&to).and_then(|r| r.key);
+        let (kind, key, label): (_, _, &[u8]) = match (&self.room, room, invite) {
+            (Some(r), true, _) => (Proof::Room, Some(r.key), b"nb-offer"),
+            (None, true, _) => return,
+            (_, false, Some(k)) => (Proof::Invite, Some(k), b"nb-invite"),
+            (_, false, None) => (Proof::None, None, b""),
         };
-        let relays = ep.connected_peers().filter(|p| **p != to).take(MAX_RELAYS).copied().collect();
+        // A relay-only node names only its relay, not every peer it links with.
+        let relays = match self.privacy {
+            Privacy::RelayOnly { .. } => self.relay().filter(|r| *r != to && ep.is_connected(r)).into_iter().collect(),
+            _ => ep.connected_peers().filter(|p| **p != to).take(MAX_RELAYS).copied().collect(),
+        };
         let o = Offer {
-            room,
+            kind,
             reply,
             role: self.role().unwrap_or(Role::Peer),
             nat: self.nat,
             ts: self.wall_ms(now),
             nonce: self.rng.next_u64(),
-            addrs: self.candidates(),
+            addrs: self.candidates_for(&to),
             relays,
         };
         let mut body = o.encode();
         if let Some(k) = key {
-            let proof = mac(&k, &[b"nb-offer", self.id.as_bytes(), to.as_bytes(), &body]);
+            let proof = mac(&k, &[label, self.id.as_bytes(), to.as_bytes(), &body]);
             body.extend_from_slice(&proof);
         }
         let mut seed = [0u8; 32];
@@ -585,6 +712,26 @@ fn dialable<A: Address>(a: &A, loopback: bool) -> bool {
     let ip = s.ip().to_canonical();
     let broadcast = matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast());
     s.port() != 0 && !ip.is_unspecified() && !ip.is_multicast() && !broadcast && (loopback || !ip.is_loopback())
+}
+
+/// Whether an address is on the public internet: not loopback, private (RFC 1918,
+/// IPv6 ULA), carrier-grade NAT (100.64/10), link-local or otherwise special.
+/// Addresses that aren't IP addresses count as public.
+fn is_public<A: Address>(a: &A) -> bool {
+    use std::net::IpAddr;
+    let Some(s) = a.to_socket_addr() else { return true };
+    let ip = s.ip().to_canonical();
+    let local = match ip {
+        IpAddr::V4(v) => {
+            let [a, b, ..] = v.octets();
+            v.is_private() || v.is_link_local() || v.is_broadcast() || (a == 100 && b & 0xc0 == 64) || a == 0
+        }
+        IpAddr::V6(v) => {
+            let s0 = v.segments()[0];
+            s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80
+        }
+    };
+    !(local || ip.is_loopback() || ip.is_unspecified() || ip.is_multicast())
 }
 
 /// The key that proves knowledge of a room's name. Not the topic, which every relay
@@ -621,33 +768,49 @@ fn role_name(r: Role) -> &'static str {
 
 const HELLO_HEAD: &str = r#"{"t":"hello","from":""#;
 const HELLO_MID: &str = r#"","meta":{"nb":1,"role":""#;
-const HELLO_PROOF: &str = r#"","p":""#;
+const HELLO_TS: &str = r#"","ts":"#;
+const HELLO_PROOF: &str = r#","p":""#;
 const HELLO_TAIL: &str = r#""}}"#;
 
 /// The room presence message, in the JSON shape `nostr.js` uses (`{t, from, meta}`).
-/// `meta.nb` marks a UDP peer, so browsers' WebRTC hellos are told apart; `meta.p`
-/// is the room proof, an HMAC under the room key over the sender and its role.
-fn hello(key: &[u8; 32], id: &PeerId, role: Role) -> Vec<u8> {
-    let proof = mac(key, &[b"nb-hello", id.as_bytes(), &[role as u8]]);
+/// `meta.nb` marks a UDP peer, so browsers' WebRTC hellos are told apart; `meta.ts`
+/// is the sender's Unix time in ms; `meta.p` is the room proof, an HMAC under the
+/// room key over the sender, its role and `ts` (so a captured hello goes stale).
+fn hello(key: &[u8; 32], id: &PeerId, role: Role, ts: u64) -> Vec<u8> {
+    let proof = mac(key, &[b"nb-hello", id.as_bytes(), &[role as u8], &ts.to_le_bytes()]);
     let (id, name, proof) = (hex(id.as_bytes()), role_name(role), hex(&proof));
-    format!("{HELLO_HEAD}{id}{HELLO_MID}{name}{HELLO_PROOF}{proof}{HELLO_TAIL}").into_bytes()
+    format!("{HELLO_HEAD}{id}{HELLO_MID}{name}{HELLO_TS}{ts}{HELLO_PROOF}{proof}{HELLO_TAIL}").into_bytes()
 }
 
-fn parse_hello(b: &[u8]) -> Option<(PeerId, Role, [u8; 32])> {
+fn parse_hello(b: &[u8]) -> Option<(PeerId, Role, u64, [u8; 32])> {
     let s = std::str::from_utf8(b).ok()?;
     let rest = s.strip_prefix(HELLO_HEAD)?;
     let (id_hex, rest) = (rest.get(..64)?, rest.get(64..)?);
-    let (role, proof_hex) = rest.strip_prefix(HELLO_MID)?.strip_suffix(HELLO_TAIL)?.split_once(HELLO_PROOF)?;
+    let (role, rest) = rest.strip_prefix(HELLO_MID)?.strip_suffix(HELLO_TAIL)?.split_once(HELLO_TS)?;
+    let (ts, proof_hex) = rest.split_once(HELLO_PROOF)?;
     let role = [Role::Peer, Role::Host, Role::Client].into_iter().find(|r| role_name(*r) == role)?;
+    if ts.is_empty() || ts.len() > 19 || !ts.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     let (mut id, mut proof) = ([0u8; 32], [0u8; 32]);
-    (unhex(id_hex, &mut id) && unhex(proof_hex, &mut proof)).then_some((PeerId(id), role, proof))
+    (unhex(id_hex, &mut id) && unhex(proof_hex, &mut proof)).then_some((PeerId(id), role, ts.parse().ok()?, proof))
+}
+
+/// What an offer's proof is under (it follows the body, inside the seal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Proof {
+    /// Version 1: none.
+    None,
+    /// Version 2: the room key.
+    Room,
+    /// Version 3: the recipient's invite key.
+    Invite,
 }
 
 /// Candidates for one peer. Sealed to it, so only it reads them.
 #[derive(Debug, PartialEq)]
 struct Offer<A> {
-    /// A room offer (version 2): the sealed body is followed by a room proof.
-    room: bool,
+    kind: Proof,
     /// The sender wants an offer back (it will dial when that arrives).
     reply: bool,
     role: Role,
@@ -661,12 +824,16 @@ struct Offer<A> {
 }
 
 impl<A: Address> Offer<A> {
-    // [1|2] [flags] [role] [nat] [ts u64 le] [nonce u64 le] [n] n*([len] addr) [m] m*(32 B peer id)
-    // A room offer (2) is followed, outside this body, by its 32-byte proof.
+    // [1|2|3] [flags] [role] [nat] [ts u64 le] [nonce u64 le] [n] n*([len] addr) [m] m*(32 B peer id)
+    // A room (2) or invite (3) offer is followed, outside this body, by its 32-byte proof.
     fn encode(&self) -> Vec<u8> {
         let role = [Role::Peer, Role::Host, Role::Client].iter().position(|r| *r == self.role).unwrap() as u8;
         let nat = [NatType::Unknown, NatType::Open, NatType::Cone, NatType::Symmetric].iter().position(|n| *n == self.nat);
-        let version = if self.room { ROOM_OFFER } else { OFFER };
+        let version = match self.kind {
+            Proof::None => OFFER,
+            Proof::Room => ROOM_OFFER,
+            Proof::Invite => INVITE_OFFER,
+        };
         let mut v = vec![version, self.reply as u8, role, nat.unwrap() as u8];
         v.extend_from_slice(&self.ts.to_le_bytes());
         v.extend_from_slice(&self.nonce.to_le_bytes());
@@ -685,7 +852,9 @@ impl<A: Address> Offer<A> {
     }
 
     fn decode(b: &[u8]) -> Option<Self> {
-        let (&[version @ (OFFER | ROOM_OFFER), flags, role, nat], rest) = b.split_first_chunk::<4>()? else { return None };
+        let (&[version @ (OFFER | ROOM_OFFER | INVITE_OFFER), flags, role, nat], rest) = b.split_first_chunk::<4>()? else {
+            return None;
+        };
         let role = *[Role::Peer, Role::Host, Role::Client].get(role as usize)?;
         let nat = *[NatType::Unknown, NatType::Open, NatType::Cone, NatType::Symmetric].get(nat as usize)?;
         let (ts, rest) = rest.split_first_chunk::<8>()?;
@@ -711,7 +880,7 @@ impl<A: Address> Offer<A> {
             rest = r;
         }
         Some(Offer {
-            room: version == ROOM_OFFER,
+            kind: [Proof::None, Proof::Room, Proof::Invite][version as usize - 1],
             reply: flags == 1,
             role,
             nat,
@@ -738,16 +907,25 @@ mod tests {
         let p = id(1).peer_id();
         let key = room_key("app", "room");
         for role in [Role::Peer, Role::Host, Role::Client] {
-            let (from, r, proof) = parse_hello(&hello(&key, &p, role)).unwrap();
-            assert_eq!((from, r), (p, role));
-            assert!(mac_ok(&key, &[b"nb-hello", p.as_bytes(), &[role as u8]], &proof));
-            assert!(!mac_ok(&room_key("app", "other"), &[b"nb-hello", p.as_bytes(), &[role as u8]], &proof));
-            assert!(!mac_ok(&key, &[b"nb-hello", p.as_bytes(), &[9]], &proof), "bound to the role");
+            let ts = 1_800_000_000_123u64;
+            let (from, r, t, proof) = parse_hello(&hello(&key, &p, role, ts)).unwrap();
+            assert_eq!((from, r, t), (p, role, ts));
+            let parts = |role: u8, ts: u64| mac_ok(&key, &[b"nb-hello", p.as_bytes(), &[role], &ts.to_le_bytes()], &proof);
+            assert!(parts(role as u8, ts));
+            assert!(!parts(9, ts), "bound to the role");
+            assert!(!parts(role as u8, ts + 1), "bound to the time");
+            let other = room_key("app", "other");
+            assert!(!mac_ok(&other, &[b"nb-hello", p.as_bytes(), &[role as u8], &ts.to_le_bytes()], &proof));
         }
         let js = format!(r#"{{"t":"hello","from":"{}","meta":{{"role":"player"}}}}"#, hex(p.as_bytes()));
+        // Not a number, signed, or too long: refused.
+        let h = String::from_utf8(hello(&key, &p, Role::Peer, 5)).unwrap();
+        for bad in ["\"ts\":x,", "\"ts\":+5,", "\"ts\":,", "\"ts\":99999999999999999999,"] {
+            assert_eq!(parse_hello(h.replace("\"ts\":5,", bad).as_bytes()), None, "{bad}");
+        }
         assert_eq!(parse_hello(js.as_bytes()), None);
         assert_eq!(parse_hello(b"{}"), None);
-        let h = hello(&key, &p, Role::Peer);
+        let h = hello(&key, &p, Role::Peer, 0);
         for cut in 0..h.len() {
             assert_eq!(parse_hello(&h[..cut]), None);
         }
@@ -758,7 +936,7 @@ mod tests {
     #[test]
     fn offer_round_trips_and_rejects_garbage() {
         let o: Offer<SocketAddr> = Offer {
-            room: false,
+            kind: Proof::None,
             reply: true,
             role: Role::Client,
             nat: NatType::Symmetric,
@@ -775,23 +953,39 @@ mod tests {
         let mut long = b.clone();
         long.push(0);
         assert_eq!(Offer::<SocketAddr>::decode(&long), None);
-        let room: Offer<SocketAddr> = Offer { room: true, ..Offer::decode(&b).unwrap() };
-        let rb = room.encode();
-        assert_eq!(rb[0], ROOM_OFFER);
-        assert_eq!(Offer::decode(&rb), Some(room));
-        let mut v3 = rb.clone();
-        v3[0] = 3;
-        assert_eq!(Offer::<SocketAddr>::decode(&v3), None);
+        for (kind, version) in [(Proof::Room, ROOM_OFFER), (Proof::Invite, INVITE_OFFER)] {
+            let o: Offer<SocketAddr> = Offer { kind, ..Offer::decode(&b).unwrap() };
+            let ob = o.encode();
+            assert_eq!(ob[0], version);
+            assert_eq!(Offer::decode(&ob), Some(o));
+        }
+        let mut v4 = b.clone();
+        v4[0] = 4;
+        assert_eq!(Offer::<SocketAddr>::decode(&v4), None);
     }
 
     const ROOM: (&str, &str) = ("app", "room");
 
     /// A sealed offer from `from` to `to`, with a room proof under `key` if given.
     fn offer_from(from: &Identity, to: &PeerId, key: Option<&[u8; 32]>, nonce: u64, role: Role, addrs: Vec<SocketAddr>) -> Vec<u8> {
-        let o = Offer { room: key.is_some(), reply: true, role, nat: NatType::Cone, ts: 0, nonce, addrs, relays: vec![] };
+        proved_offer(from, to, key.map(|k| (Proof::Room, k)), nonce, role, addrs)
+    }
+
+    /// A sealed offer from `from` to `to`, with a proof of `kind` under its key.
+    fn proved_offer(
+        from: &Identity,
+        to: &PeerId,
+        proof: Option<(Proof, &[u8; 32])>,
+        nonce: u64,
+        role: Role,
+        addrs: Vec<SocketAddr>,
+    ) -> Vec<u8> {
+        let kind = proof.map_or(Proof::None, |p| p.0);
+        let o = Offer { kind, reply: true, role, nat: NatType::Cone, ts: 0, nonce, addrs, relays: vec![] };
         let mut body = o.encode();
-        if let Some(k) = key {
-            body.extend(mac(k, &[b"nb-offer", from.peer_id().as_bytes(), to.as_bytes(), &body]));
+        if let Some((kind, k)) = proof {
+            let label: &[u8] = if kind == Proof::Room { b"nb-offer" } else { b"nb-invite" };
+            body.extend(mac(k, &[label, from.peer_id().as_bytes(), to.as_bytes(), &body]));
         }
         sealed::seal(from, to, [7; 32], &body).unwrap()
     }
@@ -831,7 +1025,7 @@ mod tests {
         let ap = attacker.peer_id();
         let old = format!(r#"{{"t":"hello","from":"{}","meta":{{"nb":1,"role":"host"}}}}"#, hex(ap.as_bytes()));
         t.handle_signal(now, &mut ep, topic, old.as_bytes());
-        t.handle_signal(now, &mut ep, topic, &hello(&topic.0, &ap, Role::Host));
+        t.handle_signal(now, &mut ep, topic, &hello(&topic.0, &ap, Role::Host, 0));
         assert_eq!((dials(&mut ep, now), published(&mut t)), (vec![], 0));
         assert_eq!((t.room_role(&ap), t.admits(&ap)), (None, false));
         // A member's offer: dialled, answered, and its role is known.
@@ -840,7 +1034,7 @@ mod tests {
         assert_eq!((dials(&mut ep, now), published(&mut t)), (vec![there], 1));
         assert_eq!((t.room_role(&host.peer_id()), t.admits(&host.peer_id())), (Some(Role::Host), true));
         // A member's hello in a role this client doesn't link with: no offer.
-        t.handle_signal(now, &mut ep, topic, &hello(&key, &id(3).peer_id(), Role::Client));
+        t.handle_signal(now, &mut ep, topic, &hello(&key, &id(3).peer_id(), Role::Client, 0));
         assert_eq!(published(&mut t), 0);
         // Leaving the room forgets who proved what; outside a room, links are anyone's call.
         t.leave_room();
@@ -849,9 +1043,9 @@ mod tests {
         // With an expected host, other members are ignored.
         let (mut t, mut ep) = in_room(Role::Client, Some(id(3).peer_id()), local);
         t.handle_signal(now, &mut ep, inbox, &offer_from(&host, &me, Some(&key), 4, Role::Host, vec![there]));
-        t.handle_signal(now, &mut ep, topic, &hello(&key, &host.peer_id(), Role::Host));
+        t.handle_signal(now, &mut ep, topic, &hello(&key, &host.peer_id(), Role::Host, 0));
         assert_eq!((dials(&mut ep, now), published(&mut t)), (vec![], 0));
-        t.handle_signal(now, &mut ep, topic, &hello(&key, &id(3).peer_id(), Role::Host));
+        t.handle_signal(now, &mut ep, topic, &hello(&key, &id(3).peer_id(), Role::Host, 0));
         assert_eq!(published(&mut t), 1);
         assert!(t.admits(&id(3).peer_id()) && !t.admits(&host.peer_id()));
     }
@@ -864,7 +1058,7 @@ mod tests {
         let there: SocketAddr = "198.51.100.9:4000".parse().unwrap();
         let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
         let now = Instant::from_millis(10);
-        t.introduce(now, &ep, id(2).peer_id());
+        t.introduce(now, &ep, id(2).peer_id(), None);
         assert_eq!(published(&mut t), 1);
         t.handle_signal(now, &mut ep, Topic::peer(&me), &offer_from(&id(2), &me, None, 1, Role::Peer, vec![there]));
         assert_eq!(dials(&mut ep, now), vec![there]);
@@ -878,10 +1072,10 @@ mod tests {
         let me = id(1).peer_id();
         let (mut t, mut ep) = in_room(Role::Client, None, "10.0.0.1:7000".parse().unwrap());
         let now = Instant::from_millis(10);
-        t.introduce(now, &ep, id(2).peer_id());
+        t.introduce(now, &ep, id(2).peer_id(), None);
         while t.poll_signal().is_some() {}
         let o = Offer::<SocketAddr> {
-            room: true, reply: true, role: Role::Host, nat: NatType::Cone, ts: 0, nonce: 1, addrs: vec![], relays: vec![],
+            kind: Proof::Room, reply: true, role: Role::Host, nat: NatType::Cone, ts: 0, nonce: 1, addrs: vec![], relays: vec![],
         };
         let body = o.encode();
         assert!(body.len() <= PROOF_LEN, "short enough to skip the proof split");
@@ -902,12 +1096,12 @@ mod tests {
         let member = |n: u8| id(n.wrapping_add(10)).peer_id();
         // 200 forged hellos: nothing sent, no token spent.
         for n in 0..200u8 {
-            t.handle_signal(t0, &mut ep, topic, &hello(&topic.0, &member(n), Role::Peer));
+            t.handle_signal(t0, &mut ep, topic, &hello(&topic.0, &member(n), Role::Peer, 0));
         }
         assert_eq!(published(&mut t), 0);
         // Real hellos from 100 members: a burst of answers, then none.
         for n in 0..100u8 {
-            t.handle_signal(t0, &mut ep, topic, &hello(&key, &member(n), Role::Peer));
+            t.handle_signal(t0, &mut ep, topic, &hello(&key, &member(n), Role::Peer, 0));
         }
         assert_eq!(published(&mut t), BURST as usize);
         // Offers have their own budget: still acted on (each answered).
@@ -933,7 +1127,7 @@ mod tests {
         // And the hello budget at one per REFILL.
         let later = t0 + REFILL * 3;
         for n in 100..150u8 {
-            t.handle_signal(later, &mut ep, topic, &hello(&key, &member(n), Role::Peer));
+            t.handle_signal(later, &mut ep, topic, &hello(&key, &member(n), Role::Peer, 0));
         }
         assert_eq!(published(&mut t), 3);
     }
@@ -945,8 +1139,10 @@ mod tests {
         let me = ia.peer_id();
         let mut ep: Endpoint<SocketAddr> = Endpoint::new(&ia, Config::default(), [1; 32]);
         let mut t = Traversal::new(&ia, [3; 32], 0, vec!["10.0.0.1:7000".parse().unwrap()], vec![]);
+        let k = t.invite_key();
         for n in 0..200u8 {
-            t.handle_signal(Instant::ZERO, &mut ep, Topic::peer(&me), &offer_from(&id(n.wrapping_add(2)), &me, None, 1, Role::Peer, vec![]));
+            let o = proved_offer(&id(n.wrapping_add(2)), &me, Some((Proof::Invite, &k)), 1, Role::Peer, vec![]);
+            t.handle_signal(Instant::ZERO, &mut ep, Topic::peer(&me), &o);
         }
         assert_eq!(t.nonces.len(), BURST as usize);
         assert!(MAX_NONCES >= (BURST as usize + (2 * FRESH_MS as usize / REFILL.as_millis() as usize)), "covers the window");
@@ -967,7 +1163,9 @@ mod tests {
             let ia = id(1);
             let mut ep = Endpoint::new(&ia, Config::default(), [1; 32]);
             let mut t = Traversal::new(&ia, [3; 32], 0, vec![local.parse().unwrap()], vec![]);
-            t.handle_signal(now, &mut ep, Topic::peer(&me), &offer_from(&id(2), &me, None, 1, Role::Peer, addrs.clone()));
+            let k = t.invite_key();
+            let o = proved_offer(&id(2), &me, Some((Proof::Invite, &k)), 1, Role::Peer, addrs.clone());
+            t.handle_signal(now, &mut ep, Topic::peer(&me), &o);
             let mut d = dials(&mut ep, now);
             d.sort();
             d.dedup();
@@ -984,6 +1182,177 @@ mod tests {
             t.handle_event(now, &mut ep, &Event::AddrObserved { by: id(2).peer_id(), addr: *a });
         }
         assert_eq!(t.candidates(), vec!["198.51.100.7:9".parse().unwrap(), "10.0.0.1:7000".parse().unwrap()]);
+    }
+
+    /// The offers `t` published, opened with `to`'s key and decoded.
+    fn sent_offers(t: &mut Traversal<SocketAddr>, to: &Identity) -> Vec<Offer<SocketAddr>> {
+        std::iter::from_fn(|| t.poll_signal())
+            .filter_map(|s| match s {
+                Signal::Publish(topic, p) if topic == Topic::peer(&to.peer_id()) => {
+                    let (_, body) = sealed::open(to, &p)?;
+                    let cut = if body[0] == OFFER { body.len() } else { body.len() - PROOF_LEN };
+                    Offer::decode(&body[..cut])
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn public_addresses() {
+        let public = ["198.51.100.7:9", "8.8.8.8:53", "[2001:db8::1]:9", "100.128.0.1:1", "172.32.0.1:1"];
+        let local = ["10.0.0.1:1", "192.168.1.2:1", "172.16.0.1:1", "127.0.0.1:1", "169.254.1.1:1", "100.64.0.1:1",
+            "100.127.255.1:1", "0.0.0.0:1", "255.255.255.255:1", "224.0.0.1:1", "[::1]:1", "[fe80::1]:1", "[fd00::1]:1",
+            "[::ffff:10.0.0.1]:1"];
+        for a in public {
+            assert!(is_public(&a.parse::<SocketAddr>().unwrap()), "{a}");
+        }
+        for a in local {
+            assert!(!is_public(&a.parse::<SocketAddr>().unwrap()), "{a}");
+        }
+    }
+
+    /// NB-034: what each mode puts in an offer, read back by its recipient.
+    #[test]
+    fn privacy_decides_what_offers_carry() {
+        let (ia, peer, relay) = (id(1), id(2), id(3));
+        let lan: SocketAddr = "10.0.0.1:7000".parse().unwrap();
+        let lo: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let public: SocketAddr = "198.51.100.1:7000".parse().unwrap();
+        let mut ep = Endpoint::new(&ia, Config::default(), [1; 32]);
+        let mut t = Traversal::new(&ia, [3; 32], 0, vec![lan, lo], vec![]);
+        t.public = Some(public);
+        t.handle_event(Instant::ZERO, &mut ep, &Event::AddrObserved { by: relay.peer_id(), addr: "192.168.0.9:1".parse().unwrap() });
+        let now = Instant::from_millis(10);
+        let offer_to = |t: &mut Traversal<SocketAddr>, ep: &mut Endpoint<SocketAddr>, to: &Identity| {
+            while t.poll_signal().is_some() {}
+            t.introduce(now, ep, to.peer_id(), Some([5; 32]));
+            let o = sent_offers(t, to);
+            assert_eq!(o.len(), 1);
+            assert_eq!(o[0].kind, Proof::Invite, "proved with the invite key");
+            (o[0].addrs.clone(), o[0].relays.clone())
+        };
+        assert_eq!(offer_to(&mut t, &mut ep, &peer).0, vec![public, "192.168.0.9:1".parse().unwrap(), lan, lo]);
+        t.set_privacy(&mut ep, Privacy::PublicOnly);
+        assert_eq!(offer_to(&mut t, &mut ep, &peer).0, vec![public]);
+        assert_eq!(t.candidates(), vec![public]);
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: Some(relay.peer_id()) });
+        assert!(ep.relay_only());
+        assert_eq!(offer_to(&mut t, &mut ep, &peer), (vec![], vec![]), "nothing, not even the relay while unlinked");
+        assert_eq!(offer_to(&mut t, &mut ep, &relay).0, vec![public], "the relay gets the public address");
+        assert_eq!(t.candidates(), vec![]);
+        t.set_privacy(&mut ep, Privacy::Direct);
+        assert!(!ep.relay_only());
+    }
+
+    /// A relay-only node dials others only through its relay, whatever their
+    /// offers carry, and in a host/client room the host is the relay.
+    #[test]
+    fn relay_only_dials_through_the_relay() {
+        let me = id(1).peer_id();
+        let there: SocketAddr = "198.51.100.9:4000".parse().unwrap();
+        let (key, inbox) = (room_key(ROOM.0, ROOM.1), Topic::peer(&me));
+        let (mut t, mut ep) = in_room(Role::Client, None, "10.0.0.1:7000".parse().unwrap());
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: None });
+        assert_eq!(t.relay(), None);
+        let now = Instant::from_millis(10);
+        // The host proves its role: it is the relay, and dialled directly.
+        let host = id(2);
+        t.handle_signal(now, &mut ep, inbox, &offer_from(&host, &me, Some(&key), 1, Role::Host, vec![there]));
+        assert_eq!(t.relay(), Some(host.peer_id()));
+        assert_eq!(dials(&mut ep, now), vec![there]);
+        // Pinning a host makes it the relay before it says anything.
+        let (mut t, mut ep) = in_room(Role::Client, Some(id(4).peer_id()), "10.0.0.1:7000".parse().unwrap());
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: None });
+        assert_eq!(t.relay(), Some(id(4).peer_id()));
+        // Anyone else is never dialled at its addresses (the relay isn't linked: no dial at all).
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: Some(id(3).peer_id()) });
+        t.handle_signal(now, &mut ep, inbox, &offer_from(&id(5), &me, Some(&key), 1, Role::Peer, vec![there]));
+        assert_eq!(dials(&mut ep, now), vec![]);
+        assert_eq!(published(&mut t), 1, "answered, with no address");
+    }
+
+    /// NB-034 R1: a relay-only client's relay is the first Host it dials, and stays
+    /// so: a second Host (here with the lower PeerId, which used to win) is never
+    /// dialled directly, until the first's dial fails.
+    #[test]
+    fn relay_only_client_dials_exactly_one_host_directly() {
+        let me = id(1).peer_id();
+        let (key, inbox) = (room_key(ROOM.0, ROOM.1), Topic::peer(&me));
+        let (first_at, second_at): (SocketAddr, SocketAddr) =
+            ("198.51.100.9:4000".parse().unwrap(), "198.51.100.10:4000".parse().unwrap());
+        let (mut first, mut second) = (id(2), id(3));
+        if first.peer_id() < second.peer_id() {
+            std::mem::swap(&mut first, &mut second);
+        }
+        let (mut t, mut ep) = in_room(Role::Client, None, "10.0.0.1:7000".parse().unwrap());
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: None });
+        let now = Instant::from_millis(10);
+        t.handle_signal(now, &mut ep, inbox, &offer_from(&first, &me, Some(&key), 1, Role::Host, vec![first_at]));
+        assert_eq!(t.relay(), Some(first.peer_id()));
+        assert_eq!(dials(&mut ep, now), vec![first_at]);
+        t.handle_signal(now, &mut ep, inbox, &offer_from(&second, &me, Some(&key), 1, Role::Host, vec![second_at]));
+        assert_eq!(t.relay(), Some(first.peer_id()), "the relay doesn't switch");
+        assert_eq!(dials(&mut ep, now), vec![], "the second Host is not dialled at its address");
+        assert!(sent_offers(&mut t, &second).iter().all(|o| o.addrs.is_empty() && o.relays.is_empty()));
+        // Once the first dial fails, the next Host may be picked.
+        t.handle_event(now, &mut ep, &Event::ConnectFailed { peer: first.peer_id() });
+        assert_eq!(t.relay(), None);
+        let later = now + SENDER_REFILL;
+        t.handle_signal(later, &mut ep, inbox, &offer_from(&second, &me, Some(&key), 2, Role::Host, vec![second_at]));
+        assert_eq!(t.relay(), Some(second.peer_id()));
+        assert_eq!(dials(&mut ep, later), vec![second_at]);
+        // A pinned `via` overrides any pick.
+        t.set_privacy(&mut ep, Privacy::RelayOnly { via: Some(first.peer_id()) });
+        assert_eq!(t.relay(), Some(first.peer_id()));
+    }
+
+    /// NB-032: a stale or replayed-later hello is dropped.
+    #[test]
+    fn stale_hellos_are_dropped() {
+        let (key, topic) = (room_key(ROOM.0, ROOM.1), Topic::room(ROOM.0, ROOM.1));
+        let (mut t, mut ep) = in_room(Role::Peer, None, "10.0.0.1:7000".parse().unwrap());
+        let late = Instant::ZERO + Duration::from_millis(FRESH_MS + 1);
+        t.handle_signal(late, &mut ep, topic, &hello(&key, &id(5).peer_id(), Role::Peer, 0));
+        assert_eq!(published(&mut t), 0);
+        let ts = FRESH_MS + 1;
+        t.handle_signal(late, &mut ep, topic, &hello(&key, &id(5).peer_id(), Role::Peer, ts));
+        assert_eq!(published(&mut t), 1);
+    }
+
+    /// NB-032: outside a room, a plain offer from a peer this node never dialled
+    /// is ignored (knowing a PeerId gets no dial-back and no addresses), and peers
+    /// it dialled are answered even when strangers spent the node's budget.
+    #[test]
+    fn only_invite_holders_and_dialled_peers_get_answers() {
+        let ia = id(1);
+        let me = ia.peer_id();
+        let there: SocketAddr = "198.51.100.9:4000".parse().unwrap();
+        let mut ep = Endpoint::new(&ia, Config::default(), [1; 32]);
+        let mut t = Traversal::new(&ia, [3; 32], 0, vec!["10.0.0.1:7000".parse().unwrap()], vec![]);
+        while t.poll_signal().is_some() {}
+        let now = Instant::from_millis(10);
+        let inbox = Topic::peer(&me);
+        t.handle_signal(now, &mut ep, inbox, &proved_offer(&id(2), &me, None, 1, Role::Peer, vec![there]));
+        let wrong = proved_offer(&id(2), &me, Some((Proof::Invite, &[0; 32])), 2, Role::Peer, vec![there]);
+        t.handle_signal(now, &mut ep, inbox, &wrong);
+        // Nor does a room offer outside a room.
+        let room = proved_offer(&id(2), &me, Some((Proof::Room, &room_key(ROOM.0, ROOM.1))), 3, Role::Peer, vec![there]);
+        t.handle_signal(now, &mut ep, inbox, &room);
+        assert_eq!((dials(&mut ep, now), published(&mut t)), (vec![], 0));
+        // Invite holders spend the node's whole offer budget...
+        let k = t.invite_key();
+        for n in 0..BURST as u8 + 5 {
+            t.handle_signal(now, &mut ep, inbox, &proved_offer(&id(100 + n), &me, Some((Proof::Invite, &k)), 1, Role::Peer, vec![]));
+        }
+        assert_eq!(published(&mut t), BURST as usize);
+        // ...but a peer this node dialled is still answered (dialled, no reply asked twice).
+        t.introduce(now, &ep, id(9).peer_id(), None);
+        assert_eq!(published(&mut t), 1);
+        let answer = proved_offer(&id(9), &me, None, 1, Role::Peer, vec![there]);
+        t.handle_signal(now, &mut ep, inbox, &answer);
+        assert_eq!(dials(&mut ep, now), vec![there]);
     }
 
     #[test]
@@ -1009,7 +1378,7 @@ mod tests {
         let mut tb = Traversal::new(&ib, [4; 32], base, vec![b_addr], vec![]);
         let now = Instant::from_millis(10);
         assert_eq!(ta.poll_signal(), Some(Signal::Subscribe(Topic::peer(&ia.peer_id()))));
-        ta.introduce(now, &ea, ib.peer_id());
+        ta.introduce(now, &ea, ib.peer_id(), Some(tb.invite_key()));
         let Some(Signal::Publish(topic, sealed)) = ta.poll_signal() else { panic!() };
         assert_eq!(topic, Topic::peer(&ib.peer_id()));
         tb.handle_signal(now, &mut eb, topic, &sealed);

@@ -65,6 +65,8 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `get_connect_error() -> String` | After `connection_failed`: `symmetric` (NATs make punching impossible), `unreachable`, or `""` |
 | `set_stun_servers(PackedStringArray)` | `host:port` list, from the next host/join. Default Google + Cloudflare; empty: off |
 | `set_signaling_relays(PackedStringArray)` | Nostr relay URLs, from the next host/join. Default `wss://relay.damus.io`, `wss://nos.lol`; empty: off |
+| `set_privacy_mode(mode: int)` | Which addresses this peer gives out: `PRIVACY_DIRECT` (default), `PRIVACY_PUBLIC_ONLY`, `PRIVACY_RELAY_ONLY`. From the next host/join, and for the running session's next invites and offers; links already up are kept. See [Privacy](#privacy) |
+| `get_privacy_mode() -> int` | The mode set |
 | `get_peer_key(id) -> PackedByteArray` | The 32-byte Ed25519 key that authenticated peer `id`'s link (empty if not directly connected) |
 | `get_public_key() -> PackedByteArray` | This peer's own key |
 | `get_peer_rtt_ms(id) -> float` | Smoothed RTT to a directly connected peer, `-1` if unknown |
@@ -135,7 +137,9 @@ read or changed on the way. Everything Godot does with those bytes is outside th
 - **Relaying between joiners is Godot's server relay** (`multiplayer.server_relay`, on by default): the host's
   SceneMultiplayer forwards joiner packets, and the binding only reports that it can. Set
   `multiplayer.server_relay = false` on the host to stop it. Joiners then see only the host.
-- **The invite is not a password; the room name is.** An invite holds no secret, so anyone who has it can join.
+- **The invite is not a password; the room name is.** Anyone who has the invite can join. It carries a key that
+  lets its holder ask the host to dial back (to punch through NATs); someone who knows only the host's public key
+  can't.
   - **Rooms.** Relays only see a hash of the room name. Hellos and offers carry an HMAC under a key derived from
     the name, so a peer that doesn't know the name can't join the room or pose as its host. Links from such peers
     are closed unseen.
@@ -156,10 +160,30 @@ read or changed on the way. Everything Godot does with those bytes is outside th
   `cargo run -p nobaas --features nostr --example nostr_relay` is a minimal relay for a LAN. On a `ws://` relay,
   anyone on the network path can drop or inject events. Offers stay sealed and hellos stay proven, so that can stop
   a game from connecting but not let anyone into it.
-- **Your key works like an invite.** Anyone who knows your public key can send you a sealed offer, and an answer
-  reveals your LAN and public addresses and up to 8 keys you are linked to. Rooms limit this to members.
+- **Your key alone gets nothing.** A peer answers an offer, and so reveals its addresses and up to 8 keys it is
+  linked to, only to room members (who know the name), holders of its invite, or peers it dialled.
 - **Malformed packets** fail at the binding's `decode` and are dropped. Payloads above the lane caps are refused
   on the way out. Rust panics are caught at the GDExtension boundary by godot-rust and never unwind into Godot.
+
+## Privacy
+
+Players link only with the host, so with Godot's server relay they never see each other's IP addresses, in any
+mode. The host sees every player's public address, and players see the host's. `set_privacy_mode` decides what a
+peer gives out beyond that:
+
+| Mode | A joiner gives out | A host gives out |
+|---|---|---|
+| `PRIVACY_DIRECT` (default) | public, LAN and loopback addresses, to the host (and in its own invite) | the same, in its invite and to every joiner |
+| `PRIVACY_PUBLIC_ONLY` | public addresses only: no LAN or loopback address | public addresses only. Players on the host's LAN then reach it through the router (if it supports hairpinning) |
+| `PRIVACY_RELAY_ONLY` | its public addresses to the host only, and nothing to anyone else (its own invite names no address) | as `PRIVACY_PUBLIC_ONLY`: the host is the relay, and every player links to it directly |
+
+Under `PRIVACY_RELAY_ONLY` a room player's relay is the first peer that proves it hosts the room; anyone who knows
+the room name can claim that and so learn the player's IP. Use `join_room_host()` when the host's key is known. A
+player's own invite names the host as its relay, with the host's address.
+
+```gdscript
+peer.set_privacy_mode(NobaasMultiplayerPeer.PRIVACY_PUBLIC_ONLY)   # before host*() / join*(), or any time
+```
 
 ## Demo
 
@@ -175,7 +199,8 @@ GODOT=godot ./examples/godot/test.sh     # headless check on loopback: invite ru
 ```
 
 `test.sh` runs a host and a joiner headless, twice: by invite, then by room through a local Nostr relay
-(`examples/rust/nostr_relay.rs`). It passes `--stun=none` and a local or no relay, so it touches no public
+(`examples/rust/nostr_relay.rs`). The joiner is `--privacy=public-only` in the first run and `relay-only` in the
+second. It passes `--stun=none` and a local or no relay, so it touches no public
 service. The instances move by themselves and chat. Each passes once it has seen the other peer's square move and
 received its chat line:
 

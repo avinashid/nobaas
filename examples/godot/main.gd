@@ -6,7 +6,8 @@ extends Node2D
 ## Headless check (see test.sh): `-- --host=FILE` writes the invite to FILE,
 ## `-- --join=FILE` reads it; `-- --host-room=ROOM` / `-- --join-room=ROOM` meet by
 ## room instead. `--stun=a:3478,b:3478` and `--relay=wss://…,…` set the STUN servers
-## and Nostr relays (`none` turns either off). Both move by themselves, chat, and
+## and Nostr relays (`none` turns either off); `--privacy=public-only|relay-only`
+## which addresses this peer gives out. Both move by themselves, chat, and
 ## quit with 0 once they have seen another peer's square move and its chat line,
 ## or 1 on timeout.
 
@@ -52,6 +53,13 @@ func _ready() -> void:
 		peer.set_stun_servers(_list(args["stun"]))
 	if args.has("relay"):
 		peer.set_signaling_relays(_list(args["relay"]))
+	if args.has("privacy"):
+		var modes := {"direct": NobaasMultiplayerPeer.PRIVACY_DIRECT,
+			"public-only": NobaasMultiplayerPeer.PRIVACY_PUBLIC_ONLY,
+			"relay-only": NobaasMultiplayerPeer.PRIVACY_RELAY_ONLY}
+		peer.set_privacy_mode(modes[args["privacy"]])
+		assert(peer.get_privacy_mode() == modes[args["privacy"]])
+		_log("privacy: %s" % args["privacy"])
 	headless = args.has("host") or args.has("join") or args.has("host-room") or args.has("join-room")
 	if args.has("host"):
 		_host()
