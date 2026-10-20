@@ -933,6 +933,74 @@ mod tests {
         assert_eq!((host.available(), host.inbox_bytes), (0, 0));
     }
 
+    /// NB-014: frames, mutated, round-trip through `decode`; and a joiner fed
+    /// random frames from its host, from known peers and from strangers takes
+    /// its id only from the host's first ASSIGN, queues packets only from peers
+    /// it knows, and keeps the inbox within its caps.
+    #[test]
+    fn fuzz_frames_from_peers() {
+        use nobaas_sim::fuzz::{cases, mutate, run, Rng};
+        let modes = [Mode::Unreliable, Mode::UnreliableOrdered, Mode::Reliable];
+        let frame = |rng: &mut Rng| {
+            let mut b = match rng.below(4) {
+                0 => encode_assign(rng.u32() as i32 >> rng.below(31)),
+                _ => {
+                    let (mode, channel, n) = (*rng.pick(&modes), rng.below(4) as u8, rng.below(300));
+                    encode_data(mode, channel, rng.u32(), &rng.bytes(n))
+                }
+            };
+            if rng.one_in(3) {
+                mutate(rng, &mut b, 400);
+            }
+            b
+        };
+        run("godot-frames", cases(30_000), frame, |b| {
+            let again = match decode(b) {
+                None => return,
+                Some(Frame::Assign(id)) => {
+                    assert!(id >= 2);
+                    encode_assign(id)
+                }
+                Some(Frame::Data { mode, channel, seq, payload }) => encode_data(mode, channel, seq, payload),
+            };
+            assert_eq!(again, b);
+        });
+
+        let host = Session::host(local());
+        let mut s = Session::join(local(), &host.invite()).unwrap();
+        let hp = s.host_peer.unwrap();
+        let known: Vec<PeerId> = (0..4).map(|i| peer(20 + i, i)).collect();
+        let mut allowed: Vec<i32> = known.iter().map(|p| s.ids.assign(*p)).collect();
+        let mut rng = Rng::for_target("godot-session");
+        let mut assigned = None;
+        for i in 0..cases(20_000) {
+            let from = match rng.below(4) {
+                0 => hp,
+                1 => peer(99, rng.byte()),
+                _ => *rng.pick(&known),
+            };
+            let b = frame(&mut rng);
+            let (before, queued) = (s.my_id, s.inbox.len());
+            s.on_message(from, &b);
+            if s.my_id != before {
+                assert!(before == 0 && from == hp && assigned.is_none(), "case {i}: id {before} -> {}", s.my_id);
+                assigned = Some(s.my_id);
+                allowed.push(HOST_ID);
+            }
+            if s.inbox.len() > queued || s.inbox.len() == MAX_INBOX {
+                assert!(allowed.contains(&s.inbox.back().unwrap().from), "case {i}: a packet from a stranger");
+            }
+            assert!(s.inbox.len() <= MAX_INBOX && s.inbox_bytes <= MAX_INBOX_BYTES);
+            if i % 512 == 0 {
+                assert_eq!(s.inbox_bytes, s.inbox.iter().map(|p| p.data.len()).sum::<usize>());
+            }
+            if rng.one_in(4) {
+                s.pop();
+            }
+        }
+        assert!(assigned.is_some_and(|id| id >= 2));
+    }
+
     /// NB-030 G4: `set_target_peer(i32::MIN)` (all but a peer that can't exist) sends
     /// to everyone, without overflowing.
     #[test]

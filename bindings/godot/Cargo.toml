@@ -19,3 +19,5 @@ godot = { version = "=0.5.5", features = ["api-4-3"] }
 [dev-dependencies]
 # Tests map a port through a fake gateway on loopback.
 nobaas = { path = "../../crates/nobaas", features = ["nostr", "testing"] }
+# The fuzz harness (nobaas_sim::fuzz).
+nobaas-sim = { path = "../../crates/nobaas-sim" }

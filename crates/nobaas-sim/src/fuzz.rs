@@ -135,3 +135,53 @@ pub fn run(name: &str, cases: usize, mut gen: impl FnMut(&mut Rng) -> Vec<u8>, m
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SimAddr;
+    use nobaas_core::Address;
+
+    #[test]
+    fn the_harness_is_deterministic_and_bounded() {
+        let draw = || {
+            let mut rng = Rng::for_target("self");
+            let mut b = rng.bytes(64);
+            (0..200)
+                .map(|_| {
+                    mutate(&mut rng, &mut b, 100);
+                    assert!(b.len() <= 100);
+                    b.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(draw(), draw(), "a seed replays the same cases");
+        assert_ne!(Rng::for_target("a").u64(), Rng::for_target("b").u64(), "targets get their own streams");
+        let caught = panic::catch_unwind(|| run("self", 10, |rng| rng.bytes(3), |b| assert!(b.len() != 3)));
+        assert!(caught.is_err(), "a failing case fails the test");
+    }
+
+    #[test]
+    fn fuzz_sim_addresses() {
+        run(
+            "simaddr",
+            cases(20_000),
+            |rng| {
+                let mut b = Vec::new();
+                SimAddr::new(rng.u32(), rng.u32() as u16).encode(&mut b);
+                if rng.below(3) != 0 {
+                    mutate(rng, &mut b, 24);
+                }
+                b
+            },
+            |b| {
+                if let Some(a) = SimAddr::decode(b) {
+                    let mut v = Vec::new();
+                    a.encode(&mut v);
+                    assert_eq!(v, b);
+                    assert_eq!(a.to_socket_addr().and_then(SimAddr::from_socket_addr), Some(a));
+                }
+            },
+        );
+    }
+}
