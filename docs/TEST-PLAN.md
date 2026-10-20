@@ -24,6 +24,7 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 | Node privacy | `node packages/js/test/privacy.mjs` | host candidates are filtered; a relay-only endpoint links through its relay and refuses a direct dial |
 | Node room | `node packages/js/test/room_node.mjs` | three `joinRoom` peers mesh; presence, lanes, targeted sends, backpressure, leave, a late joiner and `poll()` work |
 | Node peer ids | `node packages/js/test/peer_id.mjs` | SEC-1: an over-long or malformed peer id (the 8192-character repro, wrong sizes, uppercase, non-strings) throws a TypeError at every wasm copy and the module keeps working; BroadcastChannel, Nostr, WebRTC, local and room signalling drop a `from` that isn't 64 lowercase hex |
+| Node nostr bounds | `node packages/js/test/nostr_bounds.mjs` | PERF-2: 12,000 distinct relay events keep `NostrSignaling.seen` at `MAX_SEEN` (4096), oldest evicted first, recent duplicates still dropped; non-string ids and non-array tags are ignored without throwing; base64 round-trips 100 KB and 1 MB |
 | Browser | `node packages/js/test/browser.mjs 2` | two Chromium tabs form a WebRTC mesh on loopback and exchange data |
 | Arena | `node packages/js/test/arena.mjs 8 10` | every island's checkpoint hashes match, ticks keep confirming |
 | README chat | `node packages/js/test/readme.mjs` | the chat block in `packages/js/README.md` runs in two tabs, messages cross both ways, and it stays ≤ 10 lines |

@@ -163,6 +163,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/peer_id.mjs`: untrusted peer ids. A malformed or over-long id
   throws a `TypeError` before any copy into wasm memory, and every signalling layer
   drops a `from` that isn't 64 lowercase hex characters.
+- `node packages/js/test/nostr_bounds.mjs`: a flood of 12,000 distinct Nostr events
+  keeps the de-duplication set at 4096 ids, malformed events don't throw, and base64
+  round-trips bodies up to 1 MB. No relays.
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's.
