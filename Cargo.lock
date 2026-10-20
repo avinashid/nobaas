@@ -524,6 +524,7 @@ version = "0.1.0"
 dependencies = [
  "k256",
  "nobaas-core",
+ "nobaas-sim",
  "rand_chacha",
  "rand_core",
 ]
