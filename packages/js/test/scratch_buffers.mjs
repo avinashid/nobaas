@@ -17,12 +17,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const enc = new TextEncoder();
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
-// Counts nb_alloc calls an endpoint makes.
+// Counts nb_alloc calls an endpoint makes, and records its nb_free calls.
 const spy = (ep) => {
   ep.allocs = 0;
+  ep.frees = [];
+  const wrap = { nb_alloc: (v) => (...args) => (ep.allocs++, v(...args)), nb_free: (v) => (...args) => (ep.frees.push(`${args[0]}:${args[1]}`), v(...args)) };
   ep.nb = Object.assign(Object.create(nb), {
-    x: Object.fromEntries(Object.entries(nb.x).map(([k, v]) => [k,
-      typeof v === 'function' && k === 'nb_alloc' ? (...args) => (ep.allocs++, v(...args)) : v])),
+    x: Object.fromEntries(Object.entries(nb.x).map(([k, v]) => [k, wrap[k] ? wrap[k](v) : v])),
   });
   return ep;
 };
@@ -79,7 +80,37 @@ check(toHex(new Uint8Array(0)) === '' && fromHex('abc').length === 1 && fromHex(
 const odd = ['zz', '1g', 'g1', '0x10', ' 1', '1 ', 'éé', 'abšc'];
 check(odd.every((s) => same(fromHex(s), oldFromHex(s))), `fromHex reads non-hex input as the old code did (${odd.map((s) => toHex(fromHex(s))).join(' ')})`);
 
+// setPeer remembers the last id given as text, and skips the copy when it comes again:
+// whatever came in between (another id, bytes, an invalid id), peerBuf must hold the id asked for.
+const held = () => toHex(nb.mem().slice(a.peerBuf, a.peerBuf + 32));
+const idX = toHex(bytes(32, 21));
+const idY = toHex(bytes(32, 22));
+const seq = [[idX, idX], [idY, idY], [idY, idY], [fromHex(idX), idX], [idY, idY], ['bad', null], [idY, idY], [fromHex(idY), idY], [idX, idX]];
+const seen = seq.map(([id, want]) => {
+  try {
+    a.setPeer(id);
+  } catch {
+    return want === null;
+  }
+  return held() === want;
+});
+check(seen.every(Boolean), `setPeer holds the id asked for after text, repeats, bytes and an invalid id (${seen.map((v) => (v ? 1 : 0)).join('')})`);
+
+// sendRetry (PERF-4): a message over the send buffer that would block stays in wasm
+// memory, so trying it again copies nothing; it is freed once sent, or at close().
+got.length = 0;
+const big = bytes(512 * 1024, 11);
+let blocked = 0;
+for (let i = 0; i < 16 && !blocked; i++) if (a.sendRetry(b.id, big) === -3) blocked = 1;
+check(blocked === 1 && a.kept?.data === big, 'sendRetry: the send window filled, and the blocked message is kept');
+const kept = `${a.kept.p}:${a.kept.n}`;
+const allocs0 = a.allocs;
+check(a.sendRetry(b.id, big) === -3 && a.allocs === allocs0 && a.kept?.data === big, 'sendRetry: trying the kept message again allocates nothing');
+a.send(b.id, bytes(100, 12));
+check(a.kept?.data === big, 'send() of other bytes leaves the kept message alone');
+a.frees.length = 0;
 a.close();
+check(a.kept === null && a.frees.includes(kept), `close() frees the kept message (${kept})`);
 b.close();
 console.log(failed ? `${failed} FAILED` : 'scratch buffers: all passed');
 process.exit(failed ? 1 : 0);

@@ -69,6 +69,7 @@ const throws = (fn, what) => {
   check(false, `${what} throws`);
 };
 throws(() => b.send(a.id, 'x'), 'send');
+throws(() => b.sendRetry(a.id, 'x'), 'send');
 throws(() => b.connect(2, a.peerId), 'connect');
 throws(() => b.connectVia(a.id, a.peerId), 'connectVia');
 check(b.secret() === null, 'secret() is null');

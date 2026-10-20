@@ -61,6 +61,7 @@ jobs:
       - run: node packages/js/test/pump_rearm.mjs
       - run: node packages/js/test/endpoint_closed.mjs
       - run: node packages/js/test/scratch_buffers.mjs
+      - run: node packages/js/test/room_drain.mjs
 
   docker:
     name: docker build
