@@ -222,18 +222,25 @@ impl Sim {
         }
     }
 
-    fn alloc_ip(&mut self) -> u32 {
-        let ip = self.next_ip;
+    /// A fresh IP: public-looking (11.x) on the internet (realm 0), 100.64.x for a
+    /// home NAT's outside inside a carrier-grade NAT, 10.x behind a NAT, so
+    /// filters on private ranges behave as on real networks.
+    fn alloc_ip(&mut self, realm: usize, carrier: bool) -> u32 {
+        let n = self.next_ip;
         self.next_ip += 1;
-        ip
+        match (realm, carrier) {
+            (0, _) => 0x0b00_0000 | (n & 0x00ff_ffff),
+            (_, true) => 0x6440_0000 | (n & 0x003f_ffff),
+            _ => n,
+        }
     }
 
     /// Adds a NAT whose outside is the internet (`parent: None`) or the inside
     /// of NAT `parent` (a home router behind a carrier-grade NAT).
     pub fn add_nat(&mut self, config: NatConfig, parent: Option<usize>) -> usize {
         let n = self.nats.len();
-        let ip = self.alloc_ip();
         let outer = parent.map_or(0, |p| p + 1);
+        let ip = self.alloc_ip(outer, true);
         self.nats.push(Nat::new(config, ip, outer, n + 1));
         self.owners.insert(ip, Owner::Nat(n));
         n
@@ -251,9 +258,7 @@ impl Sim {
     /// Adds a node inside NAT `nat`.
     pub fn add_node_behind(&mut self, nat: usize, config: Config) -> usize {
         let identity = Identity::generate(&mut self.rng);
-        let i = self.add_node_with(identity, config);
-        self.nodes[i].realm = nat + 1;
-        i
+        self.add_node_in(identity, config, nat + 1)
     }
 
     pub fn add_node(&mut self, config: Config) -> usize {
@@ -263,15 +268,19 @@ impl Sim {
 
     /// Adds a node with a given identity (e.g. to simulate a restart).
     pub fn add_node_with(&mut self, identity: Identity, config: Config) -> usize {
+        self.add_node_in(identity, config, 0)
+    }
+
+    fn add_node_in(&mut self, identity: Identity, config: Config, realm: usize) -> usize {
         let mut seed = [0u8; 32];
         self.rng.fill_bytes(&mut seed);
-        let addr = SimAddr::new(self.alloc_ip(), HOST_PORT);
+        let addr = SimAddr::new(self.alloc_ip(realm, false), HOST_PORT);
         let i = self.nodes.len();
         self.nodes.push(Node {
             endpoint: Endpoint::new(&identity, config, seed),
             identity,
             addr,
-            realm: 0,
+            realm,
             events: Vec::new(),
             event_times: Vec::new(),
             uplink_bps: None,
@@ -349,7 +358,7 @@ impl Sim {
 
     /// Adds a STUN server on the internet; returns its address.
     pub fn add_stun_server(&mut self) -> SimAddr {
-        let ip = self.alloc_ip();
+        let ip = self.alloc_ip(0, false);
         self.owners.insert(ip, Owner::Stun);
         SimAddr::new(ip, 3478)
     }

@@ -167,7 +167,7 @@ impl Node {
 
     /// An `nb:` invite with this node's [`addresses`](Node::addresses). It holds no secret.
     pub fn invite(&self) -> String {
-        Invite { peer: self.peer_id(), addrs: self.addresses(), relays: Vec::new() }.to_link()
+        Invite { peer: self.peer_id(), key: None, addrs: self.addresses(), relays: Vec::new() }.to_link()
     }
 
     /// Addresses a peer may reach this node at, as put in [`invite`](Node::invite):

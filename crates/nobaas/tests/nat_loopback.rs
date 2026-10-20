@@ -104,7 +104,7 @@ fn invite_join_dials_back_over_signaling() {
     let hub = MemoryHub::new();
     let (mut host, mut guest) = (room_node(&hub), room_node(&hub));
     let dead = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap(); // closed when dropped
-    let invite = nobaas_core::Invite { peer: host.peer_id(), addrs: vec![dead], relays: vec![] }.to_link();
+    let invite = nobaas_core::Invite { peer: host.peer_id(), key: None, addrs: vec![dead], relays: vec![] }.to_link();
     let h = guest.connect(&invite).unwrap();
     let g = guest.peer_id();
     assert!(pump(&mut [&mut host, &mut guest], 5, |n| linked(n[0], g) && linked(n[1], h)));

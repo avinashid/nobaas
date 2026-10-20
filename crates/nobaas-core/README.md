@@ -48,7 +48,7 @@ and the time, and takes out datagrams, events and the next timer deadline.
 - **Public address:** every direct peer reports where it sees you (`Event::AddrObserved`),
   so any peer works as STUN. `stun` has a sans-IO RFC 5389 client codec for real STUN
   servers. It demultiplexes against Nobaas packets on the same socket (RFC 7983 first-byte ranges).
-- **Invites:** `Invite { peer, addrs, relays }` ⇄ a `nb:` base64url link for QR codes,
+- **Invites:** `Invite { peer, key, addrs, relays }` ⇄ a `nb:` base64url link for QR codes,
   URLs or signaling notes.
 - **Addresses** implement `Address` (encode/decode, optional `port_offset`). `SocketAddr`
   does out of the box.
