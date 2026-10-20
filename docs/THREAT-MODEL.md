@@ -55,7 +55,7 @@ global passive adversary; malicious application code above the API.
 Severity uses likelihood × impact for this software's threat model. Each finding
 that needs a change is tracked as an NB card.
 
-**Status as of `a65873c`, with `4cffbf9` (NPM-1) on review.**
+**Status as of `9273ea3`, with `6f947f3` (NPM-3).**
 
 | Finding | Status |
 |---|---|
@@ -66,9 +66,9 @@ that needs a change is tracked as an NB card.
 | SEC-9…SEC-11 | Requirements met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 open |
 | SEC-12 (Info) | Accepted, no card |
 | N38-1…N38-3 (port mapping) | **Fixed** in NB-038 (`71d83b2`) and NB-041 (`0dfdbc9`) |
-| NPM-1 (Low) | **Fixed** by `4cffbf9`: no port mapping under `RelayOnly` |
+| NPM-1 (Low) | **Fixed** by `4cffbf9` (merged `14f463a`): no port mapping under `RelayOnly` |
 | NPM-2 (Low) | **Fixed** in `docs/GODOT.md` (`9be92d5`); the flood risk itself is SEC-4 |
-| NPM-3 (Low) | Open: a map request in flight at stop isn't deleted |
+| NPM-3 (Low) | **Fixed** by `6f947f3`: a map request in flight at stop gets one delete |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
 
@@ -281,7 +281,7 @@ Findings:
   was taken as a permanent mapping; it is now a refusal.
 - **N38-3 (fixed, NB-041 `bf769e9`).** A UPnP chain stopped half-way kept
   sending; the worker now checks stop before each HTTP exchange.
-- **NPM-1 (Low, fixed by `4cffbf9`).** Under `Privacy::RelayOnly` the mapped
+- **NPM-1 (Low, fixed by `4cffbf9`, merged `14f463a`).** Under `Privacy::RelayOnly` the mapped
   address is never given out, yet the port was still opened. Now a relay-only
   node asks the router nothing (state `RelayOnly`). Switching to relay-only
   deletes the mapping without blocking, and switching out maps again after the
@@ -289,12 +289,13 @@ Findings:
   out its public addresses as under `PublicOnly`.
 - **NPM-2 (Low, fixed in `docs/GODOT.md`, `9be92d5`).** The doc said the port
   "reaches only the Noise endpoint" without the SEC-4 flood caveat.
-- **NPM-3 (Low, open).** `Mapper::stop()` deletes only a lease it holds. A PCP or
-  NAT-PMP map request still unanswered when the worker stops (drop right after
-  bind, or `set_privacy(RelayOnly)` right after a map request) gets no delete, so
-  the router's late grant stays open for its lease (2 h). **Fix:** on stop with a
-  request outstanding, send one lifetime-0 delete for the requested port (PCP
-  with the same nonce).
+- **NPM-3 (Low, fixed by `6f947f3`).** `Mapper::stop()` deleted only a lease it
+  held. A PCP or NAT-PMP map request still unanswered when the worker stopped
+  (drop right after bind, or `set_privacy(RelayOnly)` right after a map request)
+  got no delete, so the router's late grant stayed open for its lease (2 h). Now
+  a stop with no lease and a map request out sends one lifetime-0 delete: PCP
+  with the same nonce and no suggested address (RFC 6887 §15), NAT-PMP with
+  external port 0 (RFC 6886 §3.4). With a lease held, only `release()` deletes.
 
 ---
 
