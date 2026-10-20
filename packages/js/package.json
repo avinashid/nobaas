@@ -22,6 +22,7 @@
   "scripts": {
     "build": "./build.sh",
     "prepack": "./build.sh",
+    "bench": "node test/bench.mjs",
     "test": "node test/node_pair.mjs && node test/room_node.mjs && node test/readme.mjs && node test/poll.mjs"
   }
 }
