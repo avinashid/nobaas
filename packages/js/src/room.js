@@ -21,7 +21,7 @@
 // room.poll() / room.receive() return queued events as plain objects (strings,
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
 
-import { loadNobaas, Lane, toHex, fromHex } from './nobaas.js';
+import { loadNobaas, Lane, toHex, fromHex, isPeerId } from './nobaas.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
 import { NostrSignaling } from './nostr.js';
 import { LocalTransport } from './local.js';
@@ -258,8 +258,9 @@ export class Room {
   }
 
   async onHello(peer, meta) {
+    // A custom signalling adapter may pass anything along: only PeerIds are dialled.
     // `meta.nb` marks a Rust UDP peer, which WebRTC can't dial.
-    if (this.left || this.transport.has(peer) || meta?.nb) return;
+    if (this.left || !isPeerId(peer) || peer === this.self || this.transport.has(peer) || meta?.nb) return;
     // Knowing the topic isn't enough: only hellos that prove the room key count.
     if (!(await this.proof.checkHello(peer, meta))) return;
     if (this.left || this.transport.has(peer)) return;

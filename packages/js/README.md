@@ -160,6 +160,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_node.mjs`: `joinRoom` with three peers in Node: presence,
   message types, lanes, targeted sends, backpressure, leaving, a late joiner and
   the pull-style `poll()`/`receive()`/`sendTo()` path.
+- `node packages/js/test/peer_id.mjs`: untrusted peer ids. A malformed or over-long id
+  throws a `TypeError` before any copy into wasm memory, and every signalling layer
+  drops a `from` that isn't 64 lowercase hex characters.
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's.
