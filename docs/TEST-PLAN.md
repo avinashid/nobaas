@@ -24,6 +24,7 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 | Node privacy | `node packages/js/test/privacy.mjs` | host candidates are filtered; a relay-only endpoint links through its relay and refuses a direct dial |
 | Node room | `node packages/js/test/room_node.mjs` | three `joinRoom` peers mesh; presence, lanes, targeted sends, backpressure, leave, a late joiner and `poll()` work |
 | Node peer ids | `node packages/js/test/peer_id.mjs` | SEC-1: an over-long or malformed peer id (the 8192-character repro, wrong sizes, uppercase, non-strings) throws a TypeError at every wasm copy and the module keeps working; BroadcastChannel, Nostr, WebRTC, local and room signalling drop a `from` that isn't 64 lowercase hex |
+| Node pump re-arm | `node packages/js/test/pump_rearm.mjs` | PERF-1: the endpoint re-arms its timer whatever `onTransmit` or `onEvent` do; a reliable message sent while the transport throws, refuses, or has a DataChannel over `MAX_BUFFERED` (1 MiB) queued arrives after the outage by retransmit, well inside the 10 s keepalive; `WebRtcTransport` counts those drops in `congested` |
 | Browser | `node packages/js/test/browser.mjs 2` | two Chromium tabs form a WebRTC mesh on loopback and exchange data |
 | Arena | `node packages/js/test/arena.mjs 8 10` | every island's checkpoint hashes match, ticks keep confirming |
 | README chat | `node packages/js/test/readme.mjs` | the chat block in `packages/js/README.md` runs in two tabs, messages cross both ways, and it stays ≤ 10 lines |

@@ -197,6 +197,8 @@ export declare class Endpoint {
   /** Called with (transport handle, datagram) for each datagram to send. */
   onTransmit: (addr: number, bytes: Uint8Array) => void;
   onEvent: (event: EndpointEvent) => void;
+  /** Datagrams lost because `onTransmit` threw; the endpoint keeps running and retransmits. */
+  readonly transmitErrors: number;
   secret(): Uint8Array;
   connect(addr: number, peer: PeerId | Uint8Array): number;
   connectVia(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): number;
@@ -249,6 +251,10 @@ export declare class WebRtcTransport implements Transport {
       RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
     },
   );
+  /** Datagrams dropped by the simulated `loss` option. */
+  readonly dropped: number;
+  /** Datagrams dropped because the DataChannel had over 1 MiB queued or `send` threw. */
+  readonly congested: number;
   dial(peer: PeerId): Promise<void>;
   has(peer: PeerId): boolean;
   drop(peer: PeerId): void;

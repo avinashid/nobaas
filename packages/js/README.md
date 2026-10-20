@@ -166,6 +166,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's.
+- `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
+  DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
+  the outage still arrives after it, by retransmit.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
