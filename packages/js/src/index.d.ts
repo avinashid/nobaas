@@ -128,7 +128,8 @@ export declare class Room {
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
   /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,
-   * where it also runs): the promise is already settled. */
+   * where it also runs): the promise is already settled. Reliable messages not yet acknowledged may not arrive:
+   * the goodbye can overtake them. */
   leave(): Promise<void>;
 }
 
