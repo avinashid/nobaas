@@ -77,7 +77,8 @@ deterministically) run by one thread with its own UDP socket, so the node's sock
   mapping, and counts as a refusal. A failed renewal drops the address and starts over.
   Dropping the node deletes the mapping. It waits for that: usually a few milliseconds, at most 7 s (an HTTP
   exchange under way, then the delete's own). A UPnP chain stopped half-way (description, address, Add retries)
-  sends nothing more after the exchange under way.
+  sends nothing more after the exchange under way. A PCP or NAT-PMP map request still unanswered at the stop may
+  have made a mapping whose answer is never read, so it gets a delete too, sent once (NPM-3).
 - **After a crash.** A node that never drops leaves the mapping on the router until its lease runs out (2 hours),
   or for good under UPnP's permanent-lease fallback, until the router restarts or someone deletes it.
 - **Only public addresses.** If the router's external address is carrier-grade NAT (100.64/10) or private, another
@@ -349,8 +350,9 @@ Crates added to `nobaas` by NAT traversal:
   PCP version refusal; UPnP after PCP and NAT-PMP refusals, with port conflicts and permanent leases; the timeout
   schedule through every protocol and the 5-minute retry; a failed renewal starting over; CGNAT and private
   external addresses not advertised; SSDP answers pointing elsewhere refused; description parsing and chunked
-  HTTP. Mock PCP, NAT-PMP and UPnP gateways on loopback drive the real thread to a mapping, a renewal and the
-  delete on drop. `node.rs` checks a mapped address appears in `addresses()` and invites, and that a relay-only
+  HTTP; a stop with a PCP or NAT-PMP map request unanswered deleting it. Mock PCP, NAT-PMP and UPnP gateways on
+  loopback drive the real thread to a mapping, a renewal and the delete on drop, and a worker dropped before a
+  slow gateway answers still sends the delete. `node.rs` checks a mapped address appears in `addresses()` and invites, and that a relay-only
   node asks the gateway nothing, deletes the mapping when switched to `RelayOnly` and maps again when switched
   out; `traversal.rs` where it ranks and which privacy modes give it out.
 - `crates/nobaas/tests/room_security.rs`:
