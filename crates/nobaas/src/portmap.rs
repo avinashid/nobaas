@@ -712,7 +712,7 @@ fn run(mut m: Mapper, sock: UdpSocket, stop: &AtomicBool, states: &mpsc::Sender<
     let mut last = None;
     m.start(now());
     loop {
-        let stopping = stop.load(Ordering::Acquire);
+        let mut stopping = stop.load(Ordering::Acquire);
         if stopping {
             m.stop();
         }
@@ -721,6 +721,13 @@ fn run(mut m: Mapper, sock: UdpSocket, stop: &AtomicBool, states: &mpsc::Sender<
                 let _ = sock.send_to(&data, to);
             }
             let Some(req) = m.poll_http() else { break };
+            // Stopped mid-chain (UPnP: description, address, Add retries): drop the
+            // rest, so at most one exchange runs before the delete.
+            if !stopping && stop.load(Ordering::Acquire) {
+                stopping = true;
+                m.stop();
+                continue;
+            }
             let res = http(&req, HTTP_DEADLINE);
             m.handle_http(now(), res.as_deref());
         }
@@ -1311,5 +1318,77 @@ pub(crate) mod tests {
         let start = std::time::Instant::now();
         assert!(w.shut_down(), "the thread finished");
         assert!(start.elapsed() < HTTP_DEADLINE + Duration::from_secs(1), "{:?}", start.elapsed());
+    }
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A UPnP gateway on loopback whose `slow` actions answer after 2.8 s, and whose
+    /// AddPortMappings get `adds` in turn (0: OK, else that UPnP error). Keeps the
+    /// actions it was asked and the ports it holds mapped.
+    fn slow_upnp_gateway(slow: &'static [&'static str], adds: Vec<u16>) -> (SocketAddr, SocketAddr, Log, Log) {
+        let gw = refusing_gateway();
+        let http = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ssdp = ssdp_responder(http.local_addr().unwrap());
+        let (actions, held) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let (seen, table) = (actions.clone(), held.clone());
+        std::thread::spawn(move || {
+            let mut adds = adds.into_iter();
+            for s in http.incoming() {
+                let mut s = s.unwrap();
+                let (mut req, mut buf) = (Vec::new(), [0u8; 4096]);
+                while !http_complete(&req) && !(req.starts_with(b"GET") && req.ends_with(b"\r\n\r\n")) {
+                    let n = s.read(&mut buf).unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let req = String::from_utf8(req).unwrap();
+                let action = req.split("#").nth(1).and_then(|a| a.split('"').next()).unwrap_or("GET").to_string();
+                seen.lock().unwrap().push(action.clone());
+                if slow.contains(&action.as_str()) {
+                    std::thread::sleep(Duration::from_millis(2800));
+                }
+                let port = tag(&req, "NewExternalPort").unwrap_or_default().to_string();
+                let answer = match action.as_str() {
+                    "GET" => http_answer("200 OK", DESC),
+                    "GetExternalIPAddress" => {
+                        http_answer("200 OK", &format!("<NewExternalIPAddress>{EXT}</NewExternalIPAddress>"))
+                    }
+                    "AddPortMapping" => match adds.next().unwrap_or(0) {
+                        0 => {
+                            table.lock().unwrap().push(port);
+                            http_answer("200 OK", "")
+                        }
+                        code => http_answer("500 Error", &format!("<errorCode>{code}</errorCode>")),
+                    },
+                    _ => {
+                        table.lock().unwrap().retain(|p| *p != port);
+                        http_answer("200 OK", "")
+                    }
+                };
+                let _ = s.write_all(&answer);
+            }
+        });
+        (gw, ssdp, actions, held)
+    }
+
+    #[test]
+    fn worker_stopped_mid_upnp_chain_stops_in_time_and_leaves_nothing_mapped() {
+        // Stopped while fetching the description: the rest of the chain
+        // (address, Add, 718, 718, 725, OK) is dropped, so nothing gets mapped.
+        let (gw, ssdp, actions, held) =
+            slow_upnp_gateway(&["GET", "GetExternalIPAddress", "AddPortMapping"], vec![718, 718, 725, 0]);
+        let mut w = Worker::spawn(PORT, gw, ssdp, [9; 20]).unwrap();
+        assert!(eventually(|| actions.lock().unwrap().len() == 1), "fetching the description");
+        assert!(w.shut_down(), "the thread finished within STOP_WAIT");
+        assert_eq!(*actions.lock().unwrap(), ["GET"]);
+        assert!(held.lock().unwrap().is_empty());
+        // Stopped while a slow Add is under way that succeeds: it finishes, then the delete goes out.
+        let (gw, ssdp, actions, held) = slow_upnp_gateway(&["AddPortMapping", "DeletePortMapping"], vec![0]);
+        let mut w = Worker::spawn(PORT, gw, ssdp, [9; 20]).unwrap();
+        assert!(eventually(|| actions.lock().unwrap().len() == 3), "adding");
+        let start = std::time::Instant::now();
+        assert!(w.shut_down(), "the thread finished within STOP_WAIT");
+        assert!(start.elapsed() < STOP_WAIT, "{:?}", start.elapsed());
+        assert_eq!(actions.lock().unwrap().last().map(String::as_str), Some("DeletePortMapping"));
+        assert!(held.lock().unwrap().is_empty(), "deleted on the router");
     }
 }

@@ -76,7 +76,8 @@ deterministically) run by one thread with its own UDP socket, so the node's sock
   allows permanent UPnP leases gets one, deleted with the node. A PCP or NAT-PMP answer with lifetime 0 means no
   mapping, and counts as a refusal. A failed renewal drops the address and starts over.
   Dropping the node deletes the mapping. It waits for that: usually a few milliseconds, at most 7 s (an HTTP
-  exchange under way, then the delete's own).
+  exchange under way, then the delete's own). A UPnP chain stopped half-way (description, address, Add retries)
+  sends nothing more after the exchange under way.
 - **After a crash.** A node that never drops leaves the mapping on the router until its lease runs out (2 hours),
   or for good under UPnP's permanent-lease fallback, until the router restarts or someone deletes it.
 - **Only public addresses.** If the router's external address is carrier-grade NAT (100.64/10) or private, another
