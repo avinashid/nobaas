@@ -6,7 +6,8 @@
 export const Lane = { Reliable: 0, Unreliable: 1, Urgent: 2 };
 export const EventKind = { Connected: 1, Message: 2, Disconnected: 3, ConnectFailed: 4, PathChanged: 5, AddrObserved: 6 };
 const REASONS = ['timeout', 'closed', 'replaced', 'violation'];
-const MAX_DATAGRAM = 1232;
+// The largest datagram the core sends or accepts; transports drop anything bigger.
+export const MAX_DATAGRAM = 1232;
 
 export async function loadNobaas(source) {
   let bytes;
@@ -27,6 +28,33 @@ export async function loadNobaas(source) {
 export const toHex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 export const fromHex = (s) => Uint8Array.from(s.match(/../g), (h) => parseInt(h, 16));
 
+// A PeerId as text: 64 lowercase hex characters. Ids from signalling are
+// untrusted; check them with this before using them.
+export const isPeerId = (s) => typeof s === 'string' && /^[0-9a-f]{64}$/.test(s);
+
+// Exactly `n` bytes, or a TypeError: every fixed-size copy into wasm memory
+// goes through here, so nothing can write past its buffer.
+function exact(b, n, what) {
+  if (!(b instanceof Uint8Array) || b.length !== n) throw new TypeError(`${what} must be ${n} bytes`);
+  return b;
+}
+
+// A PeerId (32 bytes, or 64 lowercase hex characters) as bytes; throws otherwise.
+export function peerBytes(id) {
+  if (typeof id === 'string') {
+    if (!isPeerId(id)) throw new TypeError('peer id must be 64 lowercase hex characters or 32 bytes');
+    return fromHex(id);
+  }
+  return exact(id, 32, 'peer id');
+}
+
+function bytesOf(b) {
+  if (b instanceof Uint8Array) return b;
+  if (b instanceof ArrayBuffer) return new Uint8Array(b);
+  if (ArrayBuffer.isView(b)) return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+  throw new TypeError('expected bytes (Uint8Array, ArrayBuffer or a typed array view)');
+}
+
 class Nobaas {
   constructor(x) {
     this.x = x;
@@ -34,8 +62,10 @@ class Nobaas {
   mem() {
     return new Uint8Array(this.x.memory.buffer);
   }
-  // Copies bytes into a fresh buffer in wasm memory; caller frees.
+  // Copies bytes into a fresh buffer in wasm memory, sized from the bytes
+  // themselves; caller frees `bytes.length`.
   put(bytes) {
+    bytes = bytesOf(bytes);
     const p = this.x.nb_alloc(bytes.length);
     this.mem().set(bytes, p);
     return p;
@@ -60,6 +90,8 @@ class Nobaas {
   // BIP-340 signature of a 32-byte message.
   nostrSign(secret, msg32) {
     const x = this.x;
+    exact(secret, 32, 'nostr secret');
+    exact(msg32, 32, 'nostr message');
     const p = this.put(new Uint8Array([...secret, ...msg32, ...crypto.getRandomValues(new Uint8Array(32))]));
     const out = x.nb_alloc(64);
     x.nb_nostr_sign(p, p + 32, p + 64, out);
@@ -68,9 +100,12 @@ class Nobaas {
     this.free(out, 64);
     return sig;
   }
-  // Creates an endpoint. `secret` (32 bytes) restores an identity.
-  endpoint({ secret = null, shareAddresses = false } = {}) {
-    return new Endpoint(this, secret, shareAddresses);
+  // Creates an endpoint. `secret` (32 bytes) restores an identity. `relayOnly`:
+  // see Endpoint.setRelayOnly.
+  endpoint({ secret = null, shareAddresses = false, relayOnly = false } = {}) {
+    const ep = new Endpoint(this, secret, shareAddresses);
+    if (relayOnly) ep.setRelayOnly(true);
+    return ep;
   }
 }
 
@@ -81,8 +116,9 @@ export class Endpoint {
     this.nb = nb;
     const x = nb.x;
     const seed = crypto.getRandomValues(new Uint8Array(32));
+    // The wasm reads 32 bytes from the secret pointer.
+    const kp = secret ? nb.put(exact(secret, 32, 'secret')) : 0;
     const sp = nb.put(seed);
-    const kp = secret ? nb.put(secret) : 0;
     const out = x.nb_alloc(32);
     this.h = x.nb_endpoint_new(kp, sp, shareAddresses ? 1 : 0, out);
     this.peerId = nb.mem().slice(out, out + 32);
@@ -100,8 +136,9 @@ export class Endpoint {
     this.onEvent = () => {};
     this.timer = null;
   }
+  // Throws on anything but a valid PeerId, before touching wasm memory.
   setPeer(id) {
-    this.nb.mem().set(typeof id === 'string' ? fromHex(id) : id, this.peerBuf);
+    this.nb.mem().set(peerBytes(id), this.peerBuf);
     return this.peerBuf;
   }
   secret() {
@@ -116,10 +153,17 @@ export class Endpoint {
     this.pump();
     return r;
   }
+  // Relay-only: links made through a relay (connectVia) stay relayed and never
+  // punch to a direct path, relays forward our packets without our address, and
+  // a direct handshake is answered only from a peer we are dialling directly.
+  setRelayOnly(on) {
+    this.nb.x.nb_set_relay_only(this.h, on ? 1 : 0);
+  }
   connectVia(relay, peer) {
     const x = this.nb.x;
-    const rp = this.nb.put(typeof relay === 'string' ? fromHex(relay) : relay);
-    const r = x.nb_connect_via(this.h, nowUs(), rp, this.setPeer(peer));
+    const pp = this.setPeer(peer);
+    const rp = this.nb.put(peerBytes(relay));
+    const r = x.nb_connect_via(this.h, nowUs(), rp, pp);
     this.nb.free(rp, 32);
     this.pump();
     return r;
@@ -138,10 +182,12 @@ export class Endpoint {
   // Encrypts to `peer`, authenticated as us (Noise X). See nobaas_core::sealed.
   seal(peer, bytes) {
     const x = this.nb.x;
+    const pp = this.setPeer(peer);
+    bytes = bytesOf(bytes);
     const p = this.nb.put(bytes);
     const cap = bytes.length + 128;
     const out = x.nb_alloc(cap);
-    const n = x.nb_seal(this.h, this.setPeer(peer), p, bytes.length, out, cap);
+    const n = x.nb_seal(this.h, pp, p, bytes.length, out, cap);
     const r = n > 0 ? this.nb.mem().slice(out, out + n) : null;
     this.nb.free(p, bytes.length);
     this.nb.free(out, cap);
@@ -150,6 +196,7 @@ export class Endpoint {
   // Returns { from, data } or null if it isn't for us or was tampered with.
   open(bytes) {
     const x = this.nb.x;
+    bytes = bytesOf(bytes);
     const p = this.nb.put(bytes);
     const out = x.nb_alloc(bytes.length + 32);
     const n = x.nb_open(this.h, p, bytes.length, out, out + 32, bytes.length);
@@ -168,15 +215,18 @@ export class Endpoint {
   }
   // Returns 0, or a negative NB_ERR code (-1 not connected, -2 too large, -3 would block).
   send(peer, data, lane = Lane.Reliable) {
-    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    const pp = this.setPeer(peer);
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : bytesOf(data);
     const p = this.nb.put(bytes);
-    const r = this.nb.x.nb_send(this.h, this.setPeer(peer), lane, p, bytes.length);
+    const r = this.nb.x.nb_send(this.h, pp, lane, p, bytes.length);
     this.nb.free(p, bytes.length);
     this.schedule();
     return r;
   }
-  // Feed a datagram that arrived on transport handle `addr`.
+  // Feed a datagram that arrived on transport handle `addr`. Over MAX_DATAGRAM is never ours: dropped.
   receive(addr, bytes) {
+    bytes = bytesOf(bytes);
+    if (bytes.length > MAX_DATAGRAM) return;
     const p = this.nb.put(bytes);
     this.nb.x.nb_handle_datagram(this.h, nowUs(), addr, p, bytes.length);
     this.nb.free(p, bytes.length);

@@ -1,0 +1,54 @@
+[package]
+name = "nobaas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Nobaas: peer-to-peer nodes over UDP, with no server"
+
+[dependencies]
+nobaas-core = { path = "../nobaas-core" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Deterministic randomness in the sans-IO traversal (already used by nobaas-sim and nobaas-ffi).
+rand_chacha = "0.3"
+# SHA-256 for signaling topics, as nostr.js computes them (already in the tree through k256).
+sha2 = "0.10"
+# HMAC-SHA256 room proofs on hellos and room offers (RustCrypto, same family as sha2).
+hmac = "0.12"
+# Optional async host; the sync Node needs no runtime.
+tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "macros", "rt"] }
+# Nostr signaling (feature `nostr`): websocket client, TLS, BIP-340 signatures, relay JSON.
+tungstenite = { version = "0.24", optional = true, default-features = false, features = ["handshake"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "1", optional = true }
+k256 = { version = "0.13", optional = true, default-features = false, features = ["schnorr", "arithmetic"] }
+serde_json = { version = "1", optional = true }
+
+[features]
+tokio = ["dep:tokio"]
+nostr = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:k256", "dep:serde_json"]
+
+[dev-dependencies]
+nobaas-core = { path = "../nobaas-core" }
+# Tests and examples cover the async host and Nostr signaling too.
+nobaas = { path = ".", features = ["tokio", "nostr"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
+
+[[example]]
+name = "echo"
+path = "../../examples/rust/echo.rs"
+
+[[example]]
+name = "echo_async"
+path = "../../examples/rust/echo_async.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "natcheck"
+path = "../../examples/rust/natcheck.rs"
+required-features = ["nostr"]
+
+[[example]]
+name = "nostr_relay"
+path = "../../examples/rust/nostr_relay.rs"
+required-features = ["nostr"]

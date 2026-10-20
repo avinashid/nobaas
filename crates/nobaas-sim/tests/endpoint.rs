@@ -237,10 +237,7 @@ fn idle_link_times_out_and_keepalive_holds_it() {
     sim.run_for(Duration::from_secs(31));
     for i in 0..2 {
         let e = link_events(&mut sim, i);
-        assert!(
-            matches!(e[..], [Event::Disconnected { reason: DisconnectReason::Timeout, .. }]),
-            "{e:?}"
-        );
+        assert!(matches!(e[..], [Event::Disconnected { reason: DisconnectReason::Timeout, .. }]), "{e:?}");
     }
 }
 
@@ -386,7 +383,8 @@ fn fuzzed_datagrams_never_panic_or_break_the_link() {
 
 #[test]
 fn hub_with_300_peers() {
-    let net = NetConfig { latency: Duration::from_millis(25), jitter: Duration::from_millis(10), loss: 0.02, duplicate: 0.0 };
+    let net =
+        NetConfig { latency: Duration::from_millis(25), jitter: Duration::from_millis(10), loss: 0.02, duplicate: 0.0 };
     let mut sim = Sim::new(net, 14);
     let n = 300;
     for _ in 0..=n {

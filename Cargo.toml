@@ -5,6 +5,8 @@ members = [
     "crates/nobaas-sim",
     "crates/nobaas-ffi",
     "crates/nobaas-game",
+    "crates/nobaas",
+    "bindings/godot",
 ]
 
 [workspace.package]

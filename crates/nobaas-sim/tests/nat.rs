@@ -105,7 +105,8 @@ fn port_restricted_nat_drops_unsolicited_and_expires_mappings() {
 #[test]
 fn mapping_expires_without_keepalive() {
     let mut sim = Sim::new(NetConfig::default(), 2);
-    let config = Config { keepalive: Duration::from_secs(40), idle_timeout: Duration::from_secs(120), ..Config::default() };
+    let config =
+        Config { keepalive: Duration::from_secs(40), idle_timeout: Duration::from_secs(120), ..Config::default() };
     let server = sim.add_node(config.clone());
     let nat = sim.add_nat(NatConfig::port_restricted(), None);
     let client = sim.add_node_behind(nat, config);
@@ -163,6 +164,58 @@ fn relayed_dial_then_punch_goes_direct() {
     println!("relayed connect {t_conn:?}, direct after {t_direct:?}, relay carried {relayed_before} packets");
 }
 
+/// NB-034: a relay-only endpoint's relayed links stay relayed, whichever side
+/// dials, though a direct path would work: no packet ever goes between the two
+/// peers' addresses, and the relay doesn't tag its packets with its address.
+#[test]
+fn relay_only_links_stay_relayed() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    for a_dials in [true, false] {
+        let mut sim = Sim::new(NetConfig::default(), 11);
+        let r = sim.add_node(Config::default());
+        let a = sim.add_node(Config::default());
+        let b = sim.add_node(Config::default());
+        sim.nodes[a].endpoint.set_relay_only(true);
+        sim.connect(a, r).unwrap();
+        sim.connect(b, r).unwrap();
+        assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, a, r) && connected(s, b, r)));
+        let (aa, ba) = (sim.addr(a), sim.addr(b));
+        let direct = Rc::new(RefCell::new(0));
+        let seen = direct.clone();
+        sim.hook = Some(Box::new(move |from, to, _| {
+            if (from == aa && to == ba) || (from == ba && to == aa) {
+                *seen.borrow_mut() += 1;
+            }
+            true
+        }));
+        let (x, y) = if a_dials { (a, b) } else { (b, a) };
+        // The dialler also offers A's address; a relay-only A still doesn't punch.
+        sim.connect_via(x, r, y, &[sim.addr(y)]).unwrap();
+        assert!(sim.run_until(Duration::from_secs(2), |s| connected(s, a, b)));
+        for k in 0..50u32 {
+            sim.send(a, b, Lane::Reliable, &k.to_le_bytes()).unwrap();
+            sim.send(b, a, Lane::Reliable, &k.to_le_bytes()).unwrap();
+        }
+        sim.run_for(Duration::from_secs(20));
+        assert!(connected(&sim, a, b));
+        assert_eq!(sim.path(a, b), Some(Path::Via(sim.peer_id(r))), "a_dials {a_dials}");
+        assert_eq!(sim.path(b, a), Some(Path::Via(sim.peer_id(r))), "a_dials {a_dials}");
+        assert_eq!(messages(&sim.take_events(b)).len(), 50);
+        let (sa, sb) = (sim.nodes[a].endpoint.stats(), sim.nodes[b].endpoint.stats());
+        assert_eq!((sa.punches_sent, sa.punch_succeeded, sb.punch_succeeded), (0, 0, 0));
+        if a_dials {
+            // B learned no candidate for A: from the relay's tag or anywhere else.
+            assert_eq!(sb.punches_sent, 0);
+            assert_eq!(*direct.borrow(), 0, "no packet between A and B directly");
+        } else {
+            // B dialled A's address itself (it had it); A never answered there.
+            assert!(sim.nodes[a].endpoint.stats().tx_packets > 0);
+            assert_eq!(sim.path(a, b), Some(Path::Via(sim.peer_id(r))));
+        }
+    }
+}
+
 #[test]
 fn relay_refuses_when_disabled() {
     let mut sim = Sim::new(NetConfig::default(), 5);
@@ -203,7 +256,8 @@ fn symmetric_pair_stays_relayed_and_works() {
 #[test]
 fn direct_path_failure_falls_back_to_relay() {
     let pr = Kind::Nat("pr", NatConfig::port_restricted());
-    let config = Config { keepalive: Duration::from_secs(2), direct_timeout: Duration::from_secs(5), ..Config::default() };
+    let config =
+        Config { keepalive: Duration::from_secs(2), direct_timeout: Duration::from_secs(5), ..Config::default() };
     let (mut sim, r, a, b) = trio(&pr, &pr, config, 7);
     sim.connect_via(a, r, b, &[]).unwrap();
     assert!(sim.run_until(Duration::from_secs(5), |s| connected(s, a, b) && is_direct(s, a, b)));
@@ -271,6 +325,68 @@ fn same_nat_peers_use_lan_candidates() {
     assert_eq!(sim.path(a, b), Some(Path::Direct(lan_b)));
 }
 
+/// NB-035: a sequential symmetric NAT S maps its next new destination to the
+/// port after its last one. Its cone peer C, behind a port-restricted NAT, can't
+/// punch to the port S's relay saw, but can to guesses around the next one, while
+/// relayed and while dialling. A relay-only C ignores guesses.
+#[test]
+fn guessed_ports_punch_a_sequential_symmetric_nat() {
+    let sym = Kind::Nat("sym-seq", NatConfig::symmetric_sequential());
+    let pr = Kind::Nat("pr", NatConfig::port_restricted());
+    // S's NAT (nat 0) gave R port 20000; the next mapping is 20001.
+    let guesses = |sim: &Sim| (0..8).map(|k| SimAddr::new(sim.nat_ip(0), 20_000 + k)).collect::<Vec<_>>();
+    for (guess, relay_only) in [(false, false), (true, false), (true, true)] {
+        let (mut sim, r, s, c) = trio(&sym, &pr, Config::default(), 12);
+        sim.nodes[c].endpoint.set_relay_only(relay_only);
+        sim.connect_via(c, r, s, &[]).unwrap();
+        assert!(sim.run_until(Duration::from_secs(2), |sim| connected(sim, c, s)));
+        if guess {
+            let (now, ps, g) = (sim.now, sim.peer_id(s), guesses(&sim));
+            sim.nodes[c].endpoint.set_guesses(now, &ps, &g);
+        }
+        sim.run_until(Duration::from_secs(6), |sim| is_direct(sim, c, s));
+        let direct = is_direct(&sim, c, s);
+        assert_eq!(direct, guess && !relay_only, "guess {guess}, relay-only {relay_only}");
+        if direct {
+            assert_eq!(sim.path(c, s), Some(Path::Direct(SimAddr::new(sim.nat_ip(0), 20_001))));
+            // Guesses go out every fifth punch round only.
+            let sent = sim.nodes[c].endpoint.stats().punches_sent;
+            assert!(sent < 8 * 3, "{sent} punches");
+        }
+    }
+    // While relayed, guesses that never land are punched on three rounds, however
+    // often they are set again: punches with them minus punches without.
+    let punches = |set: bool| {
+        let (mut sim, r, s, c) = trio(&sym, &pr, Config::default(), 12);
+        sim.connect_via(c, r, s, &[]).unwrap();
+        assert!(sim.run_until(Duration::from_secs(2), |sim| connected(sim, c, s)));
+        let (ps, wrong) = (sim.peer_id(s), (0..8).map(|k| SimAddr::new(sim.nat_ip(0), 30_000 + k)).collect::<Vec<_>>());
+        for _ in 0..5 {
+            if set {
+                let now = sim.now;
+                sim.nodes[c].endpoint.set_guesses(now, &ps, &wrong);
+            }
+            sim.run_for(Duration::from_secs(1));
+        }
+        assert!(!is_direct(&sim, c, s));
+        sim.nodes[c].endpoint.stats().punches_sent
+    };
+    assert_eq!(punches(true) - punches(false), 8 * 3);
+    // No relay: S dials C's public address while C dials S's guesses.
+    let (mut sim, r, s, c) = trio(&sym, &pr, Config::default(), 13);
+    let (ps, pc) = (sim.peer_id(s), sim.peer_id(c));
+    let c_public = SimAddr::new(sim.nat_ip(1), nobaas_sim::HOST_PORT);
+    sim.nodes[r].endpoint.disconnect(&ps);
+    sim.nodes[r].endpoint.disconnect(&pc);
+    let (now, g) = (sim.now, guesses(&sim));
+    sim.nodes[s].endpoint.connect(now, c_public, pc).unwrap();
+    sim.nodes[c].endpoint.connect(now, g[0], ps).unwrap();
+    sim.nodes[c].endpoint.set_guesses(now, &ps, &g);
+    assert!(sim.run_until(Duration::from_secs(5), |sim| connected(sim, s, c)));
+    assert!(is_direct(&sim, s, c));
+    assert_eq!(sim.path(c, s), Some(Path::Direct(SimAddr::new(sim.nat_ip(0), 20_001))));
+}
+
 #[derive(Debug)]
 struct Outcome {
     connected: bool,
@@ -332,10 +448,7 @@ fn nat_matrix() {
     // Cone NATs on both sides must always go direct.
     for a in ["full-cone", "restricted", "port-restr", "cgnat(pr+pr)"] {
         for b in ["public", "full-cone", "restricted", "port-restr", "cgnat(pr+pr)"] {
-            let (ka, kb) = (
-                ks.iter().find(|k| k.name() == a).unwrap(),
-                ks.iter().find(|k| k.name() == b).unwrap(),
-            );
+            let (ka, kb) = (ks.iter().find(|k| k.name() == a).unwrap(), ks.iter().find(|k| k.name() == b).unwrap());
             assert!(run_pair(ka, kb, 0, 7).direct, "{a} x {b} should go direct");
         }
     }

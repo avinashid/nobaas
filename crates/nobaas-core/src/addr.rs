@@ -20,6 +20,15 @@ pub trait Address: Clone + Eq + Hash + Debug {
     fn port_offset(&self, _delta: i32) -> Option<Self> {
         None
     }
+    /// The UDP address this stands for, if any: lets a host ask STUN servers
+    /// over any transport whose addresses are IP addresses.
+    fn to_socket_addr(&self) -> Option<SocketAddr> {
+        None
+    }
+    /// The reverse of [`to_socket_addr`](Address::to_socket_addr).
+    fn from_socket_addr(_addr: SocketAddr) -> Option<Self> {
+        None
+    }
 }
 
 pub const MAX_ADDR_LEN: usize = 19;
@@ -55,6 +64,14 @@ impl Address for SocketAddr {
     fn port_offset(&self, delta: i32) -> Option<Self> {
         let p = i32::from(self.port()) + delta;
         (1..=65535).contains(&p).then(|| SocketAddr::new(self.ip(), p as u16))
+    }
+
+    fn to_socket_addr(&self) -> Option<SocketAddr> {
+        Some(*self)
+    }
+
+    fn from_socket_addr(addr: SocketAddr) -> Option<Self> {
+        Some(addr)
     }
 }
 

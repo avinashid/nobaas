@@ -42,10 +42,7 @@ impl CryptoResolver for SeededResolver {
     }
 }
 
-pub(crate) fn builder<'a>(
-    seed: [u8; 32],
-    local_private: &'a [u8],
-) -> Result<snow::Builder<'a>, snow::Error> {
+pub(crate) fn builder<'a>(seed: [u8; 32], local_private: &'a [u8]) -> Result<snow::Builder<'a>, snow::Error> {
     builder_for(NOISE_PARAMS, PROLOGUE, seed, local_private)
 }
 

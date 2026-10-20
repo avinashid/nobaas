@@ -1,0 +1,172 @@
+# Test plan
+
+How Nobaas is tested, what each layer covers, and the gate every change passes before merge.
+
+## The gate
+
+One command runs it:
+
+```sh
+scripts/gate.sh             # everything below that stays on loopback
+scripts/gate.sh --quick     # skip the browser tests (no Playwright needed)
+scripts/gate.sh --strict    # clippy with -D warnings
+scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a change touches signaling
+```
+
+| Step | Command | Passes when |
+|---|---|---|
+| Rust tests | `cargo test --workspace --release` | every test passes (ignored tests are known gaps, below) |
+| Lints | `cargo clippy --workspace --all-targets` (`-- -D warnings` with `--strict`) | no errors; `--strict` is clean today |
+| Format | `cargo fmt --all -- --check` | skipped while rustfmt is not installed on the dev host; CI runs it |
+| wasm build | `packages/js/build.sh` | builds `packages/js/pkg/nobaas_ffi.wasm` |
+| wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
+| Node glue | `node packages/js/test/node_pair.mjs` | two endpoints connect; 1000 × 64 B and one 64 KiB reliable message arrive, the large one intact |
+| Node privacy | `node packages/js/test/privacy.mjs` | host candidates are filtered; a relay-only endpoint links through its relay and refuses a direct dial |
+| Node room | `node packages/js/test/room_node.mjs` | three `joinRoom` peers mesh; presence, lanes, targeted sends, backpressure, leave, a late joiner and `poll()` work |
+| Node peer ids | `node packages/js/test/peer_id.mjs` | SEC-1: an over-long or malformed peer id (the 8192-character repro, wrong sizes, uppercase, non-strings) throws a TypeError at every wasm copy and the module keeps working; BroadcastChannel, Nostr, WebRTC, local and room signalling drop a `from` that isn't 64 lowercase hex |
+| Browser | `node packages/js/test/browser.mjs 2` | two Chromium tabs form a WebRTC mesh on loopback and exchange data |
+| Arena | `node packages/js/test/arena.mjs 8 10` | every island's checkpoint hashes match, ticks keep confirming |
+| README chat | `node packages/js/test/readme.mjs` | the chat block in `packages/js/README.md` runs in two tabs, messages cross both ways, and it stays ≤ 10 lines |
+| Poll | `node packages/js/test/poll.mjs 3` | three tabs driven only by `poll()`/`sendTo()` see each other; a closed tab leaves |
+| Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `relay.damus.io` / `nos.lol` and connect over public STUN |
+
+The script runs every step even after a failure, prints a PASS/FAIL/SKIP summary and exits non-zero if any step
+failed. A full run takes about 2.5 minutes on the 4-core aarch64 dev host (Rust tests ~65 s, wasm build ~20 s,
+browser + arena ~30 s).
+
+**Release gate:** `scripts/gate.sh --strict` green on `main`, plus `--nostr` once per release, plus the CI matrix
+(below) green on all three OSes.
+
+## Test layers
+
+| Layer | Where | What it is for |
+|---|---|---|
+| Unit | `#[cfg(test)]` in `crates/*/src` | parsers, codecs, crypto vectors, reliability state machine |
+| Crate integration | `crates/<crate>/tests/` | public API of one crate, including seeded property tests |
+| Simulation | `crates/nobaas-sim/tests/` | whole endpoints over a deterministic network: loss, jitter, NATs, roaming, relays, arena |
+| JS glue | `packages/js/test/node_pair.mjs` | the wasm C ABI and `nobaas.js` in Node |
+| Browser | `packages/js/test/{browser,arena}.mjs` | WebRTC transport and the demo pages in headless Chromium, loopback only |
+| Public network | `packages/js/test/nostr.mjs` | Nostr signaling and public STUN; small, opt-in |
+
+### Rules
+
+- **Deterministic.** Simulation tests take a seed (`same_seed_same_run` checks that a run replays exactly).
+  Property tests use `ChaCha8Rng` seeded from a fixed constant XOR a per-test salt, so a failure reproduces
+  by rerunning the test; the failing input is in the assertion message.
+- **Small.** Property tests run ~2000 cases; simulations stay at a few hundred peers and a few simulated seconds.
+  Larger scales go in `docs/PERFORMANCE.md` as **theoretical**, with the formula.
+- **Local.** Loopback, LAN or the simulator. Only `nostr.mjs` touches public services, the allowed ones.
+- **Known gaps are tests too.** A behaviour we know is wrong gets an `#[ignore = "known gap: …"]` test that
+  asserts the intended behaviour. Fixing the gap means removing the `ignore`. `cargo test -- --ignored` runs them.
+
+## Coverage by component
+
+### nobaas-core (unit, `src/`)
+
+- `wire`: frame round trips, truncated frames fail once, frame parser survives garbage, packet bounds.
+- `reliable`: out-of-order reassembly, ACK and retransmit, tail-loss probe beats the RTO, urgent fragments are
+  sent twice, buffer limit.
+- `stun`: RFC 5769 IPv4/IPv6 vectors; Nobaas packets are not mistaken for STUN.
+- `crypto`, `identity`, `sealed`, `invite`, `addr`: Noise static key derivation, sign/verify, replay window,
+  sealed-box open/reject, RFC 4648 vectors, invite round trip and garbage rejection, socket address round trip.
+
+### nobaas-core over the simulator (`crates/nobaas-sim/tests/endpoint.rs`, `nat.rs`)
+
+- Handshake in one RTT; wrong identity fails; simultaneous open converges to one link; replayed handshake does
+  not displace a live link; peer restart replaces the stale link.
+- Reliable lane exact and ordered under loss; unreliable lane at most once; bulk transfer keeps the queue short
+  for game traffic.
+- Tampered and replayed packets rejected; fuzzed datagrams never panic or break the link.
+- Keepalive, idle timeout, heavy loss, roaming to a new address, a hub with 300 peers.
+- NAT: reflexive address discovery, mapping expiry, relayed dial then punch, relay refusal, symmetric pairs stay
+  relayed, direct-path failure falls back to the relay, LAN candidates behind one NAT, and the full NAT matrix
+  (public, full-cone, restricted, port-restricted, symmetric sequential/random, two CGNAT stacks).
+
+### nobaas-game (`crates/nobaas-game/tests/`)
+
+| File | Covers |
+|---|---|
+| `fixed_point.rs` | int conversion (floors), saturating add/sub vs an i64 reference, mul vs `(a*b)>>16`, mul/div identities, div inverts mul within tolerance, div by zero panics, `q16_sqrt` is the exact floor and monotonic, physics step per input bit, dash, arena clamp, bit-identical replay, line of sight |
+| `hilbert.rs` | known order-1/2 indices, bijection and grid-adjacent steps on every grid up to 64×64, range on 65536², partition invariants (each player once, full islands, ids, Hilbert order, non-overlapping ranges), `k_max` clamp, input-order independence with position ties, off-grid positions, spatial locality |
+| `desync.rs` | CRC golden values (a change is a wire break), determinism, every hashed field changes the CRC (collisions bounded), order sensitivity, input bits not hashed, quorum known cases (exact 2/3, below 2/3, output order) and a property over island sizes 1–12 |
+| `restored.rs` | the checks from the original `p0-hilbert-rollback` tests that still apply (Hilbert neighbours, ten-tick step, the wall-at-x∈[4,6] sight line, 4-peer quorum eviction); the rollback-simulator and witness parts return with NB-018 |
+| `lockstep.rs` | 30 players × 600 ticks replayed by peers that registered players in different orders: identical island hashes on every tick; a golden digest of the whole run (a change is a protocol break); one wrong input diverges exactly one island and the quorum names the cheater |
+
+### nobaas-sim arena (`crates/nobaas-sim/tests/arena.rs`)
+
+Lockstep islands agree over super-peers; bundles survive 5 % loss with jitter; islands survive a super-peer
+dying; an overloaded super-peer degrades without stalling. `cargo run -p nobaas-sim --release --example arena`
+is the full harness for `docs/PERFORMANCE.md`.
+
+### nobaas-ffi and packages/js
+
+`two_endpoints_through_the_c_abi` (Rust), `node_pair.mjs` (wasm in Node), `browser.mjs` and `arena.mjs`
+(Chromium, WebRTC over loopback), `nostr.mjs` (opt-in).
+
+## Godot binding (NB-020)
+
+The binding must be testable with plain `cargo test`, with no Godot binary. The design rule that makes this
+possible: keep the MultiplayerPeer logic in a Godot-free Rust module (no `godot` types in its API), and make
+`NobaasMultiplayerPeer` a thin GDExtension shell that only converts types and forwards calls. The same logic module
+runs on a test double, on `nobaas-sim` and inside Godot.
+
+**Unit tests (logic module, `cargo test`):**
+
+- *Peer IDs:* the host is 1; a joiner's ID comes from its Nobaas PeerId, is in `2..=i32::MAX`, and stays the same
+  across reconnects. Collisions are forced with an injected hash, and every peer must resolve them to the same IDs
+  whatever order the joins arrive in (a property test over shuffled join orders).
+- *Packet queue:* FIFO; `_get_available_packet_count` matches the queue length; `_get_packet_peer` belongs to the
+  packet `_get_packet_script` returns next. Target peer `0` means broadcast, `-id` means everyone except `id`, and
+  an unknown target is an error. Packets from a peer that disconnected before they were drained are handled the
+  way the spec decides.
+- *Transfer modes:* reliable goes to the reliable lane and unreliable to the unreliable lane. Unreliable-ordered
+  never delivers a packet older than one already delivered (property: random reordering, the output sequence is
+  strictly increasing). Packets over the unreliable limit (1100 B) are rejected. Ordering holds per channel.
+- *Connection status:* disconnected → connecting → connected; `host()` connects immediately and returns an invite
+  that parses; a bad invite or a failed join returns to disconnected; `_close` and `_disconnect_peer` raise
+  `peer_disconnected` once per peer.
+
+**Simulator tests (`crates/nobaas-sim/tests/godot_peer.rs`):** a host and three joiners on `nobaas-sim` through
+the logic module, at 0 % and 5 % loss with jitter and behind the NAT matrix. Every `@rpc`-style reliable packet
+arrives exactly once and in order, unreliable-ordered packets never go backwards, a joiner dropping out raises
+`peer_disconnected` on the others, and the same seed replays the run exactly.
+
+**Determinism:** lockstep game logic uses `nobaas-game` fixed-point maths, not Godot physics. `lockstep.rs` is
+the reference: the binding's demo state hash must match a Rust replay of the same input log.
+
+**Headless Godot smoke test (opt-in, not in the default gate):** Godot 4.7.2 is installed at `~/.local/bin/godot`.
+Once `examples/godot/` exists, a `scripts/godot-smoke.sh` starts one `godot --headless` instance that hosts and
+writes its invite to a file, and a second that joins with it. They exchange an `@rpc` chat line and a few
+synchronizer updates, then both exit 0 within a timeout. It runs on loopback only and gets added as a
+`--godot` flag on `scripts/gate.sh`.
+
+## Known gaps
+
+| Gap | Test | Owner |
+|---|---|---|
+| No property tests yet for `nobaas-core` codecs (wire, invite, STUN) beyond the garbage-input tests | — | qa (with NB-014 fuzzing) |
+| `browser.mjs` reports round trips and throughput but asserts only that the mesh forms and data arrives | — | qa |
+| No rustfmt on the dev host, so formatting is only checked in CI | — | ops (NB-002) |
+| Planned crates (facade, sync, media, store, Godot binding) have no tests yet; each lands with its own, per the plans above | — | backend |
+
+## CI
+
+NB-002 (ops) owns `.github/workflows/ci.yml`. The jobs should call the same commands as the gate so local and CI
+results match:
+
+| Job | Runs on | Command |
+|---|---|---|
+| test | ubuntu, macos, windows | `cargo test --workspace --release` |
+| clippy | ubuntu | `cargo clippy --workspace --all-targets -- -D warnings` |
+| fmt | ubuntu | `cargo fmt --all -- --check` |
+| wasm + node | ubuntu | `scripts/gate.sh --quick` steps `wasm build`, `wasm size+imports`, `node glue` |
+| browser | ubuntu with `npx playwright install --with-deps chromium` | `PLAYWRIGHT=$(npm root)/playwright/index.mjs node packages/js/test/browser.mjs 2` and `arena.mjs 8 10` |
+
+On Linux CI, `scripts/gate.sh --strict` alone covers every job except the macOS and Windows test runs.
+
+## Turning acceptance criteria into tests
+
+Each backlog task's acceptance criteria get a named test before the task moves to review: unit or crate
+integration for an API, a simulator test for anything that crosses the network, a browser test for anything in
+`packages/js` or `examples/`. The task card lists the test names and the gate output. When reviewing a branch, QA
+runs `scripts/gate.sh --strict` on it and posts the summary block plus any failing output on the card.

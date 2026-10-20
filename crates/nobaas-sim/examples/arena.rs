@@ -18,10 +18,8 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use nobaas_game::{
-    compute_island_state_crc16, partition_into_hilbert_islands, q16_from_i32, PlayerEntityQ16, Vec2Q16,
-};
 use nobaas_core::{Config, Event, Instant, Lane};
+use nobaas_game::{compute_island_state_crc16, partition_into_hilbert_islands, q16_from_i32, PlayerEntityQ16, Vec2Q16};
 use nobaas_sim::{NatConfig, NetConfig, Sim};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -145,7 +143,7 @@ fn args() -> Args {
 /// Deterministic input policy: change direction now and then, dash sometimes.
 fn input_bits(player: usize, tick: u32) -> u16 {
     let phase = (tick + player as u32 * 7) / 30;
-    let h = (player as u64 * 0x9E37_79B9_7F4A_7C15) ^ (phase as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let h = (player as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (phase as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     let h = h ^ (h >> 29);
     let dir = [0x01, 0x02, 0x04, 0x08, 0x05, 0x09, 0x06, 0x0a][(h % 8) as usize];
     dir | if (h >> 8).is_multiple_of(5) { 0x10 } else { 0 }
@@ -327,7 +325,10 @@ pub fn run(a: Args) -> Summary {
     let entities: Vec<PlayerEntityQ16> = (0..a.players)
         .map(|i| PlayerEntityQ16 {
             peer_id: i as u16,
-            pos: Vec2Q16::new(q16_from_i32((rng.next_u32() % ARENA) as i32), q16_from_i32((rng.next_u32() % ARENA) as i32)),
+            pos: Vec2Q16::new(
+                q16_from_i32((rng.next_u32() % ARENA) as i32),
+                q16_from_i32((rng.next_u32() % ARENA) as i32),
+            ),
             vel: Vec2Q16::new(0, 0),
             hp: 100,
             last_input_bits: 0,
@@ -469,7 +470,10 @@ pub fn run(a: Args) -> Summary {
                 );
             }
         }
-        panic!("not all {want} links came up: {links} super-peer link ends of {}, {failed} ConnectFailed", a.players + a.supers * (a.supers - 1));
+        panic!(
+            "not all {want} links came up: {links} super-peer link ends of {}, {failed} ConnectFailed",
+            a.players + a.supers * (a.supers - 1)
+        );
     }
     // Hot standby: every player also keeps an idle link to the next super-peer
     // in its island's ranking, so failing over needs no handshake.
@@ -503,7 +507,9 @@ pub fn run(a: Args) -> Summary {
         let direct = islands
             .iter()
             .flat_map(|m| m.iter().flat_map(move |&x| m.iter().map(move |&y| (x, y))))
-            .filter(|&(x, y)| x < y && matches!(sim.nodes[node_of[x]].endpoint.path(&peer_of[y]), Some(nobaas_core::Path::Direct(_))))
+            .filter(|&(x, y)| {
+                x < y && matches!(sim.nodes[node_of[x]].endpoint.path(&peer_of[y]), Some(nobaas_core::Path::Direct(_)))
+            })
             .count();
         direct_pairs = (direct, pairs);
     }
@@ -659,7 +665,8 @@ pub fn run(a: Args) -> Summary {
                     // super-peer's measured delivery time to the target island.
                     // Until the minimap reports the target's delivery time, assume
                     // the other two hops are like our own.
-                    let up = sim.nodes[p.node].endpoint.rtt(&super_peer[p.sup]).map_or(25.0, |r| r.as_secs_f64() * 500.0);
+                    let up =
+                        sim.nodes[p.node].endpoint.rtt(&super_peer[p.sup]).map_or(25.0, |r| r.as_secs_f64() * 500.0);
                     let rest = match p.deliver.get(target) {
                         Some(&d) if d > 0 => 2.0 * d as f64,
                         _ => 2.0 * up + tick_ms,
@@ -727,7 +734,8 @@ pub fn run(a: Args) -> Summary {
                             // inputs from the history.
                             let me = player_of_node[&from];
                             let (slot, start) = (data[1] as usize, u32::from_le_bytes(data[2..6].try_into().unwrap()));
-                            if let Some(h) = islands[players[me].island].get(slot).and_then(|m| supers[si].hist.get(m)) {
+                            if let Some(h) = islands[players[me].island].get(slot).and_then(|m| supers[si].hist.get(m))
+                            {
                                 let end = (start + 63).min(ticks - 1);
                                 let mut m = vec![9u8, slot as u8];
                                 m.extend_from_slice(&end.to_le_bytes());
@@ -775,7 +783,10 @@ pub fn run(a: Args) -> Summary {
                                 continue;
                             }
                             let targets: Vec<usize> = match kind {
-                                3 => [k.checked_sub(1), Some(k + 1).filter(|&x| x < n_islands)].into_iter().flatten().collect(),
+                                3 => [k.checked_sub(1), Some(k + 1).filter(|&x| x < n_islands)]
+                                    .into_iter()
+                                    .flatten()
+                                    .collect(),
                                 _ => vec![k],
                             };
                             let lane = match (kind, a.urgent) {
@@ -808,9 +819,14 @@ pub fn run(a: Args) -> Summary {
                                         if m[0] != 3 || r == 0 {
                                             return true;
                                         }
-                                        let Some(&Latest { pos: (px, py), .. }) = supers[si].latest.get(&x) else { return true };
+                                        let Some(&Latest { pos: (px, py), .. }) = supers[si].latest.get(&x) else {
+                                            return true;
+                                        };
                                         let (px, py) = (px as i32, py as i32);
-                                        px >= m[7] as i32 - r && px <= m[9] as i32 + r && py >= m[8] as i32 - r && py <= m[10] as i32 + r
+                                        px >= m[7] as i32 - r
+                                            && px <= m[9] as i32 + r
+                                            && py >= m[8] as i32 - r
+                                            && py <= m[10] as i32 + r
                                     };
                                     for &x in &islands[tk] {
                                         if near(x) {
@@ -890,7 +906,9 @@ pub fn run(a: Args) -> Summary {
                             // newest tick advances in jumps, and sending each entry
                             // once would leave a tick covered by only 2-3 packets.
                             if let Some(ent) = supers[si].latest.get_mut(&m) {
-                                if (ent.new || (full && a.resend && ent.tick + a.redundancy as u32 > t)) && t - ent.tick < 256 {
+                                if (ent.new || (full && a.resend && ent.tick + a.redundancy as u32 > t))
+                                    && t - ent.tick < 256
+                                {
                                     let mut e = vec![slot as u8, (t - ent.tick) as u8];
                                     e.extend_from_slice(&ent.runs);
                                     entries[slot] = Some(e);
@@ -924,7 +942,17 @@ pub fn run(a: Args) -> Summary {
                         let own: Vec<(usize, u8)> = sp
                             .islands
                             .iter()
-                            .map(|&k| (k, islands[k].iter().filter_map(|m| sp.latest.get(m)).map(|l| l.delay).max().unwrap_or(0)))
+                            .map(|&k| {
+                                (
+                                    k,
+                                    islands[k]
+                                        .iter()
+                                        .filter_map(|m| sp.latest.get(m))
+                                        .map(|l| l.delay)
+                                        .max()
+                                        .unwrap_or(0),
+                                )
+                            })
                             .collect();
                         // Minimap: per island a quantised centroid (2 bytes) and the
                         // delivery time from this super-peer to its slowest member.
@@ -935,7 +963,10 @@ pub fn run(a: Args) -> Summary {
                             let d = if o == si {
                                 own.iter().find(|e| e.0 == j).map_or(0, |e| e.1) as f64 * 2.0
                             } else {
-                                let hop = sim.nodes[node].endpoint.rtt(&super_peer[o]).map_or(0.0, |r| r.as_secs_f64() * 500.0);
+                                let hop = sim.nodes[node]
+                                    .endpoint
+                                    .rtt(&super_peer[o])
+                                    .map_or(0.0, |r| r.as_secs_f64() * 500.0);
                                 // Plus up to a tick waiting at the other super-peer.
                                 hop + sp.remote_delay.get(&j).map_or(0, |&d| d) as f64 * 2.0 + 1000.0 / a.hz as f64
                             };
@@ -962,7 +993,9 @@ pub fn run(a: Args) -> Summary {
                 let interval = supers[si].interval as usize;
                 let waits = |to: &usize, m: &[u8]| {
                     matches!(m[0], 3 | 5)
-                        && player_of_node.get(to).is_some_and(|&x| !(t as usize + players[x].island).is_multiple_of(interval))
+                        && player_of_node
+                            .get(to)
+                            .is_some_and(|&x| !(t as usize + players[x].island).is_multiple_of(interval))
                 };
                 let (hold, out): (Vec<_>, Vec<_>) =
                     std::mem::take(&mut supers[si].held).into_iter().chain(out).partition(|(to, _, m)| waits(to, m));
@@ -975,7 +1008,8 @@ pub fn run(a: Args) -> Summary {
                     }
                 }
             }
-            let next = at(t) + Duration::from_micros((at(t + 1) - at(t)).as_micros() as u64 * (sub as u64 + 1) / a.substeps as u64);
+            let next = at(t)
+                + Duration::from_micros((at(t + 1) - at(t)).as_micros() as u64 * (sub as u64 + 1) / a.substeps as u64);
             sim.run_for(next - sim.now);
         }
         // Players consume what arrived, with arrival times.
@@ -1013,13 +1047,21 @@ pub fn run(a: Args) -> Summary {
                             }
                         }
                         let own = p.slot;
-                        let c = p.contiguous.iter().enumerate().filter(|&(s, _)| s != own).map(|(_, &c)| c).min().unwrap_or(ticks);
+                        let c = p
+                            .contiguous
+                            .iter()
+                            .enumerate()
+                            .filter(|&(s, _)| s != own)
+                            .map(|(_, &c)| c)
+                            .min()
+                            .unwrap_or(ticks);
                         let c = c.min(p.contiguous[own]);
                         for u in p.confirmed..c {
                             if u >= warmup {
                                 let lag = (when - at(u)).as_secs_f64() * 1000.0;
                                 lags.push(lag);
-                                if kill_tick.is_some_and(|k| u >= k && u < k + 2 * a.hz) && orphaned.contains(&p.island) {
+                                if kill_tick.is_some_and(|k| u >= k && u < k + 2 * a.hz) && orphaned.contains(&p.island)
+                                {
                                     fail_lags.push(lag);
                                 }
                             }
@@ -1035,13 +1077,21 @@ pub fn run(a: Args) -> Summary {
                         take_runs(&data[6..], end as usize, &mut p.known[slot]);
                         extend_contiguous(p, slot, ticks);
                         let own = p.slot;
-                        let c = p.contiguous.iter().enumerate().filter(|&(s, _)| s != own).map(|(_, &c)| c).min().unwrap_or(ticks);
+                        let c = p
+                            .contiguous
+                            .iter()
+                            .enumerate()
+                            .filter(|&(s, _)| s != own)
+                            .map(|(_, &c)| c)
+                            .min()
+                            .unwrap_or(ticks);
                         let c = c.min(p.contiguous[own]);
                         for u in p.confirmed..c {
                             if u >= warmup {
                                 let lag = (when - at(u)).as_secs_f64() * 1000.0;
                                 lags.push(lag);
-                                if kill_tick.is_some_and(|k| u >= k && u < k + 2 * a.hz) && orphaned.contains(&p.island) {
+                                if kill_tick.is_some_and(|k| u >= k && u < k + 2 * a.hz) && orphaned.contains(&p.island)
+                                {
                                     fail_lags.push(lag);
                                 }
                             }
@@ -1078,8 +1128,12 @@ pub fn run(a: Args) -> Summary {
             if std::env::var("ARENA_DEBUG").is_ok() {
                 for &m in members {
                     let p = &players[m];
-                    let gaps: Vec<(usize, u32)> = p.contiguous.iter().cloned().enumerate().filter(|&(_, c)| c < ticks).collect();
-                    println!("island {k} player {m} slot {} confirmed {} gaps (slot, first missing tick) {gaps:?}", p.slot, p.confirmed);
+                    let gaps: Vec<(usize, u32)> =
+                        p.contiguous.iter().cloned().enumerate().filter(|&(_, c)| c < ticks).collect();
+                    println!(
+                        "island {k} player {m} slot {} confirmed {} gaps (slot, first missing tick) {gaps:?}",
+                        p.slot, p.confirmed
+                    );
                     for &(slot, g) in &gaps {
                         let w: Vec<String> = (g.saturating_sub(10)..(g + 12).min(ticks))
                             .map(|t| if p.known[slot][t as usize] == UNKNOWN { "_".into() } else { "x".into() })
@@ -1138,7 +1192,8 @@ pub fn run(a: Args) -> Summary {
     );
     if a.adapt {
         let tot = interval_ticks.iter().sum::<u64>().max(1) as f64;
-        let shares: Vec<String> = interval_ticks[1..].iter().map(|&n| format!("{:.0}", 100.0 * n as f64 / tot)).collect();
+        let shares: Vec<String> =
+            interval_ticks[1..].iter().map(|&n| format!("{:.0}", 100.0 * n as f64 / tot)).collect();
         println!(
             "overload control: bundles every 1..{MAX_INTERVAL} ticks {}% of super-peer ticks, {interval_changes} changes",
             shares.join("/")
@@ -1153,9 +1208,12 @@ pub fn run(a: Args) -> Summary {
         );
     }
     if let Some(s) = a.kill {
-        let moved: Vec<u32> = orphaned.iter().filter_map(|k| moved_at.get(k)).map(|&m| m.saturating_sub(kill_tick.unwrap())).collect();
-        let new_owners: std::collections::BTreeSet<usize> =
-            orphaned.iter().map(|&k| supers.iter().position(|sp| !sp.dead && sp.islands.contains(&k)).unwrap_or(usize::MAX)).collect();
+        let moved: Vec<u32> =
+            orphaned.iter().filter_map(|k| moved_at.get(k)).map(|&m| m.saturating_sub(kill_tick.unwrap())).collect();
+        let new_owners: std::collections::BTreeSet<usize> = orphaned
+            .iter()
+            .map(|&k| supers.iter().position(|sp| !sp.dead && sp.islands.contains(&k)).unwrap_or(usize::MAX))
+            .collect();
         println!(
             "failover: super-peer {s} killed at {} s; {}/{} of its islands moved (to super-peers {:?}), detected after {:.0}..{:.0} ms; {migrations} player migrations, {event_resends} events resent",
             a.kill_at,

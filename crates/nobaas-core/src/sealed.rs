@@ -67,7 +67,8 @@ mod tests {
 
     #[test]
     fn seal_open_and_reject() {
-        let (a, b, c) = (Identity::generate(&mut OsRng), Identity::generate(&mut OsRng), Identity::generate(&mut OsRng));
+        let (a, b, c) =
+            (Identity::generate(&mut OsRng), Identity::generate(&mut OsRng), Identity::generate(&mut OsRng));
         let s = seal(&a, &b.peer_id(), [7; 32], b"offer sdp").unwrap();
         assert_eq!(s.len(), 9 + SEAL_OVERHEAD);
         assert_eq!(open(&b, &s), Some((a.peer_id(), b"offer sdp".to_vec())));

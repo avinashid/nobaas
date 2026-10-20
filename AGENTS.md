@@ -17,7 +17,7 @@ WebAssembly module with a small JS package, and a C ABI. Status: early developme
 | `crates/nobaas-sim` | Deterministic network simulator and the multiplayer arena benchmark; integration tests live in `crates/nobaas-sim/tests/` |
 | `crates/nobaas-ffi` | C ABI (`nb_*` symbols, `NB_ERR_*`), the one surface for wasm and native bindings |
 | `crates/nobaas-game` | Deterministic fixed-point maths, Hilbert-curve islands, desync detection |
-| `packages/js` | `nobaas.js` (`loadNobaas`, class `Nobaas`), WebRTC transport, Nostr signaling, demos, tests |
+| `packages/js` | `@nobaas/js`: `src/room.js` (`joinRoom`), `src/nobaas.js` (`loadNobaas`, class `Nobaas`), WebRTC transport, Nostr signaling, types in `src/index.d.ts`, demos, tests |
 | `examples/` | Live examples (in progress) |
 | `docs/` | Architecture, performance model, comparison with other libraries |
 
@@ -26,6 +26,7 @@ WebAssembly module with a small JS package, and a C ABI. Status: early developme
 ```sh
 source ~/.cargo/env      # Rust; wasm32-unknown-unknown and clippy are installed, rustfmt is not
 source ~/.nvm/nvm.sh     # Node
+godot --version          # Godot 4.7.2 (user-local in ~/.local/opt/godot); use --headless on this server
 ```
 
 Do not install toolchains, `cargo install` tools or system packages without asking. Adding crates.io

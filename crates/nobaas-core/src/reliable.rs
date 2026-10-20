@@ -63,6 +63,8 @@ pub(crate) struct RelSend {
     rttvar: Duration,
     rto: Duration,
     pub(crate) retransmits: u64,
+    /// Fragments sent for the first time.
+    pub(crate) fragments_sent: u64,
     pub(crate) failed: bool,
     /// AIMD congestion window in fragments (NewReno-style), capped by the link window.
     cwnd: f64,
@@ -95,6 +97,7 @@ impl RelSend {
             rttvar: Duration::ZERO,
             rto: INITIAL_RTO,
             retransmits: 0,
+            fragments_sent: 0,
             failed: false,
             cwnd: INITIAL_CWND,
             ssthresh: f64::INFINITY,
@@ -343,9 +346,20 @@ impl RelSend {
             let dup_at = urgent.then_some(now + URGENT_GAP);
             self.inflight.insert(
                 seq,
-                Fragment { fin, data, sent_at: now, due: now + self.rto, tries: 1, fast: false, probed: false, urgent, dup_at },
+                Fragment {
+                    fin,
+                    data,
+                    sent_at: now,
+                    due: now + self.rto,
+                    tries: 1,
+                    fast: false,
+                    probed: false,
+                    urgent,
+                    dup_at,
+                },
             );
             sent_new = true;
+            self.fragments_sent += 1;
         }
         if sent_new || (self.probe_at.is_none() && !self.probe_used) {
             self.arm_probe(now);
@@ -448,6 +462,7 @@ mod tests {
         let re = drain(&mut tx, Instant::from_millis(400));
         assert_eq!(re, vec![(0, true, vec![0])]);
         assert_eq!(tx.retransmits, 1);
+        assert_eq!(tx.fragments_sent, 3, "a retransmission is not a new fragment");
         tx.on_ack(Instant::from_millis(450), 3, 0);
         assert_eq!(tx.next_due(), None);
     }
