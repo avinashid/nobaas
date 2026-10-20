@@ -23,9 +23,11 @@
 // alternates rounds between A and this checkout (B), so each pair of rounds sees
 // the same load. It prints B/A as the median of the per-pair ratios, with their
 // min..max, for throughput (above 1 is faster) and for CPU per message (below 1
-// is cheaper). A ratio whose range spans 1.0 is no measurable change.
+// is cheaper). Judge on the CPU ratio: an A/A run (the same code on both sides)
+// at load 6 on this host gave CPU medians of 0.986..1.013 in every case, while
+// throughput medians ranged 0.92..1.08 with single pairs from 0.48 to 1.88.
 //
-//   git -C ~/projects/personal/nobaas worktree add /tmp/nb-main origin/main
+//   git -C ~/projects/personal/nobaas worktree add --detach /tmp/nb-main origin/main
 //   /tmp/nb-main/packages/js/build.sh && ./packages/js/build.sh    # from the branch root
 //   cd packages/js && node test/bench.mjs --ab=/tmp/nb-main/packages/js
 import os from 'node:os';
@@ -156,7 +158,7 @@ function line(name, c, s) {
   const mb = s.mbPerSec !== undefined ? `${s.mbPerSec.toFixed(2).padStart(9)} MB/s` : ''.padStart(14);
   const heap = s.heapMB !== undefined ? `  heap +${s.heapMB} MB` : '';
   const lost = s.lost ? `  lost ${s.lost}` : '';
-  const cpu = `${s.cpuUs.toFixed(2).padStart(8)} µs cpu/${c.unit.startsWith('ev') ? 'ev ' : 'msg'}`;
+  const cpu = `${s.cpuUs.toFixed(2).padStart(10)} µs cpu/${c.unit.startsWith('ev') ? 'ev ' : 'msg'}`;
   return `${name.padEnd(28)}${String(s.median).padStart(10)} ${c.unit}${mb}${cpu}   [${s.min}..${s.max}]  gc ${s.gcCount} / ${s.gcMs} ms${heap}${lost}`;
 }
 
