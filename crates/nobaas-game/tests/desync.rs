@@ -39,6 +39,8 @@ fn crc_is_deterministic() {
     }
 }
 
+type Mutant<'a> = Box<dyn Fn(&mut PlayerEntityQ16) + 'a>;
+
 /// Any single-field change to the hashed state should change the CRC except for the 1-in-65536 collisions of a
 /// 16-bit checksum. Over CASES mutations, more than a handful of collisions would mean a field is not hashed.
 #[test]
@@ -53,7 +55,7 @@ fn crc_detects_single_field_changes() {
         let base = compute_island_state_crc16(tick, &ps);
         let i = range(&mut r, 0, n as i64 - 1) as usize;
         let delta = (r.next_u32() | 1) as i32;
-        let mutants: [Box<dyn Fn(&mut PlayerEntityQ16)>; 6] = [
+        let mutants: [Mutant; 6] = [
             Box::new(|p| p.peer_id ^= 1 + delta as u16 % 0xfff),
             Box::new(|p| p.pos.x = p.pos.x.wrapping_add(delta)),
             Box::new(|p| p.pos.y = p.pos.y.wrapping_add(delta)),

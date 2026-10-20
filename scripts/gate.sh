@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# The release gate: every check a change must pass before merge (see docs/TEST-PLAN.md).
+# Runs every step even after a failure, prints a summary and exits non-zero if any step failed.
+#
+#   scripts/gate.sh             Rust tests, clippy, wasm build and checks, Node glue, browser tests (loopback)
+#   scripts/gate.sh --quick     skip the browser tests
+#   scripts/gate.sh --strict    clippy with -D warnings
+#   scripts/gate.sh --nostr     also run the public-relay Nostr test (touches relay.damus.io, nos.lol, public STUN)
+#
+# Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs).
+set -u
+cd "$(dirname "$0")/.."
+
+quick=0 strict=0 nostr=0
+for a in "$@"; do
+  case "$a" in
+    --quick) quick=1 ;;
+    --strict) strict=1 ;;
+    --nostr) nostr=1 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
+  esac
+done
+
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+if ! command -v node >/dev/null && [ -s "$HOME/.nvm/nvm.sh" ]; then . "$HOME/.nvm/nvm.sh" >/dev/null; fi
+
+WASM_MAX_BYTES=${WASM_MAX_BYTES:-358400}
+WASM=packages/js/pkg/nobaas_ffi.wasm
+results=()
+failed=0
+
+step() {
+  local name=$1; shift
+  echo
+  echo "==> $name: $*"
+  local t0=$SECONDS
+  if "$@"; then
+    results+=("PASS  $name ($((SECONDS - t0))s)")
+  else
+    results+=("FAIL  $name ($((SECONDS - t0))s)")
+    failed=1
+  fi
+}
+
+skip() {
+  results+=("SKIP  $1 ($2)")
+}
+
+# Size and import count of the browser module: it must stay small and import nothing.
+wasm_check() {
+  node -e '
+    const fs = require("fs");
+    const [path, max] = [process.argv[1], Number(process.argv[2])];
+    const bytes = fs.readFileSync(path);
+    const imports = WebAssembly.Module.imports(new WebAssembly.Module(bytes));
+    console.log(`${path}: ${bytes.length} bytes (limit ${max}), ${imports.length} imports`);
+    for (const i of imports) console.log(`  import ${i.module}.${i.name} (${i.kind})`);
+    process.exit(bytes.length <= max && imports.length === 0 ? 0 : 1);
+  ' "$WASM" "$WASM_MAX_BYTES"
+}
+
+step "cargo test" cargo test --workspace --release
+if [ $strict = 1 ]; then
+  step "cargo clippy" cargo clippy --workspace --all-targets -- -D warnings
+else
+  step "cargo clippy" cargo clippy --workspace --all-targets
+fi
+if cargo fmt --version >/dev/null 2>&1; then
+  step "cargo fmt" cargo fmt --all -- --check
+else
+  skip "cargo fmt" "rustfmt not installed"
+fi
+step "wasm build" ./packages/js/build.sh
+step "wasm size+imports" wasm_check
+step "node glue" node packages/js/test/node_pair.mjs
+
+if [ $quick = 1 ]; then
+  skip "browser" "--quick"
+  skip "arena" "--quick"
+else
+  step "browser" node packages/js/test/browser.mjs 2
+  step "arena" node packages/js/test/arena.mjs 8 10
+fi
+if [ $nostr = 1 ]; then
+  step "nostr" node packages/js/test/nostr.mjs
+else
+  skip "nostr" "public relays; pass --nostr"
+fi
+
+echo
+echo "==> gate summary"
+printf '  %s\n' "${results[@]}"
+[ $failed = 0 ] && echo "GATE PASSED" || echo "GATE FAILED"
+exit $failed
