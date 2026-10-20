@@ -67,8 +67,9 @@ Topics use the same derivation as `packages/js/nostr.js`, so Rust and browser pe
 Every relay subscriber sees topics, so a topic proves nothing. The **room key**,
 `sha256("nobaas/room-key/" + app_id + "/" + room)`, is the same name hashed under another label. It can't be
 derived from the topic, so only peers given the name hold it. Hellos and room offers carry HMAC-SHA256 proofs
-under it. The room name works as the room's password: a long random name makes a private room, and a name
-others can guess makes a public lobby.
+under it. The room name works as the room's password, and a name others can guess makes a public lobby. The
+topic is an unsalted SHA-256 of the name, so whoever sees it can test guesses offline at hash speed: a private
+room needs a name with **at least 128 random bits**, such as 22 or more random base64 characters or 32 hex digits.
 
 ## Messages
 

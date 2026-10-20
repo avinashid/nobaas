@@ -114,7 +114,8 @@ println!("public address {:?}, NAT {:?}", node.public_addr(), node.nat_type());
 
 > [!IMPORTANT]
 > **The room name is the room's password.** Relays only see a hash of it. Only peers that know the name can join,
-> or act as the host. Use a long random name, such as 128 random bits in hex, for a private room. A guessable name
+> or act as the host. Use a name with at least 128 random bits (32 hex digits, or 22+ base64 characters) for a
+> private room: relays see an unsalted hash of it, which anyone can test guesses against offline. A guessable name
 > makes a public lobby.
 
 Run the bundled examples:

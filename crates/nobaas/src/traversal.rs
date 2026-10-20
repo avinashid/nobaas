@@ -1205,8 +1205,9 @@ mod tests {
         assert!(t.admits(&id(2).peer_id()) && t.room_role(&id(2).peer_id()).is_none());
     }
 
-    /// A v2 (room) offer short enough to have no proof, from an invited peer, is
-    /// dropped: it must not give that peer a room role such as Host.
+    /// NB-031: a v2 (room) offer without a verified proof, from an invited peer, is
+    /// dropped: it must not give that peer a room role such as Host. Security's
+    /// repro is the 22-byte one, short enough to skip the proof split.
     #[test]
     fn short_room_offer_without_proof_is_dropped() {
         let me = id(1).peer_id();
@@ -1214,16 +1215,28 @@ mod tests {
         let now = Instant::from_millis(10);
         t.introduce(now, &ep, id(2).peer_id(), None);
         while t.poll_signal().is_some() {}
-        let o = Offer::<SocketAddr> {
-            kind: Proof::Room, reply: true, role: Role::Host, nat: NatType::Cone, ts: 0, nonce: 1, addrs: vec![],
-            predict: None, relays: vec![],
+        let offer = |kind, nonce| {
+            let o = Offer::<SocketAddr> {
+                kind, reply: true, role: Role::Host, nat: NatType::Cone, ts: 0, nonce, addrs: vec![], predict: None,
+                relays: vec![],
+            };
+            o.encode()
         };
-        let body = o.encode();
-        assert!(body.len() <= PROOF_LEN, "short enough to skip the proof split");
-        let sealed = sealed::seal(&id(2), &me, [7; 32], &body).unwrap();
-        t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed);
-        assert_eq!(t.room_role(&id(2).peer_id()), None);
-        assert_eq!(published(&mut t), 0);
+        let mut send = |t: &mut Traversal<SocketAddr>, body: &[u8]| {
+            t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed::seal(&id(2), &me, [7; 32], body).unwrap());
+            (t.room_role(&id(2).peer_id()), published(t))
+        };
+        let short = offer(Proof::Room, 1);
+        assert_eq!(short.len(), 22);
+        assert_eq!(send(&mut t, &short), (None, 0));
+        // Padded with 32 bytes that aren't the proof, or as a short v3 (invite) offer: dropped too.
+        let padded = [offer(Proof::Room, 2), vec![0; PROOF_LEN]].concat();
+        assert_eq!(send(&mut t, &padded), (None, 0));
+        assert_eq!(send(&mut t, &offer(Proof::Invite, 3)), (None, 0));
+        // With the real proof, the same offer does make it the Host.
+        let body = offer(Proof::Room, 4);
+        let proof = mac(&room_key(ROOM.0, ROOM.1), &[b"nb-offer", id(2).peer_id().as_bytes(), me.as_bytes(), &body]);
+        assert_eq!(send(&mut t, &[body, proof.to_vec()].concat()), (Some(Role::Host), 1));
     }
 
     /// NB-032: forged hellos cost nothing, and hellos, offers and each sender
