@@ -504,3 +504,8 @@ mod tests {
         }
     }
 }
+
+// The README examples run as doc tests (`cargo test --doc`).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

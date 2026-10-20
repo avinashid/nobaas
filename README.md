@@ -427,7 +427,7 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | Node.js | the same wasm module |
 | Godot 4.3+ desktop | `nobaas-godot` GDExtension |
 | Swift, Kotlin, Dart, C | `nobaas-ffi` native library (C ABI). Higher-level bindings are planned |
-| Docker | an always-on peer is just a node that stays online (planned image) |
+| Docker | an always-on peer is just a node that stays online: `docker compose up` runs one on localhost, with the demos ([docs/DOCKER.md](docs/DOCKER.md)) |
 
 ## Repository layout
 
@@ -438,10 +438,11 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | [`bindings/godot`](bindings/godot) | Godot 4 GDExtension: `NobaasMultiplayerPeer` |
 | [`crates/nobaas-ffi`](crates/nobaas-ffi) | C ABI: one surface for WebAssembly and native FFI |
 | [`crates/nobaas-sim`](crates/nobaas-sim) | Deterministic network simulator (latency, jitter, loss, NAT types, uplink limits) and the arena benchmark |
-| [`crates/nobaas-game`](crates/nobaas-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep helpers |
+| [`crates/nobaas-game`](crates/nobaas-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep timing constants |
+| [`crates/nobaas-peer`](crates/nobaas-peer) | Optional always-on peer (binary): one identity across restarts, relays for linked peers; see [docs/DOCKER.md](docs/DOCKER.md) |
 | [`packages/js`](packages/js) | JavaScript package: wasm glue, WebRTC transport, Nostr signaling, browser demos |
 | [`examples`](examples) | Rust examples (echo, async echo, a local Nostr relay) and the Godot demo |
-| [`docs`](docs) | Architecture, NAT traversal, Godot, performance, test plan, comparison |
+| [`docs`](docs) | Architecture, NAT traversal, Godot, Docker, performance, test plan, comparison |
 | [`scripts/gate.sh`](scripts/gate.sh) | The release gate: every check a change must pass |
 
 ## Building and testing
@@ -469,6 +470,7 @@ Tests run on loopback, in the simulator or against an in-process Nostr relay
 | [Architecture](docs/ARCHITECTURE.md) | principles, layers, connection flow, lanes, super-peers |
 | [NAT traversal](docs/NAT-TRAVERSAL.md) | STUN, signaling, rooms and proofs, message formats, rules, threat analysis, coverage |
 | [Godot](docs/GODOT.md) | install, API, demo, limits |
+| [Docker](docs/DOCKER.md) | the always-on peer, the examples server, settings, exposing them |
 | [Performance model](docs/PERFORMANCE.md) | measured and theoretical numbers for games, whiteboards, chat and meetings |
 | [Test plan](docs/TEST-PLAN.md) | what is tested, and how |
 | [Comparison](docs/COMPARISON.md) | GunJS, Yjs, PeerJS, libp2p, Trystero, Hyperswarm |

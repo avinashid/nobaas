@@ -1,0 +1,10 @@
+# Only sources go into the build context.
+.git
+target
+packages/js/pkg
+**/node_modules
+tasks
+examples/godot
+**/*.png
+**/.env
+**/*.key

@@ -641,3 +641,8 @@ impl Sim {
         [next_pkt, next_timer].into_iter().flatten().min()
     }
 }
+
+// The README examples run as doc tests (`cargo test --doc`).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

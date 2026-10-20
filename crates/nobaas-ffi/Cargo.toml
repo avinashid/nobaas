@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "C ABI for nobaas-core: one surface for WASM (browsers) and native FFI (Dart, Swift, C)"
+description = "C ABI for nobaas-core: one surface for a zero-import WebAssembly module (browsers) and native FFI (Dart, Swift, C)"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]

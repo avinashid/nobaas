@@ -544,6 +544,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nobaas-peer"
+version = "0.1.0"
+dependencies = [
+ "nobaas",
+ "rand_core",
+]
+
+[[package]]
 name = "nobaas-sim"
 version = "0.1.0"
 dependencies = [

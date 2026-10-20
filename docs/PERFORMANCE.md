@@ -49,16 +49,18 @@ aarch64 core.
 
 | Link | Throughput | Peak cwnd / inflight | Delay backoffs | Retransmits | Urgent p50 / p99 | Sender CPU per fragment |
 |---|---|---|---|---|---|---|
-| Clean | 5.94 MB/s (11.3 s) | 1561 / 1024 | 1 | 0 | 546 / 955 ms | 6 µs |
+| Clean | 9.14 MB/s (7.3 s) | 1561 / 1024 | 1 | 0 | 326 / 875 ms | 5 µs |
 | 1% loss | 0.13 MB/s (504 s) | 339 / 339 | 0 | 977 | 27 / 34 s | 5 µs |
-| 0–10 ms jitter, drawn per packet (reorders) | 3.26 MB/s (20.6 s) | 952 / 952 | 2 | 0 | 1.1 / 1.6 s | 6 µs |
-| 0–10 ms jitter, in order | 2.89 MB/s (23.2 s) | 899 / 899 | 2 | 8 | 1.2 / 1.9 s | 5 µs |
+| 0–10 ms jitter, drawn per packet (reorders) | 7.00 MB/s (9.6 s) | 952 / 952 | 2 | 0 | 451 / 975 ms | 6 µs |
+| 0–10 ms jitter, in order | 6.02 MB/s (11.1 s) | 899 / 899 | 2 | 12 | 526 / 1106 ms | 5 µs |
 | Clean, 1 Gbit/s uplink | 10.39 MB/s (6.5 s) | 60416 / 1024 | 0 | 0 | 292 / 797 ms | 5 µs |
 
 What limits it:
-- **One delay backoff halves a whole transfer.** Slow start puts 1024 fragments per RTT on the wire, about
-  103 Mbit/s, so the uplink queues. Queueing delay over `QUEUE_TARGET` sets ssthresh to inflight / 2 (about 512),
-  and congestion avoidance then adds about one fragment per RTT. The window never returns to the cap.
+- **One delay backoff costs 15% of the window.** Slow start puts 1024 fragments per RTT on the wire, about
+  103 Mbit/s, so the uplink queues. Queueing delay over `QUEUE_TARGET` sets ssthresh to 85% of inflight (about
+  870), and congestion avoidance then adds about one fragment per RTT. Before PERF-7B the cut halved the window
+  (to about 512), which held the clean run to 5.94 MB/s and the jitter runs to 3.26 and 2.89 MB/s. A loss still
+  halves the window, so the loss row is unchanged.
 - **Loss caps the window, as in any Reno-style sender.** At 1% loss the window settles near
   `1.22 / √p` ≈ 12 fragments, which is **0.13 MB/s** at 100 ms (the Mathis bound, matched by the run). Before
   PERF-8, fast retransmit resent a lost fragment on every later ACK, so it reached `MAX_TRIES` in one round trip

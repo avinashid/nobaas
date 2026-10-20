@@ -168,6 +168,7 @@ two networks still need testing on real devices.
   one ordered stream, so a large reliable message on channel 2 delays channel 1 behind it.
 - **Frame format** (inside the encrypted Nobaas message), from `bindings/godot/src/session.rs`:
   - data: `0x01 mode channel [seq u32 LE, unreliable-ordered only] payload`
+    A frame whose mode doesn't match the lane it arrived on is dropped.
   - control: `0x00 0x01 id(i32 LE)`, the host's id assignment. Other control frames are ignored.
 
 ## Security

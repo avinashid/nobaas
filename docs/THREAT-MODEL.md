@@ -63,7 +63,7 @@ that needs a change is tracked as an NB card.
 | SEC-2 (Medium) | Narrowed by NB-031/NB-037: hellos need the room key; PeerId still readable by name holders |
 | SEC-3 (Medium) | Fixed for rooms (NB-031 Rust, NB-037 JS); open for a bare `WebRtcTransport` |
 | SEC-4…SEC-8 | Open (NB-024…NB-028) |
-| SEC-9…SEC-11 | Requirements met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 open |
+| SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
 | SEC-12 (Info) | Accepted, no card |
 | N38-1…N38-3 (port mapping) | **Fixed** in NB-038 (`71d83b2`) and NB-041 (`0dfdbc9`) |
 | NPM-1 (Low) | **Fixed** by `4cffbf9` (merged `14f463a`): no port mapping under `RelayOnly` |
@@ -408,7 +408,35 @@ a bug. NB-037's room-key proof does not change it. It only limits who can join a
 room to holders of the room key, and any of them can still be malicious. Godot's
 `server_relay` is on by default; `docs/GODOT.md` names its cost, how to turn it
 off, and that a relayed packet's sender id is the host's word (the host can forge
-it). NB-029 is still open to confirm these against the code.
+it).
+
+**NB-029 audit (`72c7e57`, `bindings/godot/src/{peer,session}.rs`).** Each
+requirement against the code:
+
+- SEC-9: the demo asserts `allow_object_decoding` is off (`main.gd`).
+  `get_max_packet_size()` is the current mode's cap, `put` refuses larger, and
+  received packets wait in a queue capped at 4096 packets and 16 MiB. gdext 0.5.5
+  runs every `#[func]` and virtual method under `catch_unwind`
+  (`godot-core::private::handle_panic`), so a panic is logged as a Godot error
+  and never unwinds into the engine; no panic is reachable from peer input in
+  `session.rs`.
+- SEC-10: `derive_id` never yields 0 or 1, and `IdMap::assign` moves a colliding
+  key to the next derived id (`colliding_ids_are_moved`). A packet's peer is
+  looked up from the authenticated Nobaas sender; a frame from a peer with no id
+  is dropped. A joiner takes ASSIGN only from the host it dialled, only once,
+  and never 1; a host ignores ASSIGN (`spoofed_frames_are_dropped`).
+- SEC-11: documented, as above; nothing in the binding forwards packets itself.
+- **N29-1 (Low) — fixed.** The data frame's mode byte is the sender's word and was
+  not checked against the lane the message arrived on: a peer could label
+  unreliable-lane packets `RELIABLE`, and `get_packet_mode()` reported a
+  guarantee the packet never had. Repro: `on_message(host, Lane::Unreliable,
+  encode_data(Reliable, ..))` queued a `RELIABLE` packet. Fix: a frame whose
+  `mode.lane()` differs from the delivering lane is dropped
+  (`spoofed_frames_are_dropped`, which fails with the check removed).
+- **Residual.** An admitted joiner can fill the 4096-packet queue every frame,
+  and Godot decodes everything it is handed: a CPU cost bounded by `max_peers`
+  and each link's bandwidth, not a memory one. The host's remedy is
+  `disconnect_peer` (and a ban by key); per-peer rate limits are app policy.
 
 ## Relation to the Protocol Zero red-team notes
 
