@@ -85,10 +85,14 @@ deterministically) run by one thread with its own UDP socket, so the node's sock
   and UPnP check the address before mapping).
 - **As a candidate.** `Traversal::set_mapped` puts the mapped address after the STUN address and before observed
   and LAN ones. It goes wherever public addresses go: invites, offers in `Direct` and `PublicOnly`, and the public
-  answer to invite holders (NB-033). Never under `RelayOnly`. It stays behind the STUN address so that port
-  prediction, which keys off the first address, still works.
-- **State.** `Node::port_mapping()` is `Off`, `Trying`, `Mapped { addr, protocol }`, `NotPublic { addr, protocol }`
-  or `Unavailable`, updated by `poll`.
+  answer to invite holders (NB-033). It stays behind the STUN address so that port prediction, which keys off
+  the first address, still works.
+- **Skipped under `RelayOnly`.** A relay-only node gives out no address, so it doesn't ask the router at all
+  (NPM-1): with `port_mapping(true)` it binds in state `RelayOnly` and sends nothing. `Node::set_privacy` to
+  `RelayOnly` stops the worker, which deletes the mapping on its own thread without blocking the caller; leaving
+  `RelayOnly` starts a new worker, first waiting (up to 7 s, as on drop) for the old one's delete to go out.
+- **State.** `Node::port_mapping()` is `Off`, `Trying`, `Mapped { addr, protocol }`, `NotPublic { addr, protocol }`,
+  `Unavailable` or `RelayOnly`, updated by `poll` and `set_privacy`.
 - **Limits.** Whether a mapping gets a port-restricted peer through also depends on the router sending replies
   from the mapped port; only a field test shows it for a given router.
 
@@ -346,8 +350,9 @@ Crates added to `nobaas` by NAT traversal:
   schedule through every protocol and the 5-minute retry; a failed renewal starting over; CGNAT and private
   external addresses not advertised; SSDP answers pointing elsewhere refused; description parsing and chunked
   HTTP. Mock PCP, NAT-PMP and UPnP gateways on loopback drive the real thread to a mapping, a renewal and the
-  delete on drop. `node.rs` checks a mapped address appears in `addresses()` and invites, and `traversal.rs`
-  where it ranks and which privacy modes give it out.
+  delete on drop. `node.rs` checks a mapped address appears in `addresses()` and invites, and that a relay-only
+  node asks the gateway nothing, deletes the mapping when switched to `RelayOnly` and maps again when switched
+  out; `traversal.rs` where it ranks and which privacy modes give it out.
 - `crates/nobaas/tests/room_security.rs`:
   - the security review's `sec_room_topic_only` repro, which no longer links;
   - links from non-members closed unseen;

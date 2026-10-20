@@ -664,7 +664,7 @@ impl Session {
 }
 
 /// `port_mapping` as Godot shows it: state (`"off"`, `"trying"`, `"mapped"`,
-/// `"not_public"` or `"unavailable"`), the router's `ip:port` (`""` if none) and
+/// `"not_public"`, `"unavailable"` or `"relay_only"`), the router's `ip:port` (`""` if none) and
 /// protocol (`"pcp"`, `"natpmp"`, `"upnp"` or `""`).
 pub fn port_mapping_info(m: PortMapping) -> (&'static str, String, &'static str) {
     let protocol = |p| match p {
@@ -676,6 +676,7 @@ pub fn port_mapping_info(m: PortMapping) -> (&'static str, String, &'static str)
         PortMapping::Off => ("off", String::new(), ""),
         PortMapping::Trying => ("trying", String::new(), ""),
         PortMapping::Unavailable => ("unavailable", String::new(), ""),
+        PortMapping::RelayOnly => ("relay_only", String::new(), ""),
         PortMapping::Mapped { addr, protocol: p } => ("mapped", addr.to_string(), protocol(p)),
         PortMapping::NotPublic { addr, protocol: p } => ("not_public", addr.to_string(), protocol(p)),
     }
@@ -1103,5 +1104,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(asked.lock().unwrap().last(), Some(&0), "deleted on drop");
+    }
+
+    /// NPM-1: a relay-only joiner gives out no address, so it asks the router for
+    /// nothing and shows "relay_only"; a relay-only host, which gives out its
+    /// public addresses, still maps.
+    #[test]
+    fn relay_only_joiner_skips_port_mapping() {
+        let quiet = NetOptions { stun: Some(vec![]), relays: Some(vec![]), ..NetOptions::default() };
+        let host = Session::host(quiet.bind("127.0.0.1:0").unwrap());
+        let (gw, asked) = fake_pcp_gateway();
+        let relay_only = NetOptions {
+            privacy: Privacy::RelayOnly { via: None },
+            port_mapping: true,
+            portmap_at: Some((gw, "127.0.0.1:9".parse().unwrap())),
+            ..quiet
+        };
+        let mut joiner = Session::join(relay_only.bind("127.0.0.1:0").unwrap(), &host.invite()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        joiner.poll();
+        assert_eq!(port_mapping_info(joiner.port_mapping()), ("relay_only", String::new(), ""));
+        assert!(asked.lock().unwrap().is_empty(), "no request to the router");
+
+        let mut host = Session::host(relay_only.bind("127.0.0.1:0").unwrap());
+        let end = Instant::now() + Duration::from_secs(5);
+        while host.port_mapping().addr().is_none() && Instant::now() < end {
+            host.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(port_mapping_info(host.port_mapping()).0, "mapped");
     }
 }

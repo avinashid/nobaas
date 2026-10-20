@@ -107,8 +107,9 @@ impl Builder {
     /// to peers like a public one: a peer can then reach this node through a
     /// symmetric NAT that hole punching can't get through. The mapping is renewed
     /// while the node lives and removed when it is dropped. It runs on a thread of
-    /// its own, for IPv4 sockets not bound to loopback. See
-    /// [`Node::port_mapping`]. Default: off.
+    /// its own, for IPv4 sockets not bound to loopback. It doesn't run while the
+    /// node is under [`Privacy::RelayOnly`], which gives out no address (see
+    /// [`PortMapping::RelayOnly`]). See [`Node::port_mapping`]. Default: off.
     pub fn port_mapping(mut self, on: bool) -> Self {
         self.port_mapping = on;
         self
@@ -138,12 +139,8 @@ impl Builder {
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let mut trav = Traversal::new(&identity, seed, unix_ms, local_addresses(local), stun);
         trav.set_privacy(&mut ep, self.privacy);
-        let portmap = if self.port_mapping { start_port_mapping(local, self.portmap_at) } else { None };
-        let port_mapping = match (self.port_mapping, &portmap) {
-            (false, _) => PortMapping::Off,
-            (true, Some(_)) => PortMapping::Trying,
-            (true, None) => PortMapping::Unavailable,
-        };
+        // Starts paused: sync_port_mapping starts it unless relay-only.
+        let port_mapping = if self.port_mapping { PortMapping::RelayOnly } else { PortMapping::Off };
         let mut node = Node {
             sock,
             local,
@@ -155,9 +152,12 @@ impl Builder {
             events: VecDeque::new(),
             pending: VecDeque::new(),
             buf: Box::new([0; 2048]),
-            portmap,
+            portmap: None,
             port_mapping,
+            portmap_at: self.portmap_at,
+            releasing: None,
         };
+        node.sync_port_mapping();
         node.pump_signals();
         Ok(node)
     }
@@ -177,6 +177,9 @@ pub struct Node {
     buf: Box<[u8; 2048]>,
     portmap: Option<Worker>,
     port_mapping: PortMapping,
+    portmap_at: Option<(SocketAddr, SocketAddr)>,
+    /// A worker stopped by a switch to relay-only, deleting its mapping.
+    releasing: Option<Worker>,
 }
 
 impl Node {
@@ -234,8 +237,34 @@ impl Node {
     /// Changes which addresses this node gives out, from the next offer and
     /// invite on. Links already up are kept, on the path they have: to stop a
     /// peer knowing an address it already has, disconnect it.
+    ///
+    /// With [`Builder::port_mapping`] on, switching to [`Privacy::RelayOnly`]
+    /// removes the router mapping (in the background), and switching out of it
+    /// asks the router again; that waits, like dropping the node, up to 7 s for
+    /// the last mapping's removal if the router stalls.
     pub fn set_privacy(&mut self, privacy: Privacy) {
         self.trav.set_privacy(&mut self.ep, privacy);
+        self.sync_port_mapping();
+    }
+
+    /// Runs router port mapping, when asked for, only while not relay-only.
+    fn sync_port_mapping(&mut self) {
+        if self.port_mapping == PortMapping::Off {
+            return;
+        }
+        if matches!(self.privacy(), Privacy::RelayOnly { .. }) {
+            if let Some(w) = self.portmap.take() {
+                w.stop();
+                self.releasing = Some(w);
+            }
+            self.port_mapping = PortMapping::RelayOnly;
+            self.trav.set_mapped(None);
+        } else if self.port_mapping == PortMapping::RelayOnly {
+            // The old mapping's delete goes out before the new request.
+            drop(self.releasing.take());
+            self.portmap = start_port_mapping(self.local, self.portmap_at);
+            self.port_mapping = if self.portmap.is_some() { PortMapping::Trying } else { PortMapping::Unavailable };
+        }
     }
 
     /// Addresses a peer may reach this node at, as put in [`invite`](Node::invite):
@@ -658,5 +687,51 @@ mod tests {
         assert!(inv.addrs.contains(&mapped));
         drop(n);
         assert!(eventually(|| log.lock().unwrap().last().is_some_and(|r| lifetime_of(r) == 0)));
+    }
+
+    /// NPM-1: a relay-only node gives out no address, so it asks the router for
+    /// none; switching to relay-only removes a mapping, and switching back maps again.
+    #[test]
+    fn port_mapping_is_skipped_under_relay_only() {
+        use crate::portmap::tests::{eventually, lifetime_of, pcp_gateway};
+        let ext = Ipv4Addr::new(203, 0, 113, 7);
+        let (gw, log) = pcp_gateway(ext, 120);
+        let mut n = Node::builder()
+            .stun_servers(Vec::<String>::new())
+            .privacy(Privacy::RelayOnly { via: None })
+            .port_mapping_at(gw, "127.0.0.1:9".parse().unwrap())
+            .bind("127.0.0.1:0")
+            .unwrap();
+        assert_eq!(n.port_mapping(), PortMapping::RelayOnly);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        n.poll();
+        assert_eq!(n.port_mapping(), PortMapping::RelayOnly);
+        assert!(log.lock().unwrap().is_empty(), "no request to the router");
+
+        let mapped = SocketAddr::from((ext, 41000));
+        let map = |n: &mut Node| {
+            eventually(|| {
+                n.poll();
+                n.port_mapping().addr() == Some(mapped)
+            })
+        };
+        n.set_privacy(Privacy::Direct);
+        assert_eq!(n.port_mapping(), PortMapping::Trying);
+        assert!(map(&mut n));
+        assert!(n.addresses().contains(&mapped));
+
+        n.set_privacy(Privacy::RelayOnly { via: None });
+        assert_eq!(n.port_mapping(), PortMapping::RelayOnly);
+        assert!(eventually(|| log.lock().unwrap().last().is_some_and(|r| lifetime_of(r) == 0)), "deleted");
+        n.poll();
+        assert_eq!(n.port_mapping(), PortMapping::RelayOnly);
+        n.set_privacy(Privacy::RelayOnly { via: Some(n.peer_id()) });
+        let requests = log.lock().unwrap().len();
+
+        n.set_privacy(Privacy::PublicOnly);
+        assert!(map(&mut n), "mapped again");
+        assert!(log.lock().unwrap().len() > requests);
+        assert_ne!(lifetime_of(log.lock().unwrap().last().unwrap()), 0);
+        assert_eq!(n.addresses(), vec![mapped]);
     }
 }
