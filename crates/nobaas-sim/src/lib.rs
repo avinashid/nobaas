@@ -10,12 +10,16 @@
 //! Nodes can sit behind NATs ([`NatConfig`]), and NATs behind other NATs
 //! (carrier-grade NAT). Each NAT's inside is its own address realm; the
 //! internet is realm 0.
+//!
+//! STUN servers ([`Sim::add_stun_server`]) sit on the internet and answer Binding
+//! requests with the address they saw, so hosts learn their NAT's mapping. STUN
+//! answers reaching a node go to its [`Node::stun_inbox`], not its endpoint.
 
 mod nat;
 
 pub use nat::{Dependence, NatConfig, NatStats, PortAlloc};
 use nat::Nat;
-use nobaas_core::{Address, Config, ConnectError, Endpoint, Event, Identity, Instant, Lane, Path, PeerId, SendError};
+use nobaas_core::{stun, Address, Config, ConnectError, Endpoint, Event, Identity, Instant, Lane, Path, PeerId, SendError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use std::cmp::Ordering;
@@ -57,6 +61,17 @@ impl Address for SimAddr {
         let p = i32::from(self.port) + delta;
         (1..=65535).contains(&p).then(|| SimAddr::new(self.ip, p as u16))
     }
+
+    fn to_socket_addr(&self) -> Option<std::net::SocketAddr> {
+        Some(std::net::SocketAddr::from((self.ip.to_be_bytes(), self.port)))
+    }
+
+    fn from_socket_addr(addr: std::net::SocketAddr) -> Option<Self> {
+        match addr {
+            std::net::SocketAddr::V4(a) => Some(SimAddr::new(u32::from(*a.ip()), a.port())),
+            std::net::SocketAddr::V6(_) => None,
+        }
+    }
 }
 
 /// The port every simulated host binds.
@@ -66,6 +81,7 @@ pub const HOST_PORT: u16 = 7000;
 enum Owner {
     Node(usize),
     Nat(usize),
+    Stun,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +123,8 @@ pub struct Node {
     pub tx_bytes: u64,
     pub rx_packets: u64,
     pub rx_bytes: u64,
+    /// STUN datagrams that arrived for this node, with their source; the host takes them.
+    pub stun_inbox: Vec<(SimAddr, Vec<u8>)>,
     tx_free_at: Instant,
 }
 
@@ -263,6 +281,7 @@ impl Sim {
             tx_bytes: 0,
             rx_packets: 0,
             rx_bytes: 0,
+            stun_inbox: Vec::new(),
             tx_free_at: Instant::ZERO,
         });
         self.timers.push(None);
@@ -326,6 +345,28 @@ impl Sim {
         let peer = self.peer_id(to);
         self.touch(from);
         self.nodes[from].endpoint.send(&peer, lane, data)
+    }
+
+    /// Adds a STUN server on the internet; returns its address.
+    pub fn add_stun_server(&mut self) -> SimAddr {
+        let ip = self.alloc_ip();
+        self.owners.insert(ip, Owner::Stun);
+        SimAddr::new(ip, 3478)
+    }
+
+    /// Sends a datagram from node `i`'s socket (out through its NATs), as a host
+    /// does for traffic that isn't the endpoint's, such as STUN.
+    pub fn send_raw(&mut self, i: usize, to: SimAddr, data: Vec<u8>) {
+        self.put_on_wire(i, to, data);
+    }
+
+    /// Answers a Binding request that reached a STUN server with the address it came from.
+    fn answer_stun(&mut self, p: &InFlight) {
+        let (Some(tx), Some(seen)) = (stun::parse_binding_request(&p.data), p.from.to_socket_addr()) else { return };
+        self.seq += 1;
+        let data = stun::binding_response(&tx, seen);
+        let at = self.now + self.net.latency;
+        self.queue.push(InFlight { at, seq: self.seq, from: p.to, to: p.from, realm: 0, exits: Vec::new(), data });
     }
 
     /// Delivers a raw datagram to whatever node holds `to`, right now.
@@ -432,13 +473,22 @@ impl Sim {
         self.now = self.now.max(next);
         while self.queue.peek().is_some_and(|p| p.at <= self.now) {
             let p = self.queue.pop().unwrap();
+            if p.realm == 0 && self.owners.get(&p.to.ip) == Some(&Owner::Stun) {
+                self.stats.delivered += 1;
+                self.answer_stun(&p);
+                continue;
+            }
             match self.descend(&p) {
                 Some(i) => {
                     self.stats.delivered += 1;
                     let n = &mut self.nodes[i];
                     n.rx_packets += 1;
                     n.rx_bytes += p.data.len() as u64 + 28;
-                    n.endpoint.handle_datagram(self.now, p.from, &p.data);
+                    if stun::is_stun(&p.data) {
+                        n.stun_inbox.push((p.from, p.data));
+                    } else {
+                        n.endpoint.handle_datagram(self.now, p.from, &p.data);
+                    }
                     self.touch(i);
                 }
                 None => self.stats.undeliverable += 1,
@@ -491,6 +541,7 @@ impl Sim {
         match self.owners.get(&ip) {
             Some(&Owner::Node(i)) => self.nodes[i].realm == realm,
             Some(&Owner::Nat(n)) => self.nats[n].outer == realm,
+            Some(&Owner::Stun) => realm == 0,
             None => false,
         }
     }
@@ -515,6 +566,7 @@ impl Sim {
                     dst = self.nats[n].inbound(self.now, p.from, dst)?;
                     realm = self.nats[n].inner;
                 }
+                Owner::Stun => return None,
             }
         }
     }

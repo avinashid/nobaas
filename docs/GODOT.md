@@ -2,7 +2,8 @@
 
 `bindings/godot` is a GDExtension that adds one class, `NobaasMultiplayerPeer`. It is a `MultiplayerPeer`, so
 Godot's own high-level multiplayer (`@rpc`, `MultiplayerSynchronizer`, `MultiplayerSpawner`) runs over Nobaas
-without changes and without a server. One instance hosts and hands out an `nb:` invite. The others join with it.
+without changes and without a server. One instance hosts; the others join with its `nb:` invite, or find it by
+room name. Peers learn their public address from STUN, swap addresses over Nostr relays and punch through NATs.
 Every link is encrypted with Noise IK.
 
 | | |
@@ -36,6 +37,16 @@ func host() -> void:
 func join(invite: String) -> void:
 	peer.join(invite)                     # connected_to_server fires once the host accepts
 	multiplayer.multiplayer_peer = peer
+
+# Or meet by name, across NATs, with no invite to pass around:
+func host_room() -> void:
+	peer.host_room("my-game", "lobby-42") # app id (yours) + room name
+	multiplayer.multiplayer_peer = peer
+
+func join_room() -> void:
+	peer.join_room("my-game", "lobby-42") # waits for a host to answer
+	# or peer.join_room_host("my-game", "lobby-42", host_key) to accept that host only
+	multiplayer.multiplayer_peer = peer
 ```
 
 From there everything is standard Godot: `peer_connected` / `peer_disconnected`, `@rpc` methods,
@@ -45,7 +56,15 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 |---|---|
 | `host(port := 0) -> String` | Start hosting; returns the invite, or `""` if the port can't be bound |
 | `join(invite: String) -> Error` | Dial the host; `ERR_INVALID_PARAMETER` for a bad invite |
-| `get_invite() -> String` | This peer's invite again |
+| `host_room(app_id, room, port := 0) -> String` | Host and announce in a room. Only peers that know the room name get in: invite joins are turned away while it announces. Returns the invite |
+| `join_room(app_id, room) -> Error` | Join whichever host proves it is in the room; `CONNECTING` until one answers |
+| `join_room_host(app_id, room, host_key) -> Error` | `join_room`, accepting only the host whose `get_public_key()` is `host_key` (32 bytes) |
+| `get_invite() -> String` | This peer's invite again (public address first, once STUN answered) |
+| `get_public_address() -> String` | `ip:port` STUN reported, `""` until a server answers |
+| `get_nat_type() -> String` | `open`, `cone`, `symmetric` or `unknown` (needs answers from two STUN servers) |
+| `get_connect_error() -> String` | After `connection_failed`: `symmetric` (NATs make punching impossible), `unreachable`, or `""` |
+| `set_stun_servers(PackedStringArray)` | `host:port` list, from the next host/join. Default Google + Cloudflare; empty: off |
+| `set_signaling_relays(PackedStringArray)` | Nostr relay URLs, from the next host/join. Default `wss://relay.damus.io`, `wss://nos.lol`; empty: off |
 | `get_peer_key(id) -> PackedByteArray` | The 32-byte Ed25519 key that authenticated peer `id`'s link (empty if not directly connected) |
 | `get_public_key() -> PackedByteArray` | This peer's own key |
 | `get_peer_rtt_ms(id) -> float` | Smoothed RTT to a directly connected peer, `-1` if unknown |
@@ -53,6 +72,26 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 
 The rest of the `MultiplayerPeer` API works as documented: `refuse_new_connections`, `disconnect_peer()`,
 `close()`, `transfer_mode`, `transfer_channel`, `get_unique_id()`.
+
+## Through NATs
+
+Most players sit behind a NAT, so neither side can simply dial the other. `nobaas` does the traversal (see
+[`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md)), and the binding drives it from `_poll()`; no threads are exposed to
+GDScript.
+
+1. On `host*()` / `join*()` the peer asks two STUN servers, on its game socket, what address its NAT gave it.
+   Invites list that public address first, then LAN and loopback addresses.
+2. In a room, the host announces itself on the room's Nostr topic. A joiner announcing there gets a sealed offer
+   from the host (its addresses, encrypted to the joiner's key) and answers with its own. Both then dial each
+   other at once, which opens both NATs: the handshake goes through. `join(invite)` does the same over the host's
+   own topic, so invites punch too.
+3. Cone NATs (most home routers, `cone` above) punch every time. A `symmetric` NAT against a port-restricted or
+   symmetric one cannot, and Godot's star has no third peer both sides are linked to, so `join*()` fails with
+   `get_connect_error() == "symmetric"`. Nobaas runs no TURN relay, by design. The Rust `Node` relays such pairs
+   through any peer connected to both.
+
+The simulator covers the whole NAT matrix (`crates/nobaas-sim/tests/traversal.rs`). Real carrier-grade NATs across
+two networks still need testing on real devices.
 
 ## How it maps onto Nobaas
 
@@ -96,31 +135,61 @@ read or changed on the way. Everything Godot does with those bytes is outside th
 - **Relaying between joiners is Godot's server relay** (`multiplayer.server_relay`, on by default): the host's
   SceneMultiplayer forwards joiner packets, and the binding only reports that it can. Set
   `multiplayer.server_relay = false` on the host to stop it. Joiners then see only the host.
-- **The invite is not a password.** It holds no secret, and anyone who has it can join. Set
-  `refuse_new_connections` once everyone is in, or kick with `disconnect_peer()`.
+- **The invite is not a password; the room name is.** An invite holds no secret, so anyone who has it can join.
+  - **Rooms.** Relays only see a hash of the room name. Hellos and offers carry an HMAC under a key derived from
+    the name, so a peer that doesn't know the name can't join the room or pose as its host. Links from such peers
+    are closed unseen.
+  - **Use long random room names for private games.** A guessable name (`"lobby-42"`) is a public lobby: anyone
+    who guesses it is a member, and a member could announce itself as a host.
+  - **Pin the host where you can.** If joiners can learn the host's `get_public_key()` some other way (a friend
+    code, a QR code, your own backend), `join_room_host()` accepts that host only.
+  - **Close the door.** Set `refuse_new_connections` once everyone is in (a refusing host also stops announcing
+    its room), or kick with `disconnect_peer()`.
+- **Third parties by default.** With the defaults, `host*()` and `join*()` contact Google's and Cloudflare's STUN
+  servers (they learn your public IP and that you run Nobaas) and the Nostr relays `relay.damus.io` and `nos.lol`.
+  Relays see the room topic (a SHA-256 of `nobaas/room/<app id>/<room>`, so anyone who knows or guesses the name
+  can watch who announces in it, and when), each peer's topic (a hash of its public key), your IP and the timing
+  of messages. They never see addresses or anything else in an offer: offers are sealed to the recipient's key
+  (Noise X), carry a timestamp and nonce, and are dropped when stale or replayed. A fresh Nostr key signs each
+  session's events, so they are not linked to your Nobaas identity. `set_stun_servers([])` and
+  `set_signaling_relays([])` turn both off (LAN and open-port play still work), or point them at servers you run:
+  `cargo run -p nobaas --features nostr --example nostr_relay` is a minimal relay for a LAN. On a `ws://` relay,
+  anyone on the network path can drop or inject events. Offers stay sealed and hellos stay proven, so that can stop
+  a game from connecting but not let anyone into it.
+- **Your key works like an invite.** Anyone who knows your public key can send you a sealed offer, and an answer
+  reveals your LAN and public addresses and up to 8 keys you are linked to. Rooms limit this to members.
 - **Malformed packets** fail at the binding's `decode` and are dropped. Payloads above the lane caps are refused
   on the way out. Rust panics are caught at the GDExtension boundary by godot-rust and never unwind into Godot.
 
 ## Demo
 
-[`examples/godot/`](../examples/godot): two (or more) instances. One hosts, the others join by invite. Each
+[`examples/godot/`](../examples/godot): two (or more) instances. One hosts, the others join by invite or by
+typing the same room name (Host room / Join room). Each
 player moves a square with the arrow keys, synced by `MultiplayerSynchronizer` and spawned by
 `MultiplayerSpawner`. A text box sends an `@rpc` chat line.
 
 ```sh
 cargo build --release -p nobaas-godot
 godot --path examples/godot              # twice: Host in one window, paste the invite + Join in the other
-GODOT=godot ./examples/godot/test.sh     # headless check on loopback: host + joiner, exits 0 on success
+GODOT=godot ./examples/godot/test.sh     # headless check on loopback: invite run + room run, exits 0 on success
 ```
 
-`test.sh` runs both instances headless. They move by themselves and chat. Each passes once it has seen the other
-peer's square move and received its chat line:
+`test.sh` runs a host and a joiner headless, twice: by invite, then by room through a local Nostr relay
+(`examples/rust/nostr_relay.rs`). It passes `--stun=none` and a local or no relay, so it touches no public
+service. The instances move by themselves and chat. Each passes once it has seen the other peer's square move and
+received its chat line:
 
 ```
 NOBAAS_DEMO_OK peer=1 rtt_ms=6.9
-NOBAAS_DEMO_OK peer=712076104 rtt_ms=8.8
+NOBAAS_DEMO_OK peer=1813978524 rtt_ms=16.0
+invite: PASS
+NOBAAS_DEMO_OK peer=1 rtt_ms=10.9
+NOBAAS_DEMO_OK peer=985991120 rtt_ms=-1.0
+room: PASS
 PASS
 ```
+
+(`-1` means no RTT sample yet: that joiner finished before its first one.)
 
 ## Tests
 
@@ -132,14 +201,17 @@ binary:
 - mode → lane mapping and the size limits;
 - unreliable-ordered dropping, including wrap-around;
 - a host with two joiners over loopback: id assignment, broadcast, exclude-one targeting, kick, close;
-- refusing new connections.
+- refusing new connections;
+- a room host found by two clients (and not by a client of another room) through in-process signaling; clients
+  link to the host only, and a refusing host stops being found.
 
 ## Limits
 
-- **Reachability.** An invite lists the host's LAN and loopback addresses, plus any public address peers have
-  reported. Today that covers the same machine, the same LAN, or a host with a reachable UDP port. NAT traversal
-  across the internet (STUN, signaling adapters, peer relays) arrives in the `nobaas` facade with NB-004; the
-  binding will pick it up without API changes.
+- **NATs.** Cone NATs punch; a symmetric NAT against a port-restricted or symmetric one fails with
+  `get_connect_error() == "symmetric"` (no TURN; see [Through NATs](#through-nats)). Some networks block UDP or
+  Nostr's websockets altogether.
+- **Rooms have no size limit or host election.** One host per room: a second `host_room` with the same name is
+  found by some joiners and not others.
 - **The host's uplink carries everyone**, as with any star. Use `nobaas-game` islands and super-peers for big
   sessions.
 - **Lockstep and rollback games** must run their game logic on `nobaas-game` fixed-point maths, not Godot

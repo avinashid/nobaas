@@ -1,16 +1,18 @@
-use crate::session::{Mode, PeerEvent, PutError, Session, Status};
+use crate::session::{Mode, NetOptions, PeerEvent, PutError, Session, Status};
+use nobaas::{Failure, NatType, Node, PeerId};
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
 use godot::prelude::*;
 
 /// A `MultiplayerPeer` over Nobaas: Godot's `@rpc`, `MultiplayerSynchronizer` and
-/// `MultiplayerSpawner` with no server. One instance hosts (peer 1) and hands out
-/// an `nb:` invite; the others join with it.
+/// `MultiplayerSpawner` with no server. One instance hosts (peer 1); the others
+/// join with its `nb:` invite, or find it by room name. Peers swap addresses over
+/// Nostr relays and punch through NATs.
 ///
 /// ```gdscript
 /// var peer := NobaasMultiplayerPeer.new()
-/// var invite := peer.host()          # or: peer.join(invite)
+/// peer.host_room("my-game", "lobby-42")   # or: peer.join_room("my-game", "lobby-42")
 /// multiplayer.multiplayer_peer = peer
 /// ```
 #[derive(GodotClass)]
@@ -22,26 +24,112 @@ pub struct NobaasMultiplayerPeer {
     mode: Mode,
     channel: u8,
     refuse: bool,
+    net: NetOptions,
 }
 
 #[godot_api]
 impl NobaasMultiplayerPeer {
+    /// STUN servers (`host:port`) asked for the public address, from the next
+    /// `host` / `join`. Default: Google's and Cloudflare's. Empty: no STUN.
+    #[func]
+    fn set_stun_servers(&mut self, servers: PackedStringArray) {
+        self.net.stun = Some(strings(&servers));
+    }
+
+    /// Nostr relays (`wss://…`, or `ws://…` on a LAN) peers swap addresses through,
+    /// from the next `host` / `join`. Default: relay.damus.io and nos.lol. Empty: no
+    /// signaling, so no rooms, and invites work only where the host is reachable.
+    #[func]
+    fn set_signaling_relays(&mut self, relays: PackedStringArray) {
+        self.net.relays = Some(strings(&relays));
+    }
+
+    /// Hosts on UDP `port` (0: a free one) and announces this game in room `room` of
+    /// application `app_id`, for `join_room`. Only peers that know the room name get
+    /// in: while announcing, the host turns away invite joins. Returns the invite, or
+    /// `""` if the port can't be bound.
+    #[func]
+    fn host_room(&mut self, app_id: GString, room: GString, #[opt(default = 0)] port: i32) -> GString {
+        let (app, room) = (app_id.to_string(), room.to_string());
+        self.start_host(port, |node| Session::host_room(node, &app, &room))
+    }
+
+    /// Joins the host announced in room `room` of `app_id`. The peer is connecting
+    /// until a host answers and assigns this peer its id; then
+    /// `connected_to_server` fires. It waits for a host as long as it takes.
+    ///
+    /// The room name is the password: only a peer that knows it can be taken for
+    /// the host (relays see a hash). Use a long random name for a private game; a
+    /// guessable one is a public lobby.
+    #[func]
+    fn join_room(&mut self, app_id: GString, room: GString) -> Error {
+        self.join_room_of(app_id, room, None)
+    }
+
+    /// `join_room`, taking only the host whose `get_public_key()` is `host_key`
+    /// (32 bytes): another peer in the room can't pose as it.
+    #[func]
+    fn join_room_host(&mut self, app_id: GString, room: GString, host_key: PackedByteArray) -> Error {
+        let Ok(key) = <[u8; 32]>::try_from(host_key.as_slice()) else {
+            godot_error!("NobaasMultiplayerPeer.join_room_host: host_key must be 32 bytes");
+            return Error::ERR_INVALID_PARAMETER;
+        };
+        self.join_room_of(app_id, room, Some(PeerId(key)))
+    }
+
+    fn join_room_of(&mut self, app_id: GString, room: GString, host: Option<PeerId>) -> Error {
+        self.close();
+        match self.net.bind("0.0.0.0:0") {
+            Ok(node) => {
+                self.install(Session::join_room(node, &app_id.to_string(), &room.to_string(), host));
+                Error::OK
+            }
+            Err(e) => {
+                godot_error!("NobaasMultiplayerPeer.join_room: {e}");
+                Error::ERR_CANT_CREATE
+            }
+        }
+    }
+
+    /// The public `ip:port` STUN reported for this peer, or `""` until a server answers.
+    #[func]
+    fn get_public_address(&self) -> GString {
+        match self.session.as_ref().and_then(Session::public_address) {
+            Some(a) => GString::from(a.to_string().as_str()),
+            None => GString::new(),
+        }
+    }
+
+    /// `"open"` (no NAT), `"cone"` (punching works), `"symmetric"` (punching works only
+    /// towards cone or open peers) or `"unknown"` (no STUN answer from two servers yet).
+    #[func]
+    fn get_nat_type(&self) -> GString {
+        let nat = self.session.as_ref().map_or(NatType::Unknown, Session::nat_type);
+        GString::from(match nat {
+            NatType::Unknown => "unknown",
+            NatType::Open => "open",
+            NatType::Cone => "cone",
+            NatType::Symmetric => "symmetric",
+        })
+    }
+
+    /// After `connection_failed`: `"symmetric"` if NATs on both sides made punching
+    /// impossible (no TURN relay, by design), `"unreachable"` if the host never
+    /// answered, or `""`.
+    #[func]
+    fn get_connect_error(&self) -> GString {
+        GString::from(match self.session.as_ref().and_then(Session::connect_failure) {
+            Some(Failure::Symmetric) => "symmetric",
+            Some(Failure::Unreachable) => "unreachable",
+            None => "",
+        })
+    }
+
     /// Starts hosting on UDP `port` (0 picks a free one) and returns the invite to
     /// share, or `""` if the port can't be bound.
     #[func]
     fn host(&mut self, #[opt(default = 0)] port: i32) -> GString {
-        self.close();
-        match Session::host(&format!("0.0.0.0:{}", port.clamp(0, 65535))) {
-            Ok(s) => {
-                let invite = s.invite();
-                self.install(s);
-                GString::from(invite.as_str())
-            }
-            Err(e) => {
-                godot_error!("NobaasMultiplayerPeer.host: {e}");
-                GString::new()
-            }
-        }
+        self.start_host(port, Session::host)
     }
 
     /// Joins the host that made `invite`. The peer is connecting until the host
@@ -49,7 +137,14 @@ impl NobaasMultiplayerPeer {
     #[func]
     fn join(&mut self, invite: GString) -> Error {
         self.close();
-        match Session::join("0.0.0.0:0", &invite.to_string()) {
+        let node = match self.net.bind("0.0.0.0:0") {
+            Ok(n) => n,
+            Err(e) => {
+                godot_error!("NobaasMultiplayerPeer.join: {e}");
+                return Error::ERR_CANT_CREATE;
+            }
+        };
+        match Session::join(node, &invite.to_string()) {
             Ok(s) => {
                 self.install(s);
                 Error::OK
@@ -101,6 +196,22 @@ impl NobaasMultiplayerPeer {
 }
 
 impl NobaasMultiplayerPeer {
+    fn start_host(&mut self, port: i32, make: impl FnOnce(Node) -> Session) -> GString {
+        self.close();
+        match self.net.bind(&format!("0.0.0.0:{}", port.clamp(0, 65535))) {
+            Ok(node) => {
+                let s = make(node);
+                let invite = s.invite();
+                self.install(s);
+                GString::from(invite.as_str())
+            }
+            Err(e) => {
+                godot_error!("NobaasMultiplayerPeer.host: {e}");
+                GString::new()
+            }
+        }
+    }
+
     fn install(&mut self, mut s: Session) {
         s.target = self.target;
         s.mode = self.mode;
@@ -112,6 +223,10 @@ impl NobaasMultiplayerPeer {
     fn stats(&self, id: i32) -> Option<nobaas::PeerStats> {
         self.session.as_ref()?.peer_stats(id)
     }
+}
+
+fn strings(a: &PackedStringArray) -> Vec<String> {
+    a.as_slice().iter().map(GString::to_string).collect()
 }
 
 fn to_godot(mode: Mode) -> TransferMode {
@@ -135,7 +250,15 @@ fn from_godot(mode: TransferMode) -> Mode {
 #[godot_api]
 impl IMultiplayerPeerExtension for NobaasMultiplayerPeer {
     fn init(base: Base<MultiplayerPeerExtension>) -> Self {
-        NobaasMultiplayerPeer { base, session: None, target: 0, mode: Mode::Reliable, channel: 0, refuse: false }
+        NobaasMultiplayerPeer {
+            base,
+            session: None,
+            target: 0,
+            mode: Mode::Reliable,
+            channel: 0,
+            refuse: false,
+            net: NetOptions::default(),
+        }
     }
 
     fn get_available_packet_count(&self) -> i32 {

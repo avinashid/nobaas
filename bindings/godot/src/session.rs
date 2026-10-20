@@ -6,6 +6,12 @@
 //! SceneMultiplayer's server relay. The host gives each joiner its Godot id in a
 //! control frame right after the Nobaas handshake.
 //!
+//! A joiner finds its host by invite ([`Session::join`]) or by room
+//! ([`Session::join_room`]): the host announces itself in the room as a
+//! [`Role::Host`] and joiners as [`Role::Client`], so joiners link to the host
+//! only. Either way, with signaling the two dial each other at once and punch
+//! through NATs (see `nobaas::traversal`).
+//!
 //! Every Godot packet travels in one Nobaas message:
 //!
 //! ```text
@@ -13,7 +19,10 @@
 //! control: 0x00 op(u8) ...            op 1 = ASSIGN id(i32 LE), host -> joiner
 //! ```
 
-use nobaas::{Event, Lane, Node, PeerId, PeerStats, SendError, MAX_UNRELIABLE};
+use nobaas::{
+    Event, Failure, Lane, NatType, Node, NostrSignaling, PeerId, PeerStats, Role, SendError, MAX_UNRELIABLE,
+};
+use std::net::SocketAddr;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
@@ -245,10 +254,40 @@ impl Ordered {
     }
 }
 
+/// Network settings for the node behind a [`Session`].
+#[derive(Clone, Debug, Default)]
+pub struct NetOptions {
+    /// STUN servers (`host:port`). `None`: Nobaas's defaults; empty: no STUN.
+    pub stun: Option<Vec<String>>,
+    /// Nostr relays for signaling (`wss://…`, `ws://…`). `None`: the default public
+    /// relays; empty: no signaling (rooms can't work, invites don't punch).
+    pub relays: Option<Vec<String>>,
+}
+
+impl NetOptions {
+    /// Binds a node with these settings.
+    pub fn bind(&self, addr: &str) -> io::Result<Node> {
+        let mut b = Node::builder();
+        if let Some(stun) = &self.stun {
+            b = b.stun_servers(stun.iter().cloned());
+        }
+        let relays = match &self.relays {
+            Some(r) => r.clone(),
+            None => nobaas::nostr::DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect(),
+        };
+        if !relays.is_empty() {
+            b = b.signaling(NostrSignaling::new(relays));
+        }
+        b.bind(addr)
+    }
+}
+
 /// One Godot multiplayer peer: a host or a joiner.
 pub struct Session {
     node: Node,
     host: bool,
+    /// The room this session announces in or looks for a host in: (app id, room).
+    room: Option<(String, String)>,
     /// 0 until the host assigns one (joiner).
     my_id: i32,
     /// Joiner: the host it dialled.
@@ -271,6 +310,7 @@ impl Session {
         Session {
             node,
             host,
+            room: None,
             my_id: if host { HOST_ID } else { 0 },
             host_peer: None,
             ids: IdMap::default(),
@@ -286,19 +326,43 @@ impl Session {
         }
     }
 
-    /// Hosts on `bind` (`"0.0.0.0:0"` for any interface and a free port). Read the
-    /// invite to hand out with [`invite`](Session::invite).
-    pub fn host(bind: &str) -> io::Result<Session> {
-        Ok(Session::new(Node::bind(bind)?, true))
+    /// Hosts on `node`. Read the invite to hand out with [`invite`](Session::invite).
+    pub fn host(node: Node) -> Session {
+        Session::new(node, true)
     }
 
     /// Joins the host named in `invite`.
-    pub fn join(bind: &str, invite: &str) -> Result<Session, JoinError> {
-        let mut node = Node::bind(bind).map_err(|_| JoinError::Bind)?;
+    pub fn join(mut node: Node, invite: &str) -> Result<Session, JoinError> {
         let host = node.connect(invite).map_err(|_| JoinError::InvalidInvite)?;
         let mut s = Session::new(node, false);
         s.host_peer = Some(host);
         Ok(s)
+    }
+
+    /// Hosts on `node` and announces it in room `room` of application `app_id`, for
+    /// [`join_room`](Session::join_room). Only peers that know the room name get in. Needs signaling.
+    pub fn host_room(node: Node, app_id: &str, room: &str) -> Session {
+        let mut s = Session::new(node, true);
+        s.room = Some((app_id.to_string(), room.to_string()));
+        s.announce();
+        s
+    }
+
+    /// Joins whichever host announces itself in the room (or only `host`, when its
+    /// key is known): connecting until one answers and assigns this peer its id.
+    /// Only a peer that proves it knows the room's name counts as a host. Needs
+    /// signaling.
+    pub fn join_room(mut node: Node, app_id: &str, room: &str, host: Option<PeerId>) -> Session {
+        node.join_room_with(app_id, room, Role::Client, host);
+        let mut s = Session::new(node, false);
+        s.room = Some((app_id.to_string(), room.to_string()));
+        s
+    }
+
+    fn announce(&mut self) {
+        if let Some((app, room)) = &self.room {
+            self.node.join_room_as(app, room, Role::Host);
+        }
     }
 
     /// This peer's `nb:` invite.
@@ -325,7 +389,15 @@ impl Session {
         self.status
     }
 
+    /// A refusing host also stops announcing itself in its room.
     pub fn set_refuse_new_connections(&mut self, refuse: bool) {
+        if self.host && refuse != self.refuse {
+            if refuse {
+                self.node.leave_room();
+            } else {
+                self.announce();
+            }
+        }
         self.refuse = refuse;
     }
 
@@ -351,6 +423,21 @@ impl Session {
         self.node.peer_id()
     }
 
+    /// The public address STUN reported for this peer's socket.
+    pub fn public_address(&self) -> Option<SocketAddr> {
+        self.node.public_addr()
+    }
+
+    /// What STUN says about this peer's NAT.
+    pub fn nat_type(&self) -> NatType {
+        self.node.nat_type()
+    }
+
+    /// Joiner: why the dial to the host failed, once it has.
+    pub fn connect_failure(&self) -> Option<Failure> {
+        self.node.failure(&self.host_peer?)
+    }
+
     /// RTT and loss towards a connected Godot peer.
     pub fn peer_stats(&self, id: i32) -> Option<PeerStats> {
         self.node.peer_stats(&self.ids.peer(id)?)
@@ -374,7 +461,11 @@ impl Session {
         match e {
             Event::Connected { peer, .. } => {
                 if !self.host {
-                    if Some(peer) != self.host_peer {
+                    if self.host_peer.is_none() && self.room.is_some() && self.node.room_role(&peer) == Some(Role::Host) {
+                        // The first peer to link that proved it hosts this room is ours.
+                        self.host_peer = Some(peer);
+                        self.node.leave_room();
+                    } else if Some(peer) != self.host_peer {
                         self.node.disconnect(&peer); // joiners only talk to the host
                     }
                 } else if self.refuse {
@@ -511,8 +602,6 @@ impl Session {
 /// Why [`Session::join`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinError {
-    /// No UDP socket could be bound.
-    Bind,
     /// Not an `nb:` invite, or one with no usable address.
     InvalidInvite,
 }
@@ -520,7 +609,12 @@ pub enum JoinError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nobaas::MemoryHub;
     use std::time::{Duration, Instant};
+
+    fn local() -> Node {
+        Node::bind("127.0.0.1:0").unwrap()
+    }
 
     fn peer(first: u8, rest: u8) -> PeerId {
         let mut b = [rest; 32];
@@ -627,10 +721,10 @@ mod tests {
 
     #[test]
     fn host_and_two_joiners_over_loopback() {
-        let mut host = Session::host("127.0.0.1:0").unwrap();
+        let mut host = Session::host(local());
         let invite = host.invite();
-        let mut a = Session::join("127.0.0.1:0", &invite).unwrap();
-        let mut b = Session::join("127.0.0.1:0", &invite).unwrap();
+        let mut a = Session::join(local(), &invite).unwrap();
+        let mut b = Session::join(local(), &invite).unwrap();
         assert_eq!(a.status(), Status::Connecting);
         let tentative = a.unique_id();
         assert!(tentative >= 2);
@@ -702,10 +796,10 @@ mod tests {
 
     #[test]
     fn refusing_host_turns_joiners_away() {
-        let mut host = Session::host("127.0.0.1:0").unwrap();
+        let mut host = Session::host(local());
         host.set_refuse_new_connections(true);
         assert!(host.is_refusing_new_connections());
-        let mut a = Session::join("127.0.0.1:0", &host.invite()).unwrap();
+        let mut a = Session::join(local(), &host.invite()).unwrap();
         assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Disconnected));
         assert!(host.peer_ids().is_empty());
         assert_eq!(drain_events(&mut host), vec![]);
@@ -714,6 +808,68 @@ mod tests {
 
     #[test]
     fn bad_invite_is_refused() {
-        assert_eq!(Session::join("127.0.0.1:0", "nb:nope").err(), Some(JoinError::InvalidInvite));
+        assert_eq!(Session::join(local(), "nb:nope").err(), Some(JoinError::InvalidInvite));
+    }
+
+    #[test]
+    fn room_clients_find_the_host_and_only_the_host() {
+        let hub = MemoryHub::new();
+        let node = || Node::builder().signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
+        let mut host = Session::host_room(node(), "nb-test", "godot-room");
+        let mut a = Session::join_room(node(), "nb-test", "godot-room", None);
+        let mut b = Session::join_room(node(), "nb-test", "godot-room", None);
+        let mut stranger = Session::join_room(node(), "nb-test", "another room", None);
+        assert_eq!(a.status(), Status::Connecting);
+        assert!(pump(&mut [&mut host, &mut a, &mut b, &mut stranger], |s| {
+            s[0].peer_ids().len() == 2 && s[1].status() == Status::Connected && s[2].status() == Status::Connected
+        }));
+        assert_eq!(a.peer_key(HOST_ID), Some(host.public_key()));
+        assert_eq!((a.peer_ids(), b.peer_ids()), (vec![HOST_ID], vec![HOST_ID]));
+        assert_eq!(stranger.status(), Status::Connecting);
+        a.target = HOST_ID;
+        a.put(b"hi").unwrap();
+        assert!(pump(&mut [&mut host, &mut a, &mut b], |s| s[0].available() == 1));
+        assert_eq!(host.pop().unwrap().from, a.unique_id());
+
+        // A refusing host is not announced: a newcomer finds nobody.
+        host.set_refuse_new_connections(true);
+        let mut late = Session::join_room(node(), "nb-test", "godot-room", None);
+        let found = pump(&mut [&mut host, &mut late], |s| s[1].status() == Status::Connected);
+        assert!(!found);
+    }
+
+    /// NB-031: a peer that knows the room topic (what relays see) but not its name
+    /// can't pose as the host, by hello or by dialling the client straight; with a
+    /// host key, the client takes that host only.
+    #[test]
+    fn room_clients_take_only_a_proven_host() {
+        use nobaas::{Signaling, Topic};
+        let hub = MemoryHub::new();
+        let node = || Node::builder().signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
+        let mut a = Session::join_room(node(), "nb-test", "secret-room", None);
+        let mut impostor = node();
+        let mut side = hub.connect();
+        let hex: String = impostor.peer_id().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let forged = format!(r#"{{"t":"hello","from":"{hex}","meta":{{"nb":1,"role":"host","p":"{}"}}}}"#, "00".repeat(32));
+        side.publish(Topic::room("nb-test", "secret-room"), forged.as_bytes());
+        impostor.connect(&a.invite()).unwrap();
+        let end = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < end {
+            a.poll();
+            impostor.poll();
+            while impostor.try_recv_event().is_some() {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!((a.status(), a.peer_ids()), (Status::Connecting, vec![]));
+
+        // The real host: found. Another host, when the client names one: ignored.
+        let mut host = Session::host_room(node(), "nb-test", "secret-room");
+        assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
+        assert_eq!(a.peer_key(HOST_ID), Some(host.public_key()));
+        let mut other = Session::host_room(node(), "nb-test", "secret-room");
+        let mut c = Session::join_room(node(), "nb-test", "secret-room", Some(other.public_key()));
+        assert!(pump(&mut [&mut host, &mut other, &mut c], |s| s[2].status() == Status::Connected));
+        assert_eq!(c.peer_key(HOST_ID), Some(other.public_key()));
+        assert_eq!(host.peer_ids().len(), 1, "only a");
     }
 }

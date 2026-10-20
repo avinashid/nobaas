@@ -1,18 +1,25 @@
 extends Node2D
-## Nobaas in Godot, no server: one instance hosts, the others join with its invite.
-## Arrow keys move your square (MultiplayerSynchronizer); the text box chats (@rpc).
+## Nobaas in Godot, no server: one instance hosts, the others join with its invite
+## or find it by room name, through NATs. Arrow keys move your square
+## (MultiplayerSynchronizer); the text box chats (@rpc).
 ##
 ## Headless check (see test.sh): `-- --host=FILE` writes the invite to FILE,
-## `-- --join=FILE` reads it. Both move by themselves, chat, and quit with 0 once
-## they have seen another peer's square move and its chat line, or 1 on timeout.
+## `-- --join=FILE` reads it; `-- --host-room=ROOM` / `-- --join-room=ROOM` meet by
+## room instead. `--stun=a:3478,b:3478` and `--relay=wss://…,…` set the STUN servers
+## and Nostr relays (`none` turns either off). Both move by themselves, chat, and
+## quit with 0 once they have seen another peer's square move and its chat line,
+## or 1 on timeout.
 
 const Player := preload("res://player.gd")
 const TIMEOUT := 20.0
+## Rooms are scoped to an application: pick a name of your own.
+const APP_ID := "nobaas-godot-demo"
 
 var peer := NobaasMultiplayerPeer.new()
 var players := Node2D.new()
 var spawner := MultiplayerSpawner.new()
 var invite_edit := LineEdit.new()
+var room_edit := LineEdit.new()
 var chat_edit := LineEdit.new()
 var log_label := Label.new()
 var args := {}
@@ -20,6 +27,7 @@ var headless := false
 var got_chat := false
 var done_at := -1.0
 var elapsed := 0.0
+var nat_logged := false
 
 
 func _ready() -> void:
@@ -35,21 +43,58 @@ func _ready() -> void:
 	multiplayer.peer_connected.connect(_on_peer_connected)
 	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 	multiplayer.connected_to_server.connect(_on_connected_to_server)
-	multiplayer.connection_failed.connect(func(): _log("could not reach the host"))
+	multiplayer.connection_failed.connect(func(): _log("could not reach the host (%s)" % peer.get_connect_error()))
 	multiplayer.server_disconnected.connect(func(): _log("the host left"))
 	for a in OS.get_cmdline_user_args():
 		var kv := a.trim_prefix("--").split("=", true, 1)
 		args[kv[0]] = kv[1] if kv.size() > 1 else ""
-	headless = args.has("host") or args.has("join")
+	if args.has("stun"):
+		peer.set_stun_servers(_list(args["stun"]))
+	if args.has("relay"):
+		peer.set_signaling_relays(_list(args["relay"]))
+	headless = args.has("host") or args.has("join") or args.has("host-room") or args.has("join-room")
 	if args.has("host"):
 		_host()
+	elif args.has("host-room"):
+		room_edit.text = args["host-room"]
+		_host_room()
 	elif args.has("join"):
 		invite_edit.text = FileAccess.get_file_as_string(args["join"]).strip_edges()
 		_join()
+	elif args.has("join-room"):
+		room_edit.text = args["join-room"]
+		_join_room()
+
+
+func _list(value: String) -> PackedStringArray:
+	return PackedStringArray() if value == "none" else value.split(",", false)
 
 
 func _host() -> void:
-	var invite := peer.host()
+	_start_hosting(peer.host(), "hosting as peer 1; invite copied to the clipboard")
+
+
+func _host_room() -> void:
+	var room := room_edit.text.strip_edges()
+	if room.is_empty():
+		_log("type a room name first")
+		return
+	_start_hosting(peer.host_room(APP_ID, room), "hosting room '%s' as peer 1" % room)
+
+
+func _join_room() -> void:
+	var room := room_edit.text.strip_edges()
+	if room.is_empty():
+		_log("type a room name first")
+		return
+	if peer.join_room(APP_ID, room) != OK:
+		_log("could not open a UDP port")
+		return
+	multiplayer.multiplayer_peer = peer
+	_log("looking for the host of room '%s'…" % room)
+
+
+func _start_hosting(invite: String, message: String) -> void:
 	if invite.is_empty():
 		_log("could not open a UDP port")
 		return
@@ -61,7 +106,7 @@ func _host() -> void:
 		var f := FileAccess.open(args["host"], FileAccess.WRITE)
 		f.store_string(invite)
 		f.close()
-	_log("hosting as peer 1; invite copied to the clipboard")
+	_log(message)
 	spawner.spawn(1)
 
 
@@ -115,6 +160,9 @@ func chat(text: String) -> void:
 
 
 func _process(delta: float) -> void:
+	if not nat_logged and multiplayer.has_multiplayer_peer() and peer.get_nat_type() != "unknown":
+		nat_logged = true
+		_log("public address %s, NAT %s" % [peer.get_public_address(), peer.get_nat_type()])
 	if not headless:
 		return
 	elapsed += delta
@@ -165,6 +213,19 @@ func _build_ui() -> void:
 	invite_edit.placeholder_text = "paste an nb: invite, then Join"
 	invite_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(invite_edit)
+	var room_row := HBoxContainer.new()
+	box.add_child(room_row)
+	var host_room_button := Button.new()
+	host_room_button.text = "Host room"
+	host_room_button.pressed.connect(_host_room)
+	room_row.add_child(host_room_button)
+	var join_room_button := Button.new()
+	join_room_button.text = "Join room"
+	join_room_button.pressed.connect(_join_room)
+	room_row.add_child(join_room_button)
+	room_edit.placeholder_text = "or a room name: everyone typing it meets, across NATs"
+	room_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	room_row.add_child(room_edit)
 	chat_edit.placeholder_text = "say something, Enter to send"
 	chat_edit.text_submitted.connect(func(text: String):
 		if multiplayer.has_multiplayer_peer() and not text.is_empty():

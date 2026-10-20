@@ -5,7 +5,8 @@
 #   scripts/gate.sh             Rust tests, clippy, wasm build and checks, Node glue, browser tests (loopback)
 #   scripts/gate.sh --quick     skip the browser tests
 #   scripts/gate.sh --strict    clippy with -D warnings
-#   scripts/gate.sh --nostr     also run the public-relay Nostr test (touches relay.damus.io, nos.lol, public STUN)
+#   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch relay.damus.io, nos.lol,
+#                               public STUN)
 #
 # Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs).
 set -u
@@ -17,7 +18,7 @@ for a in "$@"; do
     --quick) quick=1 ;;
     --strict) strict=1 ;;
     --nostr) nostr=1 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -84,8 +85,10 @@ else
 fi
 if [ $nostr = 1 ]; then
   step "nostr" node packages/js/test/nostr.mjs
+  step "nostr (rust)" cargo test -p nobaas --release --test nostr -- --ignored --nocapture
 else
   skip "nostr" "public relays; pass --nostr"
+  skip "nostr (rust)" "public relays; pass --nostr"
 fi
 
 echo
