@@ -1,4 +1,4 @@
-use crate::session::{Mode, NetOptions, PeerEvent, PutError, Session, Status};
+use crate::session::{Mode, NetOptions, PeerEvent, PutError, Session, Status, DEFAULT_MAX_PEERS};
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
@@ -24,11 +24,28 @@ pub struct NobaasMultiplayerPeer {
     mode: Mode,
     channel: u8,
     refuse: bool,
+    max_peers: i32,
     net: NetOptions,
 }
 
 #[godot_api]
 impl NobaasMultiplayerPeer {
+    /// The most joiners a host keeps (default 32). Past it, a newcomer is
+    /// disconnected before `peer_connected`, as with `refuse_new_connections`.
+    /// Applies at once; links already up stay.
+    #[func]
+    fn set_max_peers(&mut self, max: i32) {
+        self.max_peers = max.max(0);
+        if let Some(s) = self.session.as_mut() {
+            s.set_max_peers(self.max_peers as usize);
+        }
+    }
+
+    #[func]
+    fn get_max_peers(&self) -> i32 {
+        self.max_peers
+    }
+
     /// STUN servers (`host:port`) asked for the public address, from the next
     /// `host` / `join`. Default: Google's and Cloudflare's. Empty: no STUN.
     #[func]
@@ -274,6 +291,7 @@ impl NobaasMultiplayerPeer {
         s.mode = self.mode;
         s.channel = self.channel;
         s.set_refuse_new_connections(self.refuse);
+        s.set_max_peers(self.max_peers.max(0) as usize);
         self.session = Some(s);
     }
 
@@ -314,6 +332,7 @@ impl IMultiplayerPeerExtension for NobaasMultiplayerPeer {
             mode: Mode::Reliable,
             channel: 0,
             refuse: false,
+            max_peers: DEFAULT_MAX_PEERS as i32,
             net: NetOptions::default(),
         }
     }

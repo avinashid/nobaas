@@ -35,8 +35,11 @@ const TAG_DATA: u8 = 1;
 const OP_ASSIGN: u8 = 1;
 /// Largest reliable message: `nobaas::Config::max_message` by default.
 const MAX_RELIABLE: usize = 1 << 20;
-/// Packets waiting for Godot; past this the oldest are dropped.
+/// Packets waiting for Godot, and their bytes; past either the oldest are dropped.
 const MAX_INBOX: usize = 4096;
+const MAX_INBOX_BYTES: usize = 16 << 20;
+/// Joiners a host takes by default (see [`Session::set_max_peers`]).
+pub const DEFAULT_MAX_PEERS: usize = 32;
 
 /// Godot's `MultiplayerPeer.TransferMode`, in the same order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -298,7 +301,9 @@ pub struct Session {
     ids: IdMap,
     status: Status,
     refuse: bool,
+    max_peers: usize,
     inbox: VecDeque<Packet>,
+    inbox_bytes: usize,
     events: VecDeque<PeerEvent>,
     out_seq: HashMap<(i32, u8), u32>,
     in_seq: Ordered,
@@ -319,7 +324,9 @@ impl Session {
             ids: IdMap::default(),
             status: if host { Status::Connected } else { Status::Connecting },
             refuse: false,
+            max_peers: DEFAULT_MAX_PEERS,
             inbox: VecDeque::new(),
+            inbox_bytes: 0,
             events: VecDeque::new(),
             out_seq: HashMap::new(),
             in_seq: Ordered::default(),
@@ -429,6 +436,17 @@ impl Session {
         self.refuse
     }
 
+    /// The most joiners a host keeps linked (default [`DEFAULT_MAX_PEERS`]): past
+    /// it, a newcomer is disconnected as if the host refused new connections.
+    /// Links already up stay.
+    pub fn set_max_peers(&mut self, max: usize) {
+        self.max_peers = max;
+    }
+
+    pub fn max_peers(&self) -> usize {
+        self.max_peers
+    }
+
     /// Godot ids of the connected peers.
     pub fn peer_ids(&self) -> Vec<i32> {
         let mut v: Vec<i32> = self.ids.ids().collect();
@@ -494,7 +512,7 @@ impl Session {
                     } else if Some(peer) != self.host_peer {
                         self.node.disconnect(&peer); // joiners only talk to the host
                     }
-                } else if self.refuse {
+                } else if self.refuse || self.ids.len() >= self.max_peers {
                     self.node.disconnect(&peer);
                 } else {
                     let id = self.ids.assign(peer);
@@ -528,9 +546,12 @@ impl Session {
                 if mode == Mode::UnreliableOrdered && !self.in_seq.accept(from, channel, seq) {
                     return;
                 }
-                if self.inbox.len() >= MAX_INBOX {
-                    self.inbox.pop_front();
+                while self.inbox.len() >= MAX_INBOX || self.inbox_bytes + payload.len() > MAX_INBOX_BYTES {
+                    if self.pop().is_none() {
+                        break;
+                    }
                 }
+                self.inbox_bytes += payload.len();
                 self.inbox.push_back(Packet { from, channel, mode, data: payload.to_vec() });
             }
             None => {}
@@ -563,7 +584,9 @@ impl Session {
     }
 
     pub fn pop(&mut self) -> Option<Packet> {
-        self.inbox.pop_front()
+        let p = self.inbox.pop_front()?;
+        self.inbox_bytes -= p.data.len();
+        Some(p)
     }
 
     /// Sends `data` to [`target`](Session::target) with the current mode and channel.
@@ -582,7 +605,7 @@ impl Session {
                 }
                 vec![t]
             }
-            t => self.peer_ids().into_iter().filter(|&id| id != -t).collect(),
+            t => self.peer_ids().into_iter().filter(|&id| id != t.wrapping_neg()).collect(), // i32::MIN: all
         };
         let mut result = Ok(());
         for id in targets {
@@ -620,6 +643,7 @@ impl Session {
         }
         self.ids.clear();
         self.inbox.clear();
+        self.inbox_bytes = 0;
         self.events.clear();
         self.status = Status::Disconnected;
     }
@@ -833,6 +857,55 @@ mod tests {
         assert!(host.peer_ids().is_empty());
         assert_eq!(drain_events(&mut host), vec![]);
         assert_eq!(a.peer_ids(), Vec::<i32>::new());
+    }
+
+    /// NB-030 G1: past `max_peers`, a newcomer is turned away as if refused.
+    #[test]
+    fn host_keeps_at_most_max_peers() {
+        let mut host = Session::host(local());
+        assert_eq!(host.max_peers(), DEFAULT_MAX_PEERS);
+        host.set_max_peers(1);
+        let mut a = Session::join(local(), &host.invite()).unwrap();
+        assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
+        let mut b = Session::join(local(), &host.invite()).unwrap();
+        assert!(pump(&mut [&mut host, &mut a, &mut b], |s| s[2].status() == Status::Disconnected));
+        assert_eq!(host.peer_ids(), vec![a.unique_id()]);
+        assert_eq!(drain_events(&mut host), vec![PeerEvent::Connected(a.unique_id())], "no event for the newcomer");
+        assert_eq!(a.status(), Status::Connected);
+    }
+
+    /// NB-030 G3: the inbox holds at most MAX_INBOX_BYTES, dropping the oldest first.
+    #[test]
+    fn inbox_is_capped_in_bytes() {
+        let mut host = Session::host(local());
+        let p = peer(7, 7);
+        let id = host.ids.assign(p);
+        let big = vec![0u8; MAX_RELIABLE];
+        for n in 0..20u8 {
+            let mut data = big.clone();
+            data[0] = n;
+            host.on_message(p, &encode_data(Mode::Reliable, 0, 0, &data));
+        }
+        assert_eq!(host.available(), MAX_INBOX_BYTES / MAX_RELIABLE);
+        assert_eq!(host.inbox_bytes, MAX_INBOX_BYTES);
+        let first = host.pop().unwrap();
+        assert_eq!((first.from, first.data[0] as usize), (id, 20 - MAX_INBOX_BYTES / MAX_RELIABLE), "oldest dropped");
+        assert_eq!(host.inbox_bytes, MAX_INBOX_BYTES - MAX_RELIABLE);
+        host.close();
+        assert_eq!((host.available(), host.inbox_bytes), (0, 0));
+    }
+
+    /// NB-030 G4: `set_target_peer(i32::MIN)` (all but a peer that can't exist) sends
+    /// to everyone, without overflowing.
+    #[test]
+    fn target_i32_min_sends_to_all() {
+        let mut host = Session::host(local());
+        let mut a = Session::join(local(), &host.invite()).unwrap();
+        assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
+        host.target = i32::MIN;
+        host.put(b"all").unwrap();
+        assert!(pump(&mut [&mut host, &mut a], |s| s[1].available() == 1));
+        assert_eq!(a.pop().unwrap().data, b"all");
     }
 
     /// NB-034: a host gives out public addresses only (RELAY_ONLY acts as

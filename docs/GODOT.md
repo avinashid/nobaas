@@ -69,6 +69,7 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `set_privacy_mode(mode: int)` | Which addresses this peer gives out: `PRIVACY_DIRECT` (default), `PRIVACY_PUBLIC_ONLY`, `PRIVACY_RELAY_ONLY`. From the next host/join, and for the running session's next invites and offers; links already up are kept. See [Privacy](#privacy) |
 | `get_privacy_mode() -> int` | The mode set |
 | `get_peer_key(id) -> PackedByteArray` | The 32-byte Ed25519 key that authenticated peer `id`'s link (empty if not directly connected) |
+| `set_max_peers(max: int)` / `get_max_peers()` | Host: the most joiners it keeps (default 32). Past it, a newcomer is disconnected before `peer_connected`, as with `refuse_new_connections`. Applies at once; links already up stay |
 | `get_public_key() -> PackedByteArray` | This peer's own key |
 | `get_peer_rtt_ms(id) -> float` | Smoothed RTT to a directly connected peer, `-1` if unknown |
 | `get_peer_loss(id) -> float` | Loss estimate 0–1 from reliable retransmissions, `-1` if unknown |
@@ -141,14 +142,22 @@ read or changed on the way. Everything Godot does with those bytes is outside th
   only the dialled host is ever 1. The host gives each joiner a distinct id and renumbers on a collision, so no
   peer inherits another's id. But ids are 31 bits, and someone can grind a key that lands on a chosen id. Never
   authorize on an id or on `is_multiplayer_authority()`: use `get_peer_key(id)` and compare it with keys you
-  trust.
+  trust. Save progress and keep ban lists by key (for example `get_peer_key(id).hex_encode()`), never by id: an id
+  can be taken over while its owner is away.
 - **Godot's authority model is only as trustworthy as the peer you make the authority.** In this star the host is
   the natural authority: let it own spawning and validate what joiners send. A malicious host can still push any
   state. If no single peer can be trusted, run the game as deterministic lockstep on `nobaas-game`, where every
   peer recomputes the state and desyncs are detected.
 - **Relaying between joiners is Godot's server relay** (`multiplayer.server_relay`, on by default): the host's
-  SceneMultiplayer forwards joiner packets, and the binding only reports that it can. Set
-  `multiplayer.server_relay = false` on the host to stop it. Joiners then see only the host.
+  SceneMultiplayer forwards joiner packets, and the binding only reports that it can.
+  - A relayed packet's sender id is the host's word: joiners can't check it, so the host can forge who sent what
+    (SEC-11). Treat the host as fully trusted, or check senders inside the game data.
+  - A joiner's broadcast costs the host N−1 copies on its uplink.
+  - If joiners never talk to each other, set `multiplayer.server_relay = false` on the host. Joiners then see
+    only the host. (It stays on by default, as in Godot.)
+- **Limit who gets in.** A host keeps at most `max_peers` joiners (default 32): identities are free to make, so
+  anyone holding the invite could otherwise open link after link. Received packets wait in a queue capped at 4096
+  packets and 16 MiB, oldest dropped first.
 - **The invite is not a password; the room name is.** Anyone who has the invite can join. It carries a key that
   lets its holder ask the host to dial back (to punch through NATs); someone who knows only the host's public key
   can't.
@@ -251,8 +260,8 @@ binary:
   symmetric one against a port-restricted cone, fail with `get_connect_error() == "symmetric"` (no TURN; see
   [Through NATs](#through-nats)). Some networks block UDP or
   Nostr's websockets altogether.
-- **Rooms have no size limit or host election.** One host per room: a second `host_room` with the same name is
-  found by some joiners and not others.
+- **Rooms have no host election**, and a host takes `max_peers` joiners (default 32). One host per room: a second
+  `host_room` with the same name is found by some joiners and not others.
 - **The host's uplink carries everyone**, as with any star. Use `nobaas-game` islands and super-peers for big
   sessions.
 - **Lockstep and rollback games** must run their game logic on `nobaas-game` fixed-point maths, not Godot
