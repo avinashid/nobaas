@@ -23,6 +23,8 @@
 mod addr;
 mod crypto;
 mod endpoint;
+#[cfg(test)]
+mod fuzz;
 mod identity;
 mod invite;
 mod reliable;
