@@ -1,5 +1,7 @@
 # Nobaas
 
+[![CI](https://github.com/avinashid/nobaas/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/avinashid/nobaas/actions/workflows/ci.yml)
+
 **No backend as a service.** Nobaas is a peer-to-peer networking toolkit written in Rust. Use it to build
 multiplayer games, collaborative whiteboards, video meetings and chat without running servers or paying for relays.
 
