@@ -136,6 +136,8 @@ pub enum ConnectError {
     SelfConnect,
     InvalidPeerId,
     NoPath,
+    /// The node is relay-only and no relay is connected to dial through.
+    NoRelay,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +154,7 @@ impl std::fmt::Display for ConnectError {
             ConnectError::SelfConnect => "cannot connect to self",
             ConnectError::InvalidPeerId => "invalid peer id",
             ConnectError::NoPath => "no address or relay to dial",
+            ConnectError::NoRelay => "relay-only, and no relay is connected",
         })
     }
 }
@@ -345,6 +348,7 @@ pub struct Endpoint<A: Address> {
     ready: VecDeque<u32>,
     events: VecDeque<Event<A>>,
     stats: Stats,
+    relay_only: bool,
 }
 
 impl<A: Address> Endpoint<A> {
@@ -364,7 +368,51 @@ impl<A: Address> Endpoint<A> {
             ready: VecDeque::new(),
             events: VecDeque::new(),
             stats: Stats::default(),
+            relay_only: false,
         }
+    }
+
+    /// Keeps relayed links relayed, so peers reached through a relay never learn
+    /// this endpoint's address from it: they are asked to forward without the
+    /// origin tag (FWD_QUIET), dials that name a relay skip their direct
+    /// targets, and relayed links take no direct candidates, never
+    /// punch, never answer a punch and never move to a direct path. This endpoint
+    /// also stops sharing the addresses it sees (OBSERVED frames, origin tags), as
+    /// with `share_addresses` off, and answers a handshake at its own address
+    /// only from a peer it is dialling directly or already has a direct link
+    /// with. Direct links, such as the one to the relay, are unaffected; links
+    /// already up keep their path.
+    pub fn set_relay_only(&mut self, on: bool) {
+        self.relay_only = on;
+        if on {
+            for sess in self.sessions.values_mut().filter(|s| matches!(s.path, Path::Via(_))) {
+                sess.punch = None;
+                sess.candidates.clear();
+            }
+        }
+    }
+
+    /// Whether [`set_relay_only`](Endpoint::set_relay_only) is on.
+    pub fn relay_only(&self) -> bool {
+        self.relay_only
+    }
+
+    fn shares_addresses(&self) -> bool {
+        self.config.share_addresses && !self.relay_only
+    }
+
+    /// Whether a handshake from `peer` on `from` may be answered there: always,
+    /// unless relay-only, which answers at its own address only peers it dials
+    /// directly itself or already has a direct link with (its relay).
+    fn answers_directly(&self, from: &Path<A>, peer: &PeerId) -> bool {
+        if !self.relay_only || matches!(from, Path::Via(_)) {
+            return true;
+        }
+        let direct_dial = self.dialing.get(peer).and_then(|i| self.sessions.get(i)).is_some_and(|s| match &s.state {
+            State::Dialing(d) => d.targets.iter().any(|t| matches!(t, Path::Direct(_))),
+            State::Live(_) => false,
+        });
+        direct_dial || self.path(peer).is_some_and(|p| matches!(p, Path::Direct(_)))
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -478,6 +526,14 @@ impl<A: Address> Endpoint<A> {
         if targets.is_empty() {
             return Err(ConnectError::NoPath);
         }
+        // Relay-only: a dial that names a relay goes through it alone.
+        let relayed: Vec<Path<A>>;
+        let targets = if self.relay_only && targets.iter().any(|t| matches!(t, Path::Via(_))) {
+            relayed = targets.iter().filter(|t| matches!(t, Path::Via(_))).cloned().collect();
+            &relayed[..]
+        } else {
+            targets
+        };
         if self.peers.contains_key(&peer) {
             return Ok(());
         }
@@ -559,9 +615,9 @@ impl<A: Address> Endpoint<A> {
     }
 
     fn add_candidate(&mut self, now: Instant, idx: u32, a: A) {
-        let max = self.config.max_candidates;
+        let (max, relay_only) = (self.config.max_candidates, self.relay_only);
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
-        if sess.path.direct() == Some(&a) {
+        if sess.path.direct() == Some(&a) || (relay_only && matches!(sess.path, Path::Via(_))) {
             return;
         }
         if !sess.candidates.contains(&a) {
@@ -574,6 +630,9 @@ impl<A: Address> Endpoint<A> {
     }
 
     fn start_punch(&mut self, now: Instant, idx: u32) {
+        if self.relay_only {
+            return;
+        }
         let until = now + self.config.punch_duration;
         let token = self.rng.next_u64();
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
@@ -666,7 +725,8 @@ impl<A: Address> Endpoint<A> {
         let mut eph = [0u8; 32];
         eph.copy_from_slice(&noise[..32]);
         if let Some(&idx) = self.half_open.get(&(sender, eph)) {
-            if let Some(Session { state: State::Live(l), peer, .. }) = self.sessions.get_mut(&idx) {
+            let quiet = self.sessions.get(&idx).is_some_and(|s| !self.answers_directly(&from, &s.peer));
+            if let (Some(Session { state: State::Live(l), peer, .. }), false) = (self.sessions.get_mut(&idx), quiet) {
                 if let Some(hs2) = l.hs2.clone() {
                     l.hs2_resent = true;
                     let peer = *peer;
@@ -699,6 +759,10 @@ impl<A: Address> Endpoint<A> {
         // The claimed Ed25519 identity must be the one whose X25519 form ran the handshake.
         if peer.noise_static().as_ref().map(|k| &k[..]) != hs.get_remote_static() || peer == self.me {
             self.stats.rx_auth_failed += 1;
+            return None;
+        }
+        if !self.answers_directly(&from, &peer) {
+            self.stats.rx_handshake_dropped += 1;
             return None;
         }
         let mut inherited = (None, Vec::new());
@@ -866,9 +930,9 @@ impl<A: Address> Endpoint<A> {
                     }
                 }
                 // Relaying happens only between directly connected peers.
-                Ok(Frame::Fwd { to, packet }) => {
+                Ok(Frame::Fwd { to, packet, tag }) => {
                     if let Some(a) = &direct_from {
-                        forwards.push((to, packet.to_vec(), a.clone()));
+                        forwards.push((to, packet.to_vec(), tag.then(|| a.clone())));
                     }
                 }
                 Ok(Frame::Relayed { addr, packet }) => {
@@ -876,8 +940,9 @@ impl<A: Address> Endpoint<A> {
                         relayed.push((packet.to_vec(), A::decode(addr)));
                     }
                 }
+                // A relay-only endpoint never answers at its own address on a relayed link.
                 Ok(Frame::Punch(t)) => {
-                    if let Some(a) = &direct_from {
+                    if let (Some(a), false) = (&direct_from, self.relay_only && matches!(sess.path, Path::Via(_))) {
                         punch_acks.push((a.clone(), t));
                     }
                 }
@@ -931,7 +996,7 @@ impl<A: Address> Endpoint<A> {
             self.add_candidate(now, receiver, x);
         }
         for (to, packet, origin) in forwards {
-            self.forward(now, receiver, &to, &packet, &origin);
+            self.forward(now, receiver, &to, &packet, origin.as_ref());
         }
         for (packet, hint) in relayed {
             if let Some(idx) = self.on_packet(now, Path::Via(peer), &packet) {
@@ -957,8 +1022,8 @@ impl<A: Address> Endpoint<A> {
     }
 
     /// Relays `packet` from the peer on link `src` to peer `to`, tagged with the
-    /// address we see the sender at.
-    fn forward(&mut self, now: Instant, src: u32, to: &PeerId, packet: &[u8], origin: &A) {
+    /// address we see the sender at (`origin`: none if it asked us not to).
+    fn forward(&mut self, now: Instant, src: u32, to: &PeerId, packet: &[u8], origin: Option<&A>) {
         let ok = self.config.relay
             && self.sessions.get(&src).is_some_and(|s| s.peer != *to)
             && self
@@ -983,8 +1048,8 @@ impl<A: Address> Endpoint<A> {
         }
         sl.relay_tokens -= cost;
         let mut addr = Vec::new();
-        if self.config.share_addresses {
-            origin.encode(&mut addr);
+        if let (Some(o), true) = (origin, self.shares_addresses()) {
+            o.encode(&mut addr);
         }
         if addr.len() > crate::addr::MAX_ADDR_LEN {
             addr.clear();
@@ -1205,7 +1270,7 @@ impl<A: Address> Endpoint<A> {
                 wire::put_ping(&mut pt);
                 link.ping_pending = false;
                 // Tell the peer where we see it from (its reflexive address).
-                if let (Path::Direct(a), true) = (&sess.path, self.config.share_addresses) {
+                if let (Path::Direct(a), true) = (&sess.path, self.config.share_addresses && !self.relay_only) {
                     let mut b = Vec::new();
                     a.encode(&mut b);
                     if b.len() <= crate::addr::MAX_ADDR_LEN {
@@ -1247,7 +1312,7 @@ impl<A: Address> Endpoint<A> {
             return;
         }
         let mut f = Vec::with_capacity(FWD_OVERHEAD + payload.len());
-        wire::put_fwd(&mut f, dst, &payload);
+        wire::put_fwd(&mut f, dst, &payload, !self.relay_only);
         push_relay_frame(link, f, self.config.relay_queue, &mut self.stats.relay_dropped);
         mark_ready(&mut self.ready, ridx, link);
     }

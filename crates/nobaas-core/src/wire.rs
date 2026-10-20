@@ -9,6 +9,8 @@
 //!         | UNREL len(u16) data | CLOSE
 //!         | OBSERVED alen(u8) addr          the address the sender sees us at
 //!         | FWD to(32) len(u16) packet       relay this packet to peer `to`
+//!         | FWD_QUIET to(32) len(u16) packet  the same, without tagging it with
+//!                                          the sender's address (relay-only peers)
 //!         | RELAYED alen(u8) addr len(u16) packet
 //!                                          a relayed packet, with the address the
 //!                                          relay saw its origin at (alen 0: none)
@@ -56,6 +58,7 @@ const F_FWD: u8 = 7;
 const F_RELAYED: u8 = 8;
 const F_PUNCH: u8 = 9;
 const F_PUNCH_ACK: u8 = 10;
+const F_FWD_QUIET: u8 = 11;
 
 pub(crate) const ACK_LEN: usize = 13;
 pub(crate) const REL_OVERHEAD: usize = 8;
@@ -132,7 +135,8 @@ pub(crate) enum Frame<'a> {
     Unreliable(&'a [u8]),
     Close,
     Observed(&'a [u8]),
-    Fwd { to: PeerId, packet: &'a [u8] },
+    /// `tag`: the relay may tell `to` the address it sees the sender at.
+    Fwd { to: PeerId, packet: &'a [u8], tag: bool },
     Relayed { addr: &'a [u8], packet: &'a [u8] },
     Punch(u64),
     PunchAck(u64),
@@ -184,7 +188,7 @@ impl<'a> Iterator for Frames<'a> {
                 let n = b[1] as usize;
                 (Frame::Observed(&b[2..2 + n]), 2 + n)
             }
-            F_FWD if b.len() >= FWD_OVERHEAD => {
+            F_FWD | F_FWD_QUIET if b.len() >= FWD_OVERHEAD => {
                 let len = u16::from_le_bytes([b[33], b[34]]) as usize;
                 if b.len() < FWD_OVERHEAD + len {
                     self.failed = true;
@@ -192,7 +196,8 @@ impl<'a> Iterator for Frames<'a> {
                 }
                 let mut to = [0u8; 32];
                 to.copy_from_slice(&b[1..33]);
-                (Frame::Fwd { to: PeerId(to), packet: &b[FWD_OVERHEAD..FWD_OVERHEAD + len] }, FWD_OVERHEAD + len)
+                let packet = &b[FWD_OVERHEAD..FWD_OVERHEAD + len];
+                (Frame::Fwd { to: PeerId(to), packet, tag: b[0] == F_FWD }, FWD_OVERHEAD + len)
             }
             F_RELAYED if b.len() >= 4 && (b[1] as usize) <= MAX_ADDR_LEN && b.len() >= 4 + b[1] as usize => {
                 let n = b[1] as usize;
@@ -249,8 +254,8 @@ pub(crate) fn put_observed(out: &mut Vec<u8>, addr: &[u8]) {
     out.extend_from_slice(addr);
 }
 
-pub(crate) fn put_fwd(out: &mut Vec<u8>, to: &PeerId, packet: &[u8]) {
-    out.push(F_FWD);
+pub(crate) fn put_fwd(out: &mut Vec<u8>, to: &PeerId, packet: &[u8], tag: bool) {
+    out.push(if tag { F_FWD } else { F_FWD_QUIET });
     out.extend_from_slice(to.as_bytes());
     out.extend_from_slice(&(packet.len() as u16).to_le_bytes());
     out.extend_from_slice(packet);
@@ -282,7 +287,8 @@ mod tests {
         put_unreliable(&mut b, b"xy");
         put_close(&mut b);
         put_observed(&mut b, b"addr");
-        put_fwd(&mut b, &PeerId([7; 32]), b"pkt");
+        put_fwd(&mut b, &PeerId([7; 32]), b"pkt", true);
+        put_fwd(&mut b, &PeerId([8; 32]), b"q", false);
         put_relayed(&mut b, b"", b"p2");
         put_relayed(&mut b, b"a", b"");
         put_punch(&mut b, false, 11);
@@ -297,7 +303,8 @@ mod tests {
                 Frame::Unreliable(b"xy"),
                 Frame::Close,
                 Frame::Observed(b"addr"),
-                Frame::Fwd { to: PeerId([7; 32]), packet: b"pkt" },
+                Frame::Fwd { to: PeerId([7; 32]), packet: b"pkt", tag: true },
+                Frame::Fwd { to: PeerId([8; 32]), packet: b"q", tag: false },
                 Frame::Relayed { addr: b"", packet: b"p2" },
                 Frame::Relayed { addr: b"a", packet: b"" },
                 Frame::Punch(11),
@@ -308,12 +315,13 @@ mod tests {
 
     #[test]
     fn truncated_frames_fail_once() {
-        let mut cases: Vec<Vec<u8>> = vec![Vec::new(); 5];
+        let mut cases: Vec<Vec<u8>> = vec![Vec::new(); 6];
         put_reliable(&mut cases[0], 1, false, b"hello");
         put_observed(&mut cases[1], b"addr");
-        put_fwd(&mut cases[2], &PeerId([1; 32]), b"pkt");
+        put_fwd(&mut cases[2], &PeerId([1; 32]), b"pkt", true);
         put_relayed(&mut cases[3], b"ab", b"pkt");
         put_punch(&mut cases[4], true, 3);
+        put_fwd(&mut cases[5], &PeerId([1; 32]), b"pkt", false);
         for b in cases {
             for cut in 1..b.len() {
                 let r: Vec<_> = frames(&b[..cut]).collect();
@@ -337,7 +345,7 @@ mod tests {
             let len = (next() % 64) as usize;
             let mut b: Vec<u8> = (0..len).map(|_| next() as u8).collect();
             if let Some(f) = b.first_mut() {
-                *f = 1 + *f % 10; // mostly valid frame types
+                *f = 1 + *f % 11; // mostly valid frame types
             }
             for f in frames(&b) {
                 if f.is_err() {
