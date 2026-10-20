@@ -13,6 +13,7 @@ unchanged; this layer feeds it addresses.
 | Signaling | A publish/subscribe carrier keyed by 32-byte topics (`trait Signaling`): `MemoryHub` in-process, `NostrSignaling` over Nostr relays (feature `nostr`) |
 | Rooms | Presence on a room topic; peers that hear each other swap sealed offers |
 | Offers | Candidate addresses, NAT type and connected peers, sealed to one peer |
+| Port mapping | Opt-in (`Builder::port_mapping`): the router forwards a public port to the socket, by PCP, NAT-PMP or UPnP-IGD |
 | Dialling | Both sides call `Endpoint::connect_with` on every candidate (plus `Path::Via` a mutual peer): a simultaneous open |
 
 ## STUN
@@ -56,6 +57,35 @@ sequence, though:
   ports of the one IP the offer named (see the reflection bound below).
 - Datagrams are told apart by their first byte (RFC 7983): STUN goes to the traversal, everything else to the
   endpoint.
+
+## Router port mapping
+
+Opt-in, off by default: `Node::builder().port_mapping(true)`. For a node behind a symmetric NAT facing a peer whose
+router filters by port, where punching can't work and no third peer can relay (NB-038). The code is
+`crates/nobaas/src/portmap.rs`: a sans-IO `Mapper` (the protocols, leases and fallback order, tested
+deterministically) run by one thread with its own UDP socket, so the node's socket and `poll` are untouched.
+
+- **Order.** PCP MAP (RFC 6887), then NAT-PMP (RFC 6886), both to the default gateway's port 5351, then UPnP-IGD:
+  an SSDP search, the device description, `GetExternalIPAddress`, then `AddPortMapping`. Each UDP request is sent
+  up to 3 times (at 0, 0.25 and 0.75 s); SSDP answers are waited for 3 s. A refusal moves on at once, as does a
+  NAT-PMP-only server answering PCP. If all fail, the state is `Unavailable` and it starts over every 5 minutes.
+- **Gateway.** The IPv4 default route from `/proc/net/route` on Linux; elsewhere `.1` in the LAN's /24 (UPnP
+  finds the router by SSDP either way). IPv4 sockets only, and not ones bound to loopback.
+- **Lease.** 2 hours asked for, renewed at half of what the router grants. PCP renewals reuse the nonce and suggest
+  the port held. A UPnP port already taken on the router is retried on 2 random high ports; a router that only
+  allows permanent UPnP leases gets one, deleted with the node. A failed renewal drops the address and starts over.
+  Dropping the node deletes the mapping (it waits up to 2 s for that).
+- **Only public addresses.** If the router's external address is carrier-grade NAT (100.64/10) or private, another
+  NAT sits beyond it: the state is `NotPublic { addr }`, nothing is offered, and the mapping is deleted (NAT-PMP
+  and UPnP check the address before mapping).
+- **As a candidate.** `Traversal::set_mapped` puts the mapped address after the STUN address and before observed
+  and LAN ones. It goes wherever public addresses go: invites, offers in `Direct` and `PublicOnly`, and the public
+  answer to invite holders (NB-033). Never under `RelayOnly`. It stays behind the STUN address so that port
+  prediction, which keys off the first address, still works.
+- **State.** `Node::port_mapping()` is `Off`, `Trying`, `Mapped { addr, protocol }`, `NotPublic { addr, protocol }`
+  or `Unavailable`, updated by `poll`.
+- **Limits.** Whether a mapping gets a port-restricted peer through also depends on the router sending replies
+  from the mapped port; only a field test shows it for a given router.
 
 ## Topics and the room key
 
@@ -257,10 +287,23 @@ traversal privacy_modes_matrix -- --nocapture`:
   - `wss://` uses rustls with the webpki roots and hostname checks.
   - On `ws://` (a LAN or loopback relay), anyone on the path can drop or inject events. Offers stay sealed and
     hellos stay proven, so that costs availability, not membership.
+- **Router port mapping** (opt-in) opens a public UDP port to the node's socket for as long as it lives; anyone
+  who finds it reaches only the Noise endpoint. On the LAN:
+  - PCP and NAT-PMP answers count only from the gateway's address, and PCP answers only with the request's random
+    96-bit nonce, protocol and port;
+  - an SSDP answer is used only if its description URL names the host that answered, by IPv4 literal, and that host
+    isn't public. So a LAN responder can't send the node's HTTP requests to a third party;
+  - control URLs on another host, and service types or paths with spaces, quotes or control characters, are
+    refused, so nothing from the description can break out of a request line or header;
+  - HTTP answers are capped at 64 KiB, with 1.5 s connect, read and write timeouts.
+  A host on the LAN that answers SSDP before the router can still make the node send it the mapping requests, or
+  report a false mapped address. The second only adds a wrong candidate, which nothing can complete a handshake on.
 - **STUN servers** see the node's public address. A forged STUN answer needs the 96-bit transaction id and the
   server's source address.
 
 ## Dependencies
+
+Router port mapping adds no crates: its HTTP, SSDP and XML handling is a few hand-written functions.
 
 Crates added to `nobaas` by NAT traversal:
 - `sha2` and `hmac`: RustCrypto, MIT/Apache-2.0.
@@ -285,6 +328,13 @@ Crates added to `nobaas` by NAT traversal:
   - STUN classification and retransmits, port prediction from the two mappings;
   - predictions round-tripping in offers, and cone (not open or symmetric) receivers probing them;
   - failure messages naming the symmetric side.
+- `crates/nobaas/src/portmap.rs` unit tests: PCP mapping, renewal at half the lease and delete; NAT-PMP after a
+  PCP version refusal; UPnP after PCP and NAT-PMP refusals, with port conflicts and permanent leases; the timeout
+  schedule through every protocol and the 5-minute retry; a failed renewal starting over; CGNAT and private
+  external addresses not advertised; SSDP answers pointing elsewhere refused; description parsing and chunked
+  HTTP. Mock PCP, NAT-PMP and UPnP gateways on loopback drive the real thread to a mapping, a renewal and the
+  delete on drop. `node.rs` checks a mapped address appears in `addresses()` and invites, and `traversal.rs`
+  where it ranks and which privacy modes give it out.
 - `crates/nobaas/tests/room_security.rs`:
   - the security review's `sec_room_topic_only` repro, which no longer links;
   - links from non-members closed unseen;

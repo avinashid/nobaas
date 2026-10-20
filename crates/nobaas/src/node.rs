@@ -1,3 +1,4 @@
+use crate::portmap::{self, PortMapping, Worker};
 use crate::signaling::Signaling;
 use crate::traversal::{Failure, NatType, Privacy, Role, Signal, Traversal};
 use crate::Event;
@@ -61,6 +62,9 @@ pub struct Builder {
     stun: Vec<String>,
     signaling: Option<Box<dyn Signaling>>,
     privacy: Privacy,
+    port_mapping: bool,
+    /// PCP/NAT-PMP server and SSDP target, instead of the default gateway's (tests).
+    portmap_at: Option<(SocketAddr, SocketAddr)>,
 }
 
 impl Builder {
@@ -98,6 +102,25 @@ impl Builder {
         self
     }
 
+    /// Asks the LAN router to forward a public UDP port to this node, by PCP,
+    /// NAT-PMP or UPnP-IGD (tried in that order), and offers the mapped address
+    /// to peers like a public one: a peer can then reach this node through a
+    /// symmetric NAT that hole punching can't get through. The mapping is renewed
+    /// while the node lives and removed when it is dropped. It runs on a thread of
+    /// its own, for IPv4 sockets not bound to loopback. See
+    /// [`Node::port_mapping`]. Default: off.
+    pub fn port_mapping(mut self, on: bool) -> Self {
+        self.port_mapping = on;
+        self
+    }
+
+    /// Port mapping through a given PCP/NAT-PMP server and SSDP address.
+    #[cfg(test)]
+    pub(crate) fn port_mapping_at(mut self, gateway: SocketAddr, ssdp: SocketAddr) -> Self {
+        (self.port_mapping, self.portmap_at) = (true, Some((gateway, ssdp)));
+        self
+    }
+
     /// Binds the UDP socket (`"0.0.0.0:0"` for any interface and a free port).
     pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
         let sock = UdpSocket::bind(addr)?;
@@ -113,6 +136,12 @@ impl Builder {
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let mut trav = Traversal::new(&identity, seed, unix_ms, local_addresses(local), stun);
         trav.set_privacy(&mut ep, self.privacy);
+        let portmap = if self.port_mapping { start_port_mapping(local, self.portmap_at) } else { None };
+        let port_mapping = match (self.port_mapping, &portmap) {
+            (false, _) => PortMapping::Off,
+            (true, Some(_)) => PortMapping::Trying,
+            (true, None) => PortMapping::Unavailable,
+        };
         let mut node = Node {
             sock,
             local,
@@ -124,6 +153,8 @@ impl Builder {
             events: VecDeque::new(),
             pending: VecDeque::new(),
             buf: Box::new([0; 2048]),
+            portmap,
+            port_mapping,
         };
         node.pump_signals();
         Ok(node)
@@ -142,6 +173,8 @@ pub struct Node {
     events: VecDeque<Event>,
     pending: VecDeque<Transmit<SocketAddr>>,
     buf: Box<[u8; 2048]>,
+    portmap: Option<Worker>,
+    port_mapping: PortMapping,
 }
 
 impl Node {
@@ -164,6 +197,8 @@ impl Node {
             stun: DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
             signaling: None,
             privacy: Privacy::Direct,
+            port_mapping: false,
+            portmap_at: None,
         }
     }
 
@@ -217,6 +252,13 @@ impl Node {
     /// What STUN says about this node's NAT.
     pub fn nat_type(&self) -> NatType {
         self.trav.nat_type()
+    }
+
+    /// How router port mapping ([`Builder::port_mapping`]) stands: the mapped
+    /// address and the protocol that made it, once the router agreed. Updated by
+    /// [`poll`](Node::poll).
+    pub fn port_mapping(&self) -> PortMapping {
+        self.port_mapping
     }
 
     /// Dials the peer named in an invite, at every address it lists (and through any
@@ -354,6 +396,10 @@ impl Node {
     /// (`false` when the per-poll read cap stopped it first).
     pub(crate) fn poll_drained(&mut self, now: Instant) -> bool {
         let now = self.at(now);
+        if let Some(s) = self.portmap.as_ref().and_then(|w| w.poll()) {
+            self.port_mapping = s;
+            self.trav.set_mapped(s.addr());
+        }
         let mut drained = false;
         for _ in 0..MAX_READS_PER_POLL {
             match self.sock.recv_from(&mut self.buf[..]) {
@@ -509,6 +555,28 @@ fn local_addresses(local: SocketAddr) -> Vec<SocketAddr> {
     out
 }
 
+/// Starts router port mapping for the socket at `local`, through `at` or else the
+/// default gateway. `None` when it can't run: IPv6, loopback or no LAN address.
+fn start_port_mapping(local: SocketAddr, at: Option<(SocketAddr, SocketAddr)>) -> Option<Worker> {
+    let (gateway, ssdp) = match at {
+        Some(at) => at,
+        None => {
+            let lan = match local.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => primary_ip(false)?,
+                ip => ip,
+            };
+            let IpAddr::V4(lan) = lan else { return None };
+            if lan.is_loopback() {
+                return None;
+            }
+            (SocketAddr::from((portmap::default_gateway(lan), portmap::GATEWAY_PORT)), portmap::SSDP)
+        }
+    };
+    let mut seed = [0u8; 20];
+    OsRng.fill_bytes(&mut seed);
+    Worker::spawn(local.port(), gateway, ssdp, seed).ok()
+}
+
 /// Resolves `host:port` names, keeping the first address of the socket's family.
 fn resolve(servers: &[String], v6: bool) -> Vec<SocketAddr> {
     servers.iter().filter_map(|s| s.to_socket_addrs().ok()?.find(|a| a.is_ipv6() == v6)).collect()
@@ -563,5 +631,30 @@ mod tests {
         };
         assert_eq!(n.connect(&empty.to_link()), Err(Error::Connect(ConnectError::NoPath)));
         assert_eq!(n.status(&empty.peer), Status::Disconnected);
+    }
+
+    /// NB-038: off by default; once the router maps a port, the node offers it, and
+    /// dropping the node removes the mapping.
+    #[test]
+    fn port_mapping_is_offered_once_mapped_and_removed_on_drop() {
+        use crate::portmap::tests::{eventually, lifetime_of, pcp_gateway};
+        assert_eq!(quiet("127.0.0.1:0").port_mapping(), PortMapping::Off);
+        let on_loopback = Node::builder().stun_servers(Vec::<String>::new()).port_mapping(true).bind("127.0.0.1:0");
+        assert_eq!(on_loopback.unwrap().port_mapping(), PortMapping::Unavailable, "no gateway for loopback");
+        let ext = Ipv4Addr::new(203, 0, 113, 7);
+        let (gw, log) = pcp_gateway(ext, 120);
+        let b = Node::builder().stun_servers(Vec::<String>::new()).port_mapping_at(gw, "127.0.0.1:9".parse().unwrap());
+        let mut n = b.bind("127.0.0.1:0").unwrap();
+        assert_eq!(n.port_mapping(), PortMapping::Trying);
+        let mapped = SocketAddr::from((ext, 41000));
+        assert!(eventually(|| {
+            n.poll();
+            n.port_mapping().addr() == Some(mapped)
+        }));
+        assert_eq!(n.addresses(), vec![mapped, n.local_addr()]);
+        let inv: Invite<SocketAddr> = Invite::parse(&n.invite()).unwrap();
+        assert!(inv.addrs.contains(&mapped));
+        drop(n);
+        assert!(eventually(|| log.lock().unwrap().last().is_some_and(|r| lifetime_of(r) == 0)));
     }
 }
