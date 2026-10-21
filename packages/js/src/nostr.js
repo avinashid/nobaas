@@ -25,6 +25,14 @@ export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
 export const BACKOFF_MS = 30000;
 export const MAX_BACKOFF_MS = 600000;
 const LIMITED = /^(rate-limited|blocked)|banned|rate.?limit/i;
+// A relay socket that closes (the phone switched networks or turned on its hotspot,
+// Android froze the tab, the relay dropped us) is dialled again after this long,
+// doubling to the cap; going online, a network change or the page showing again
+// redials at once.
+export const RECONNECT_MS = 1000;
+export const MAX_RECONNECT_MS = 30000;
+// A socket still connecting this long after a network change is given up and redialled.
+const CONNECT_TIMEOUT_MS = 5000;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -51,28 +59,89 @@ export class NostrSignaling {
     this.seen = new Set();
     this.sockets = [];
     this.paused = new Map(); // relay url -> { until, ms }: backing off its rate limit
-    this.stats = { published: 0, received: 0, rejected: 0, relaysOpen: 0 };
+    this.stats = { published: 0, received: 0, rejected: 0, relaysOpen: 0, reconnects: 0 };
+    this.closed = false;
+    this.retry = new Map(); // relay url -> { ms, timer }: redial after a close
+    this.onReconnect = () => {}; // (url): a relay opened again after a close
     this.ready = this.start(relays);
   }
 
   async start(relays) {
     this.myTag = hex(await sha256(enc.encode(`peerwire/peer/${this.id}`)));
     this.roomTag = hex(await sha256(enc.encode(`peerwire/room/${this.room}`)));
-    const sub = hex(crypto.getRandomValues(new Uint8Array(8)));
-    const filter = { kinds: [KIND], '#p': [this.myTag, this.roomTag], since: Math.floor(Date.now() / 1000) - 30 };
+    this.sub = hex(crypto.getRandomValues(new Uint8Array(8)));
+    this.wake = (e) => {
+      if (e?.type === 'visibilitychange' && globalThis.document?.visibilityState !== 'visible') return;
+      this.redial(e?.type !== 'visibilitychange');
+    };
+    globalThis.addEventListener?.('online', this.wake);
+    globalThis.document?.addEventListener?.('visibilitychange', this.wake);
+    globalThis.navigator?.connection?.addEventListener?.('change', this.wake);
     await Promise.all(relays.map((url) => new Promise((resolve) => {
-      const ws = new WebSocket(url);
-      ws.relayUrl = url;
-      ws.onopen = () => {
-        this.stats.relaysOpen++;
-        ws.send(JSON.stringify(['REQ', sub, filter]));
-        resolve();
-      };
-      ws.onerror = () => resolve();
-      ws.onmessage = (m) => this.onRelay(url, m.data);
-      this.sockets.push(ws);
+      this.dial(url, resolve);
       setTimeout(resolve, 5000);
     })));
+  }
+
+  // Opens (or reopens) the socket to `url`; `opened` runs once it opens or fails.
+  dial(url, opened = () => {}) {
+    if (this.closed) return;
+    const again = this.sockets.some((s) => s.relayUrl === url);
+    this.sockets = this.sockets.filter((s) => s.relayUrl !== url);
+    const ws = new WebSocket(url);
+    ws.relayUrl = url;
+    ws.onopen = () => {
+      this.stats.relaysOpen++;
+      ws.counted = true;
+      this.retry.delete(url);
+      // Since a little before now: what was published while we were away has gone.
+      const filter = { kinds: [KIND], '#p': [this.myTag, this.roomTag], since: Math.floor(Date.now() / 1000) - 30 };
+      ws.send(JSON.stringify(['REQ', this.sub, filter]));
+      opened();
+      if (again) {
+        this.stats.reconnects++;
+        this.onReconnect(url);
+      }
+    };
+    ws.onerror = () => opened();
+    ws.onclose = () => this.lostSocket(ws);
+    ws.onmessage = (m) => this.onRelay(url, m.data);
+    ws.dialled = Date.now();
+    this.sockets.push(ws);
+  }
+
+  lostSocket(ws) {
+    if (ws.counted) this.stats.relaysOpen--;
+    ws.counted = false;
+    if (this.closed || !this.sockets.includes(ws) || this.retry.get(ws.relayUrl)?.timer) return;
+    const ms = this.retry.get(ws.relayUrl)?.ms ?? RECONNECT_MS;
+    const timer = setTimeout(() => {
+      this.retry.set(ws.relayUrl, { ms: Math.min(ms * 2, MAX_RECONNECT_MS), timer: null });
+      this.dial(ws.relayUrl);
+    }, ms);
+    this.retry.set(ws.relayUrl, { ms, timer });
+  }
+
+  // The network came back or changed, or the page is showing again: every relay that
+  // isn't open is redialled now. After a network change (`all`), open sockets are too,
+  // since their TCP connection may be on the old network and take minutes to time out.
+  redial(all) {
+    if (this.closed) return;
+    for (const ws of [...this.sockets]) {
+      const open = ws.readyState === WebSocket.OPEN;
+      const stuck = ws.readyState === WebSocket.CONNECTING && Date.now() - ws.dialled < CONNECT_TIMEOUT_MS;
+      if ((open && !all) || stuck) continue;
+      clearTimeout(this.retry.get(ws.relayUrl)?.timer);
+      this.retry.delete(ws.relayUrl);
+      if (ws.counted) this.stats.relaysOpen--;
+      ws.counted = false;
+      ws.onclose = null;
+      ws.onmessage = null;
+      try {
+        ws.close();
+      } catch {}
+      this.dial(ws.relayUrl);
+    }
   }
 
   async publish(tag, content) {
@@ -157,6 +226,12 @@ export class NostrSignaling {
   }
 
   close() {
+    this.closed = true;
+    for (const r of this.retry.values()) clearTimeout(r.timer);
+    this.retry.clear();
+    globalThis.removeEventListener?.('online', this.wake);
+    globalThis.document?.removeEventListener?.('visibilitychange', this.wake);
+    globalThis.navigator?.connection?.removeEventListener?.('change', this.wake);
     for (const ws of this.sockets) ws.close();
   }
 }

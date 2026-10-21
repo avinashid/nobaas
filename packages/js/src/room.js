@@ -177,6 +177,8 @@ export class Room {
     // ACKs free send window: flush the outbox as they arrive (the timer is a fallback).
     endpoint.onDrain = () => this.outbox.size && this.flush('drain');
     signaling.onHello = (peer, meta) => this.onHello(peer, meta);
+    // A relay back after a network change: announce us now, not at the next interval.
+    if ('onReconnect' in signaling) signaling.onReconnect = () => this.hello();
     this.helloTimer = setInterval(() => this.hello(), HELLO_EVERY_MS);
     this.onPageHide = () => {
       const linked = this.linked.size;

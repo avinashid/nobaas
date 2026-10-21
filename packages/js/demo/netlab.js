@@ -51,6 +51,7 @@ let warnings = 0;
 const relaySeen = new Map(); // relay url -> last state logged
 let lastRejected = 0;
 let lastBackoffs = 0;
+let lastReconnects = 0;
 
 // ---------- the event log ----------
 
@@ -580,7 +581,9 @@ async function render() {
       if ((s.backoffs ?? 0) > lastBackoffs) log('warn', 'a signalling relay rate-limited us: pausing it');
       lastRejected = s.rejected;
       lastBackoffs = s.backoffs ?? 0;
-      relayHtml = `<b>Signalling relays</b> (${s.published} sent, ${s.received} received, ${s.rejected} refused)<br>`
+      if ((s.reconnects ?? 0) > lastReconnects) log('info', `a signalling relay reconnected (${s.reconnects} so far): announcing us again`);
+      lastReconnects = s.reconnects ?? 0;
+      relayHtml = `<b>Signalling relays</b> (${s.published} sent, ${s.received} received, ${s.rejected} refused${s.reconnects ? `, ${s.reconnects} reconnects` : ''})<br>`
         + sig.sockets.map((ws) => { const x = st(ws); return `<span class="${x === 'open' ? 'ok' : x === 'connecting' ? 'dim' : 'bad'}">●</span> <span class="mono">${esc(ws.relayUrl)}</span> ${esc(x)}`; }).join('<br>');
       const piped = room.transport?.piped;
       if (piped) relayHtml += `<br><span class="dim">signalling route: ${piped.sent} batches sent, ${piped.received} datagrams received, ${piped.dropped} dropped</span>`;
