@@ -39,6 +39,7 @@ pub use endpoint::{
 };
 pub use identity::{Identity, PeerId};
 pub use invite::Invite;
+pub use reliable::MAX_URGENT;
 pub use time::Instant;
 pub use wire::{MAX_DATAGRAM, MAX_UNRELIABLE};
 

@@ -8,7 +8,8 @@ export type Presence = any;
 
 /** `reliable`: ordered, retransmitted. `unreliable`: latest-wins datagrams, one packet at most.
  * `urgent`: reliable, each fragment sent twice, ordered only among urgent messages (it overtakes queued
- * `reliable` data); arrives as `reliable`. */
+ * `reliable` data); arrives as `reliable`. Urgent messages are capped at 64 KiB encoded: `send` throws a
+ * RangeError above that. */
 export type LaneName = 'reliable' | 'unreliable' | 'urgent';
 
 /** What `room.send` accepts. Strings arrive as strings, bytes as a Uint8Array, anything else as parsed JSON. */
@@ -114,7 +115,7 @@ export declare class Room {
   on<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): () => void;
   off<E extends keyof RoomEvents>(event: E, fn: RoomEvents[E]): void;
   /** Sends to every joined peer, or to `to`. Returns how many peers it was queued for.
-   * Throws RangeError if the message can't fit the lane (unreliable: one datagram). */
+   * Throws RangeError if the message can't fit the lane (unreliable: one datagram; urgent: 64 KiB). */
   send(data: RoomData, options?: SendOptions): number;
   /** `send` with positional arguments; `peer` '' or null sends to everyone. */
   sendTo(peer: PeerId | '' | null, data: RoomData, lane?: LaneName | number): number;
@@ -225,7 +226,8 @@ export declare class Endpoint {
   open(bytes: Uint8Array): { from: PeerId; data: Uint8Array } | null;
   isConnected(peer: PeerId | Uint8Array): boolean;
   rttMs(peer: PeerId | Uint8Array): number | null;
-  /** 0, or a negative NB_ERR code (-1 not connected, -2 too large, -3 would block).
+  /** 0, or a negative NB_ERR code (-1 not connected, -2 too large: over 1100 B unreliable, 64 KiB urgent,
+   * 1 MiB reliable; -3 would block).
    * Throws `Error('send: endpoint closed')` after `close()`: that is a bug in the app, not a lost packet. */
   send(peer: PeerId | Uint8Array, data: string | Uint8Array, lane?: number): number;
   /** send() for a caller that tries the same message again after -3: a message over 16 KiB stays

@@ -79,7 +79,9 @@ Then it gives out its LAN/public address and loopback, learns its public address
 anyone who knows its peer id and address can link and relay through it, within the per-peer rate, the total relay rate
 and the peer cap. Identities are free to make, so one host can fill every slot: the most it can have relayed out of
 your server is `NOBAAS_RELAY_TOTAL` (8 MiB/s by default), and it can aim all of it at one linked peer, from your
-address. Lower `NOBAAS_RELAY_TOTAL` and `NOBAAS_MAX_PEERS` to what you want to give away. Relayed traffic is
+address. Lower `NOBAAS_RELAY_TOTAL` and `NOBAAS_MAX_PEERS` to what you want to give away. Each linked peer
+can also make the server hold about 2.3 MB of received data (about 2.6 MB allocated), so 256 peers can pin about
+0.6 GB of memory; size `NOBAAS_MAX_PEERS` to the memory you have. Relayed traffic is
 end-to-end encrypted between the two peers; the relay sees their addresses, packet
 sizes and timing. See [THREAT-MODEL.md](THREAT-MODEL.md).
 

@@ -63,6 +63,7 @@ pub mod traversal;
 pub use async_node::AsyncNode;
 pub use nobaas_core::{
     Config, ConnectError, DisconnectReason, Identity, Invite, Lane, PeerId, PeerStats, SendError, MAX_UNRELIABLE,
+    MAX_URGENT,
 };
 pub use node::{Builder, Error, Node, Status, DEFAULT_STUN_SERVERS};
 #[cfg(feature = "nostr")]

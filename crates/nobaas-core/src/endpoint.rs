@@ -1,7 +1,7 @@
 use crate::addr::{Address, Path};
 use crate::crypto::{self, ReplayWindow};
 use crate::identity::{Identity, PeerId};
-use crate::reliable::{PushError, RelRecv, RelSend};
+use crate::reliable::{PushError, RelRecv, RelSend, MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW};
 use crate::time::Instant;
 use crate::wire::{
     self, Frame, Packet, FWD_OVERHEAD, MAX_DATAGRAM, MAX_PLAINTEXT, MAX_RELAYED_PACKET, MAX_UNRELIABLE,
@@ -47,6 +47,8 @@ pub struct Config {
     /// re-dials waits until its old link times out, since its identity is only
     /// known after the DH. Links we dial ourselves are not capped.
     pub max_links: usize,
+    /// Largest `Reliable` message, sent or received; `Urgent` ones are also
+    /// capped at [`MAX_URGENT`]. A peer that sends a larger one is dropped.
     pub max_message: usize,
     /// Per-link cap on bytes queued or unacknowledged, for `Reliable` and for
     /// `Urgent` each, so a full reliable buffer never refuses an urgent message.
@@ -78,6 +80,16 @@ pub struct Config {
     /// Tell peers the addresses we see (OBSERVED frames, relay origin tags).
     /// Turn off when addresses are local handles rather than network addresses.
     pub share_addresses: bool,
+}
+
+impl Config {
+    /// Largest message on the urgent or the reliable lane.
+    fn max_message(&self, urgent: bool) -> usize {
+        match urgent {
+            true => self.max_message.min(MAX_URGENT),
+            false => self.max_message,
+        }
+    }
 }
 
 impl Default for Config {
@@ -120,7 +132,8 @@ pub enum Lane {
     /// with `Reliable` ones: it has its own sequence, goes out ahead of queued
     /// `Reliable` data, and each fragment is sent twice a few ms apart, so a
     /// single loss costs nothing instead of a retransmission round trip. For
-    /// small, latency-critical events; arrives as `Lane::Reliable`.
+    /// small, latency-critical events, up to [`MAX_URGENT`] (64 KiB); arrives
+    /// as `Lane::Reliable`.
     Urgent,
 }
 
@@ -347,8 +360,8 @@ impl Link {
             probe_at: now,
             ping_pending: false,
             tx: RelSend::new(),
-            rx: RelRecv::new(),
-            urx: RelRecv::new(),
+            rx: RelRecv::new(RECV_WINDOW),
+            urx: RelRecv::new(URGENT_RECV_WINDOW),
             unrel: VecDeque::new(),
             relay_q: VecDeque::new(),
             relay_tokens: burst,
@@ -777,7 +790,12 @@ impl<A: Address> Endpoint<A> {
         match lane {
             Lane::Reliable | Lane::Urgent => link
                 .tx
-                .push_message(data, self.config.max_send_buffer, self.config.max_message, lane == Lane::Urgent)
+                .push_message(
+                    data,
+                    self.config.max_send_buffer,
+                    self.config.max_message(lane == Lane::Urgent),
+                    lane == Lane::Urgent,
+                )
                 .map_err(|e| match e {
                     PushError::BufferFull => SendError::WouldBlock,
                     PushError::TooLarge => SendError::TooLarge,
@@ -1045,7 +1063,7 @@ impl<A: Address> Endpoint<A> {
                 Ok(Frame::Ack { cum, bits, urgent }) => link.tx.on_ack(now, cum, bits, urgent),
                 Ok(Frame::Reliable { seq, fin, data, urgent }) => {
                     let rx = if urgent { &mut link.urx } else { &mut link.rx };
-                    if rx.on_fragment(seq, fin, data, self.config.max_message, &mut reliable).is_err() {
+                    if rx.on_fragment(seq, fin, data, self.config.max_message(urgent), &mut reliable).is_err() {
                         violation = true;
                     }
                 }
@@ -1464,6 +1482,15 @@ impl<A: Address> Endpoint<A> {
 
     pub fn poll_event(&mut self) -> Option<Event<A>> {
         self.events.pop_front()
+    }
+
+    /// Bytes the live link to `peer` holds for its reliable and urgent receive
+    /// streams. For the tests.
+    #[cfg(test)]
+    pub(crate) fn rx_held(&self, peer: &PeerId) -> Option<[usize; 2]> {
+        let sess = self.sessions.get(self.peers.get(peer)?)?;
+        let State::Live(link) = &sess.state else { return None };
+        Some([link.rx.held(), link.urx.held()])
     }
 
     /// Seals any plaintext, well-formed or not, as the next DATA packet on the

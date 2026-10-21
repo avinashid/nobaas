@@ -17,6 +17,15 @@ const ACK_DELAY: Duration = Duration::from_millis(25);
 const MAX_TRIES: u32 = 16;
 /// Out-of-order fragments the receiver buffers ahead of the next expected one.
 pub(crate) const RECV_WINDOW: u32 = 1024;
+/// The urgent stream's receive window, which its sender also keeps the span of
+/// fragments in flight under: the SACK bitmap's width, so every urgent
+/// fragment in flight can be acknowledged, and room for a MAX_URGENT message.
+/// With MAX_URGENT it bounds what a peer can make us hold for the urgent
+/// stream to about 135 KB, against 2.2 MB for the reliable one.
+pub(crate) const URGENT_RECV_WINDOW: u32 = 64;
+/// Largest `Urgent` message (64 KiB), or `Config::max_message` if smaller.
+pub const MAX_URGENT: usize = 64 << 10;
+const _: () = assert!(MAX_URGENT.div_ceil(FRAGMENT) <= URGENT_RECV_WINDOW as usize);
 /// Congestion window at the start, and its floor after loss (fragments).
 const INITIAL_CWND: f64 = 16.0;
 const MIN_CWND: f64 = 4.0;
@@ -192,12 +201,15 @@ impl RelSend {
 
     /// Whether stream `u` may send a new fragment: the congestion window is
     /// shared, and urgent fragments fill at most half of it while reliable data
-    /// waits. Each stream also stays within `max` fragments, the receiver's window.
+    /// waits. Each stream also stays within `max` fragments, the receiver's
+    /// window, and urgent fragments within URGENT_RECV_WINDOW of the oldest one
+    /// unacknowledged, since that receiver drops anything further ahead.
     fn may_send_new(&self, u: usize, max: usize) -> bool {
         let w = self.window();
         let st = &self.streams[u];
         !st.queued.is_empty()
             && st.inflight.len() < max.max(1)
+            && (u == REL || st.inflight.first_key_value().is_none_or(|(&lo, _)| st.sent_end - lo < URGENT_RECV_WINDOW))
             && self.slots() < w
             && (u == REL || self.streams[REL].queued.is_empty() || self.urgent_slots() < w.div_ceil(2))
     }
@@ -533,6 +545,8 @@ fn due_by_seq(index: &BTreeSet<(Instant, u32)>, now: Instant) -> Vec<u32> {
 }
 
 pub(crate) struct RelRecv {
+    /// Fragments buffered at most, from `next` on: RECV_WINDOW or URGENT_RECV_WINDOW.
+    window: u32,
     next: u32,
     buf: BTreeMap<u32, (bool, Vec<u8>)>,
     assembling: Vec<u8>,
@@ -540,8 +554,8 @@ pub(crate) struct RelRecv {
 }
 
 impl RelRecv {
-    pub(crate) fn new() -> Self {
-        RelRecv { next: 0, buf: BTreeMap::new(), assembling: Vec::new(), ack_pending: false }
+    pub(crate) fn new(window: u32) -> Self {
+        RelRecv { window, next: 0, buf: BTreeMap::new(), assembling: Vec::new(), ack_pending: false }
     }
 
     /// Accepts one fragment and appends any messages it completes to `out`.
@@ -554,8 +568,12 @@ impl RelRecv {
         max_message: usize,
         out: &mut Vec<Vec<u8>>,
     ) -> Result<(), ()> {
+        // Every sender cuts at FRAGMENT; a larger one would buffer past the bound.
+        if data.len() > FRAGMENT {
+            return Err(());
+        }
         self.ack_pending = true;
-        if seq < self.next || seq - self.next >= RECV_WINDOW || self.buf.contains_key(&seq) {
+        if seq < self.next || seq - self.next >= self.window || self.buf.contains_key(&seq) {
             return Ok(());
         }
         self.buf.insert(seq, (fin, data.to_vec()));
@@ -570,6 +588,12 @@ impl RelRecv {
             }
         }
         Ok(())
+    }
+
+    /// Bytes held: fragments buffered out of order and a message partly assembled.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.buf.values().map(|(_, d)| d.len()).sum::<usize>() + self.assembling.len()
     }
 
     pub(crate) fn ack(&self) -> (u32, u64) {
@@ -606,7 +630,7 @@ mod tests {
         let mut frags = drain(&mut tx, Instant::ZERO);
         assert_eq!(frags.len(), 6);
         frags.reverse();
-        let mut rx = RelRecv::new();
+        let mut rx = RelRecv::new(RECV_WINDOW);
         let mut out = Vec::new();
         for (s, fin, d) in &frags {
             rx.on_fragment(*s, *fin, d, 1 << 20, &mut out).unwrap();
@@ -880,6 +904,44 @@ mod tests {
     }
 
     #[test]
+    fn urgent_fragments_stay_within_the_urgent_window() {
+        // The span from the oldest unacknowledged urgent fragment to the newest
+        // stays under URGENT_RECV_WINDOW: one hole stops new urgent fragments,
+        // however many after it were acknowledged.
+        let mut tx = RelSend::new();
+        for i in 0..200u8 {
+            tx.push_message(&[i; 8], 1 << 20, 1 << 20, true).ok().unwrap();
+        }
+        let first = drain(&mut tx, Instant::ZERO);
+        assert_eq!(first.len(), URGENT_RECV_WINDOW as usize);
+        tx.on_ack(Instant::from_millis(1), 0, u64::MAX >> 1, true);
+        assert_eq!(tx.streams[URG].inflight.len(), 1);
+        assert!(drain(&mut tx, Instant::from_millis(1)).is_empty());
+        tx.on_ack(Instant::from_millis(2), 1, 0, true);
+        let next = drain(&mut tx, Instant::from_millis(2));
+        assert_eq!(next.first().map(|f| f.0), Some(64));
+        assert_eq!(next.len(), URGENT_RECV_WINDOW as usize);
+    }
+
+    #[test]
+    fn the_urgent_receiver_buffers_at_most_its_window() {
+        let mut rx = RelRecv::new(URGENT_RECV_WINDOW);
+        let mut out = Vec::new();
+        for seq in 1..200 {
+            rx.on_fragment(seq, true, &[1; 100], MAX_URGENT, &mut out).unwrap();
+        }
+        assert_eq!(rx.buf.len(), URGENT_RECV_WINDOW as usize - 1);
+        rx.on_fragment(0, true, &[0; 100], MAX_URGENT, &mut out).unwrap();
+        assert_eq!(out.len(), URGENT_RECV_WINDOW as usize);
+        // An urgent message over MAX_URGENT breaks the protocol.
+        let mut rx = RelRecv::new(URGENT_RECV_WINDOW);
+        for seq in 0..(MAX_URGENT / FRAGMENT) as u32 {
+            rx.on_fragment(seq, false, &[0; FRAGMENT], MAX_URGENT, &mut out).unwrap();
+        }
+        assert!(rx.on_fragment(59, true, &[0; FRAGMENT], MAX_URGENT, &mut out).is_err());
+    }
+
+    #[test]
     fn each_stream_has_its_own_buffer() {
         let mut tx = RelSend::new();
         assert!(tx.push_message(&[0; 600], 1000, 1 << 20, false).is_ok());
@@ -902,7 +964,9 @@ mod tests {
             assert_eq!(st.by_due, due);
             assert_eq!(st.by_dup, dup);
             let urgent_room = tx.streams[REL].queued.is_empty() || urgent_slots < w.div_ceil(2);
-            let room = st.inflight.len() < window && slots < w && (u == REL || urgent_room);
+            let span = st.inflight.first_key_value().map_or(0, |(&lo, _)| st.sent_end - lo);
+            let room =
+                st.inflight.len() < window && slots < w && (u == REL || urgent_room && span < URGENT_RECV_WINDOW);
             sendable |= (!st.queued.is_empty() && room)
                 || st.inflight.values().any(|f| f.due <= now)
                 || st.probe_at.is_some_and(|p| p <= now)
@@ -928,7 +992,7 @@ mod tests {
                 x ^= x << 17;
                 x % n
             };
-            let (mut tx, mut rx) = (RelSend::new(), [RelRecv::new(), RelRecv::new()]);
+            let (mut tx, mut rx) = (RelSend::new(), [RelRecv::new(RECV_WINDOW), RelRecv::new(URGENT_RECV_WINDOW)]);
             let window = 64;
             // One-way delay: a LAN (a retransmission can go out while its
             // urgent copy is pending) or a WAN.

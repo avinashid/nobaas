@@ -76,8 +76,9 @@ browser + arena ~30 s).
 - `wire`: frame round trips, truncated frames fail once, frame parser survives garbage, packet bounds.
 - `reliable`: out-of-order reassembly, ACK and retransmit, tail-loss probe beats the RTO, urgent fragments are
   sent twice, urgent goes ahead of queued reliable data within the shared window and takes at most half of it,
-  each stream stays within the receiver's window and has its own buffer, the window grows by the slots
-  acknowledged, buffer limit.
+  each stream stays within the receiver's window and has its own buffer, urgent fragments in flight span at
+  most the 64-fragment urgent window, the urgent receiver buffers at most that and refuses a message over 64 KiB,
+  the window grows by the slots acknowledged, buffer limit.
 - `stun`: RFC 5769 IPv4/IPv6 vectors; Nobaas packets are not mistaken for STUN.
 - `crypto`, `identity`, `sealed`, `invite`, `addr`: Noise static key derivation, sign/verify, replay window,
   sealed-box open/reject, RFC 4648 vectors, invite round trip and garbage rejection, socket address round trip.
@@ -178,6 +179,7 @@ regression test.
 | Invites | `fuzz_invites` | bytes and `nb:` links: whatever parses survives its own round trip, ≤ 16 entries, and is the one encoding of what it decodes to (`to_link(parse(s)) == s`) |
 | Sealed | `fuzz_sealed` | only an untouched message sealed to us opens, naming its real sender |
 | Hostile peer | `fuzz_hostile_peer` | an authenticated peer sends sealed random frames, garbage, FWD to a bystander and RELAYED nested 12 deep, roaming and jumping time: no panic, a violation drops it and it may reconnect, half-open sessions stay bounded, and the bystander and the peer still exchange messages after |
+| Receive memory | `hostile_peer_pins_bounded_receive_memory` | an authenticated peer fills each stream's partial message and out-of-order buffer: a link holds at most 2,308,712 B (urgent 134,836 B), one urgent fragment past 64 KiB of message drops the peer, and an honest 64 KiB urgent message still arrives |
 | Hellos, offers | `nobaas` `traversal::fuzz_hello_and_offer_parsers` | round trips; candidates, relays and the prediction window stay within their limits |
 | Authenticated signals | `traversal::fuzz_authenticated_signals` | a room-key or invite-key holder's proved hellos and offers, random and mutated: the endpoint never dials loopback, multicast, broadcast, link-local, unspecified or port 0 |
 | Gateway answers | `portmap::fuzz_gateway_answers` | PCP, NAT-PMP, SSDP, URLs, IGD XML, HTTP (chunked, lengths at the integer limits): mappings have a port and lifetime, URLs and control paths are printable, SSDP points only at the private host that answered |
