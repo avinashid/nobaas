@@ -66,7 +66,7 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `get_connect_error_message() -> String` | After `connection_failed`: the reason as a sentence to show the player, naming the symmetric side; `""` if nothing failed |
 | `set_stun_servers(PackedStringArray)` | `host:port` list, from the next host/join. Default Google + Cloudflare; empty: off |
 | `set_signaling_relays(PackedStringArray)` | Nostr relay URLs, from the next host/join. Default `wss://relay.damus.io`, `wss://nos.lol`; empty: off |
-| `set_privacy_mode(mode: int)` | Which addresses this peer gives out: `PRIVACY_DIRECT` (default), `PRIVACY_PUBLIC_ONLY`, `PRIVACY_RELAY_ONLY`. From the next host/join, and for the running session's next invites and offers; links already up are kept. See [Privacy](#privacy) |
+| `set_privacy_mode(mode: int)` | Which addresses this peer gives out: `PRIVACY_DIRECT` (default), `PRIVACY_PUBLIC_ONLY`, `PRIVACY_RELAY_ONLY`. From the next host/join, and for the running session's next invites and offers; links already up are kept, except a relay-only joiner's [relay peer](#relay-peers) links. See [Privacy](#privacy) |
 | `get_privacy_mode() -> int` | The mode set |
 | `set_port_mapping(on: bool)` | Ask the router to forward this peer's UDP port (PCP, NAT-PMP or UPnP), from the next host/join. **Off by default**; it opens a port on the player's router. See [Router port mapping](#router-port-mapping) |
 | `get_port_mapping() -> Dictionary` | `{state, address, protocol}`: `state` is `off`, `trying`, `mapped`, `not_public`, `unavailable` or `relay_only`; `address` (`ip:port`) and `protocol` (`pcp`, `natpmp`, `upnp`) are `""` until the router names them. Signal `port_mapping_changed(info)` fires on each change |
@@ -129,7 +129,11 @@ peer.host_room("my-game", room)
 - The relay peer forwards sealed packets it can't read. It does see both players' IP addresses, which of them
   talk, and how much. It forwards up to 256 KiB/s per player by default (`PEERWIRE_RELAY_RATE`), enough for
   typical game traffic: see [`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md#relay-peers).
-- Not used in `PRIVACY_RELAY_ONLY`, where a joiner links through its host only.
+- A joiner in `PRIVACY_RELAY_ONLY` links through its host only: it doesn't dial relay peers, and switching a
+  running joiner to relay-only closes their links (switching back dials them again). A relay-only host still uses
+  them.
+- The relay peer gets this peer's addresses as the privacy mode allows: under `PRIVACY_DIRECT`, its LAN addresses
+  too (`PRIVACY_PUBLIC_ONLY` hides them). It is not told which players this peer links with.
 
 `examples/godot` takes `--relay-peer=pw:…` and logs `relay peers: 1 linked` and `route to peer N: direct` or
 `through a relay`.

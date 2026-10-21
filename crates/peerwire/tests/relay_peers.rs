@@ -105,7 +105,8 @@ fn relay_links_stay_up_out_of_sight_and_come_back() {
 }
 
 /// A relay-only node links through its own relay only: it never dials a relay
-/// peer, not even through that relay.
+/// peer, not even through that relay, and a switch to relay-only closes the
+/// relay-peer links already up (NB41-I1), but not the link to its own relay.
 #[test]
 fn relay_only_nodes_dial_no_relay_peer() {
     let (mut relay, mut own) = (Node::bind("127.0.0.1:0").unwrap(), Node::bind("127.0.0.1:0").unwrap());
@@ -125,4 +126,64 @@ fn relay_only_nodes_dial_no_relay_peer() {
     // Out of relay-only, it dials.
     n.set_privacy(peerwire::Privacy::Direct);
     assert!(pump(&mut [&mut relay, &mut own, &mut n], &mut ev, 3, |n| relay_linked(n[2], rid)));
+    let nid = n.peer_id();
+    assert!(pump(&mut [&mut relay, &mut own, &mut n], &mut ev, 3, |n| n[0].status(&nid) == Status::Connected));
+    // Back to relay-only: the relay-peer link is closed at once, on both ends, and stays closed.
+    n.set_privacy(peerwire::Privacy::RelayOnly { via: Some(oid) });
+    assert_eq!(n.relay_peers(), vec![(rid, Status::Disconnected)]);
+    assert!(pump(&mut [&mut relay, &mut own, &mut n], &mut ev, 3, |n| n[0].status(&nid) == Status::Disconnected));
+    pump(&mut [&mut relay, &mut own, &mut n], &mut ev, 2, |_| false);
+    assert_eq!(n.relay_peers(), vec![(rid, Status::Disconnected)], "not dialled again");
+    assert_eq!(n.status(&oid), Status::Connected, "its own relay stays");
+    // A relay peer that is its own relay stays linked.
+    n.set_privacy(peerwire::Privacy::Direct);
+    assert!(pump(&mut [&mut relay, &mut own, &mut n], &mut ev, 5, |n| relay_linked(n[2], rid)));
+    n.set_privacy(peerwire::Privacy::RelayOnly { via: Some(rid) });
+    pump(&mut [&mut relay, &mut own, &mut n], &mut ev, 1, |_| false);
+    assert!(relay_linked(&n, rid) && relay.status(&nid) == Status::Connected);
+}
+
+/// Polls the relay and `n` on a shared clock that runs 20 ms a step (a step
+/// sleeps 1 ms), for `secs` of that clock. When `drop` is set the relay closes
+/// each link from `n` as soon as it is up. Returns how many links came up.
+fn run(relay: &mut Node, n: &mut Node, clock: &mut Instant, secs: u64, drop: bool) -> usize {
+    let (nid, end) = (n.peer_id(), *clock + Duration::from_secs(secs));
+    let mut links = 0;
+    while *clock < end {
+        *clock += Duration::from_millis(20);
+        relay.poll_at(*clock);
+        while let Some(e) = relay.try_recv_event() {
+            if matches!(e, Event::Connected { peer, .. } if peer == nid) {
+                links += 1;
+                if drop {
+                    relay.disconnect(&nid);
+                }
+            }
+        }
+        n.poll_at(*clock);
+        while n.try_recv_event().is_some() {}
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    links
+}
+
+/// NB41-2: a relay that drops every link at once is dialled less and less
+/// often; the wait starts over only once a link has held for 30 s.
+#[test]
+fn relay_that_drops_every_link_is_dialled_with_backoff() {
+    let mut relay = Node::bind("127.0.0.1:0").unwrap();
+    let rid = relay.peer_id();
+    let mut n = Node::builder().relay_peers([relay.invite()]).bind("127.0.0.1:0").unwrap();
+    let mut clock = Instant::now();
+    // At once, then after 1, 2 and 4 s (one a second, ten in all, before NB41-2).
+    let links = run(&mut relay, &mut n, &mut clock, 10, true);
+    assert!((3..=5).contains(&links), "{links} links in 10 s");
+    // The next dial (8 s after the last) holds: the relay keeps it.
+    assert_eq!(run(&mut relay, &mut n, &mut clock, 10, false), 1);
+    run(&mut relay, &mut n, &mut clock, 35, false);
+    assert!(relay_linked(&n, rid), "held 35 s");
+    // Dropping it and the next ones: dialled at once, then after 1 and 2 s, as at the start.
+    relay.disconnect(&n.peer_id());
+    let links = run(&mut relay, &mut n, &mut clock, 5, true);
+    assert!(links >= 3, "{links} links in 5 s");
 }
