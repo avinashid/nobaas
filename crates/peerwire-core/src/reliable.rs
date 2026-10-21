@@ -183,8 +183,8 @@ pub(crate) struct RelSend {
     /// AIMD congestion window in slots (NewReno-style), for both streams.
     cwnd: f64,
     ssthresh: f64,
-    /// No second reduction until this time (one per round trip), except one
-    /// that keeps less than `epoch_keep`: it deepens the first, from the same
+    /// No second reduction until this time (one per round trip), except a
+    /// timeout after a random-loss cut: it deepens that cut, from the same
     /// `epoch_slots` in flight.
     recover_until: Instant,
     epoch_keep: f64,
@@ -256,12 +256,12 @@ impl RelSend {
     }
 
     /// Cuts the window to `keep` of the fragments in flight, at most once per
-    /// round trip. A stricter signal in that round trip (a timeout after a
-    /// random loss, a loss after queueing delay) deepens the cut once, to
-    /// `keep` of the same flight, so cuts never compound.
+    /// round trip. A timeout in a round trip cut for random loss deepens the
+    /// cut to `keep` of the same flight, so cuts never compound; any other
+    /// signal in it is ignored.
     fn back_off(&mut self, now: Instant, keep: f64, timeout: bool) {
         if now < self.recover_until {
-            if keep >= self.epoch_keep {
+            if !timeout || self.epoch_keep != RANDOM_LOSS_CUT {
                 return;
             }
             self.recovery.deepened += 1;
@@ -1008,10 +1008,10 @@ mod tests {
         assert_eq!(resent.len() as u32, MAX_TRIES - 1, "0 went twice in hole_at_zero");
     }
 
-    /// One cut per round trip, but a stricter one in it deepens the first, from
-    /// the flight the first was taken from: cuts never compound.
+    /// One cut per round trip, but a timeout in one cut for random loss deepens
+    /// it, from the flight the first cut was taken from: cuts never compound.
     #[test]
-    fn a_stricter_cut_in_the_same_round_trip_deepens_the_first() {
+    fn a_timeout_after_a_random_loss_cut_deepens_it() {
         let sent = || {
             let mut tx = RelSend::new();
             tx.seed_rtt(Duration::from_millis(100));
@@ -1023,22 +1023,30 @@ mod tests {
             tx
         };
         let t = Instant::from_millis(100);
+        // A delay cut is not deepened, by a loss or a timeout.
         let mut tx = sent();
         tx.back_off(t, DELAY_CUT, false);
         assert_eq!(tx.ssthresh, 100.0 * DELAY_CUT);
-        tx.on_ack(t, 20, 0, false); // 80 left in flight
-        tx.back_off(t, DELAY_CUT, false);
-        assert_eq!(tx.ssthresh, 100.0 * DELAY_CUT, "the same signal again: no change");
+        tx.back_off(t, RANDOM_LOSS_CUT, false);
+        tx.back_off(t, LOSS_CUT, false);
+        tx.back_off(t, LOSS_CUT, true);
+        assert_eq!(tx.ssthresh, 100.0 * DELAY_CUT, "after a delay cut: no change");
+        assert_eq!((tx.recovery.delay_cuts, tx.recovery.deepened), (1, 0));
+        // A random-loss cut: another loss doesn't deepen it, a timeout does.
+        let mut tx = sent();
         tx.back_off(t, RANDOM_LOSS_CUT, false);
         assert_eq!(tx.ssthresh, 100.0 * RANDOM_LOSS_CUT);
-        tx.back_off(t, DELAY_CUT, false);
+        tx.on_ack(t, 20, 0, false); // 80 left in flight
         tx.back_off(t, RANDOM_LOSS_CUT, false);
-        assert_eq!(tx.ssthresh, 100.0 * RANDOM_LOSS_CUT, "gentler or equal: no change");
+        tx.back_off(t, LOSS_CUT, false);
+        assert_eq!(tx.ssthresh, 100.0 * RANDOM_LOSS_CUT, "a loss: no change");
         tx.back_off(t, LOSS_CUT, true);
         assert_eq!(tx.ssthresh, 100.0 * LOSS_CUT);
         assert_eq!(tx.cwnd, tx.ssthresh);
+        tx.back_off(t, LOSS_CUT, true);
+        assert_eq!(tx.ssthresh, 100.0 * LOSS_CUT, "once only");
         let r = tx.recovery;
-        assert_eq!((r.delay_cuts, r.random_cuts, r.timeout_cuts, r.deepened), (1, 1, 1, 2));
+        assert_eq!((r.random_cuts, r.timeout_cuts, r.deepened), (1, 1, 1));
         // The next round trip starts afresh, from what is in flight then.
         tx.back_off(t + Duration::from_millis(100), RANDOM_LOSS_CUT, false);
         assert_eq!(tx.ssthresh, 80.0 * RANDOM_LOSS_CUT);

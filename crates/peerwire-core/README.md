@@ -93,9 +93,9 @@ complete host loop on std UDP sockets.
     also backs off when queueing delay passes 25 ms, before any loss, which keeps router
     buffers short for real-time traffic. A loss halves the window, except one found by fast
     retransmit while the RTT shows under 5 ms of queueing: that is taken as random (TCP
-    Veno) and keeps 80%. One cut per round trip, but a stricter one in it (a timeout after
-    a random loss) deepens the first, from the same flight. Urgent fragments take free
-    slots first, but at most half the window while reliable data waits.
+    Veno) and keeps 80%. One cut per round trip, but a timeout after a random-loss cut
+    deepens it to half of the same flight. Urgent fragments take free slots first, but at
+    most half the window while reliable data waits.
   - While the lowest unacknowledged fragment is repaired, fragments beyond the SACK
     bitmap's reach (64 above it) don't time out before the repair does; their timers
     restart when the cumulative ACK moves.
