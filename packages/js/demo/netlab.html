@@ -65,6 +65,12 @@
     <p class="dim note">The <b>global room</b> is one shared room: anyone who opens Net Lab and joins it sees you, and you see them.
       A <b>private room</b> has a random key: only people you send the link to can join. Either way, every member tries to link to every other member.</p>
     <p class="note" id="joinmsg"></p>
+    <details><summary>phone hotspot (advanced)</summary>
+      <div class="row"><input id="gw" placeholder="phone's hotspot address, e.g. 10.129.132.170" autocomplete="off" inputmode="decimal"></div>
+      <p class="dim note">Only on the device that uses a phone's hotspot. Most phones choose a new address each time; enter this device's <b>default gateway</b>
+        (Linux <code>ip route show default</code>, Windows <code>ipconfig</code>, Mac <code>route -n get default</code>) and the phone can link directly instead of through relays.</p>
+      <p class="note" id="gwmsg"></p>
+    </details>
   </section>
 
   <section class="card wide hidden" id="roomcard">
