@@ -67,6 +67,17 @@ export interface JoinRoomOptions {
    * machine with no STUN server can't link. Relay-only is not available for rooms: use
    * `WebRtcTransport` with `privacy: 'relay-only'`. */
   privacy?: 'direct' | 'public-only';
+  /** What to do for a peer WebRTC can't link (symmetric NAT on both sides, no TURN):
+   * - `'auto'` (default): dial it through every member linked to both of you, and over the
+   *   signalling relays themselves, at once; the first path to answer wins. Signalling is
+   *   slow (a relay round trip per batch, a few batches a second) but works on any network
+   *   that reaches the relays.
+   * - `'peers'`: through other members only.
+   * - `'off'`: WebRTC only.
+   * Every path carries the same end-to-end encrypted session. See `room.route(peer)`. */
+  fallback?: 'auto' | 'peers' | 'off';
+  /** How long a WebRTC link may take to open before the fallback starts. Default 8000 ms. */
+  fallbackMs?: number;
   /** A WebRTC implementation for runtimes without one (Node: node-datachannel's polyfill).
    * Without WebRTC, `'local'` rooms send datagrams over the BroadcastChannel. */
   RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
@@ -127,6 +138,9 @@ export declare class Room {
   getPresence(peer?: PeerId): Presence | undefined;
   setPresence(presence: Presence): void;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
+  /** How `peer` is reached: its own WebRTC link, relayed by member `via`, or over the
+   * signalling relays; null while it isn't linked. */
+  route(peer: PeerId): { kind: 'direct' } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' } | null;
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
   /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,

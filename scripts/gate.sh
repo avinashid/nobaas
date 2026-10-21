@@ -88,6 +88,7 @@ step "node scratch buffers" node packages/js/test/scratch_buffers.mjs
 step "node room drain" node packages/js/test/room_drain.mjs
 step "node fuzz" node packages/js/test/fuzz.mjs
 step "node room leave" node packages/js/test/room_leave.mjs
+step "node room fallback" node packages/js/test/room_fallback.mjs
 
 if [ $quick = 1 ]; then
   skip "browser" "--quick"

@@ -3,7 +3,7 @@
 // and base64 must handle bodies far larger than a signalling message. No relays:
 // events are fed straight into onRelay.
 import { loadPeerwire } from '../src/peerwire.js';
-import { NostrSignaling, MAX_SEEN, b64, unb64 } from '../src/nostr.js';
+import { BACKOFF_MS, MAX_BACKOFF_MS, NostrSignaling, MAX_SEEN, b64, unb64 } from '../src/nostr.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
 const pw = await loadPeerwire(wasm);
@@ -85,6 +85,31 @@ for (const n of [100 * 1024, 1 << 20]) {
   check(back.length === n && back.every((x, i) => x === data[i]), `base64 round-trip of ${n} bytes`);
 }
 check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'AP+A', 'base64 of empty and short inputs');
+
+// 5. A relay that refuses an event for its rate limit gets nothing for BACKOFF_MS, doubling;
+//    refusals of events already sent during a pause don't double it again; others still get events.
+{
+  const s5 = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/backoff', relays: [] });
+  await s5.ready;
+  const sent = { a: 0, b: 0 };
+  for (const name of ['a', 'b']) s5.sockets.push({ relayUrl: name, readyState: WebSocket.OPEN, send: () => sent[name]++, close() {} });
+  await s5.publish(s5.roomTag, 'e30=');
+  s5.onRelay('a', JSON.stringify(['OK', 'x', false, 'rate-limited: slow down']));
+  s5.onRelay('a', JSON.stringify(['OK', 'y', false, 'banned: too many rate-limit violations, try again later']));
+  await s5.publish(s5.roomTag, 'e30=');
+  const first = s5.paused.get('a');
+  check(sent.a === 1 && sent.b === 2 && first?.ms === BACKOFF_MS && s5.stats.backoffs === 1, `a rate-limited relay is paused once, the other still sent to (${JSON.stringify(sent)})`);
+  s5.onRelay('b', JSON.stringify(['OK', 'z', false, 'invalid: bad signature']));
+  check(!s5.paused.has('b'), 'other refusals do not pause a relay');
+  first.until = Date.now() - 1; // the pause ran out
+  await s5.publish(s5.roomTag, 'e30=');
+  s5.onRelay('a', JSON.stringify(['OK', 'w', false, 'rate-limited: again']));
+  check(sent.a === 2 && s5.paused.get('a').ms === BACKOFF_MS * 2, 'after the pause it is tried again, and a second limit doubles the pause');
+  s5.paused.get('a').until = Date.now() - MAX_BACKOFF_MS - 1; // quiet for MAX_BACKOFF_MS since
+  s5.onRelay('a', JSON.stringify(['OK', 'v', false, 'rate-limited: much later']));
+  check(s5.paused.get('a').ms === BACKOFF_MS, 'a limit after a long quiet period starts the pause over');
+  s5.sockets.length = 0;
+}
 
 console.log(failed ? `${failed} FAILED` : 'nostr bounds: all passed');
 process.exit(failed ? 1 : 0);

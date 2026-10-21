@@ -20,6 +20,11 @@ const MAX_CONTENT = 64 * 1024; // event content we are willing to decode (base64
 export const MAX_SEEN = 4096; // event ids remembered for de-duplication; the oldest is forgotten first
 const EVENT_ID = /^[0-9a-f]{64}$/; // NIP-01: the event hash in lowercase hex, so `seen` stays ~256 KiB
 export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
+// A relay that refuses an event for its rate limit (NIP-01 'rate-limited:', or
+// 'blocked:'/'banned') gets nothing from us for this long, doubling to the cap.
+export const BACKOFF_MS = 30000;
+export const MAX_BACKOFF_MS = 600000;
+const LIMITED = /^(rate-limited|blocked)|banned|rate.?limit/i;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -45,6 +50,7 @@ export class NostrSignaling {
     this.onHello = () => {};
     this.seen = new Set();
     this.sockets = [];
+    this.paused = new Map(); // relay url -> { until, ms }: backing off its rate limit
     this.stats = { published: 0, received: 0, rejected: 0, relaysOpen: 0 };
     this.ready = this.start(relays);
   }
@@ -56,6 +62,7 @@ export class NostrSignaling {
     const filter = { kinds: [KIND], '#p': [this.myTag, this.roomTag], since: Math.floor(Date.now() / 1000) - 30 };
     await Promise.all(relays.map((url) => new Promise((resolve) => {
       const ws = new WebSocket(url);
+      ws.relayUrl = url;
       ws.onopen = () => {
         this.stats.relaysOpen++;
         ws.send(JSON.stringify(['REQ', sub, filter]));
@@ -76,7 +83,10 @@ export class NostrSignaling {
     const sig = this.pw.nostrSign(this.key.secret, id);
     const ev = { id: hex(id), pubkey: this.pubkey, created_at, kind: KIND, tags, content, sig: hex(sig) };
     const msg = JSON.stringify(['EVENT', ev]);
-    for (const ws of this.sockets) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+    const now = Date.now();
+    for (const ws of this.sockets) {
+      if (ws.readyState === WebSocket.OPEN && !(this.paused.get(ws.relayUrl)?.until > now)) ws.send(msg);
+    }
     this.stats.published++;
   }
 
@@ -92,6 +102,15 @@ export class NostrSignaling {
     if (m[0] === 'OK' && m[2] === false) {
       this.stats.rejected++;
       this.stats.lastRejection = `${url}: ${m[3]}`;
+      if (LIMITED.test(String(m[3]))) {
+        const p = this.paused.get(url);
+        // Events already on their way get refused too: count one per pause.
+        if (p?.until > Date.now()) return;
+        // A relay quiet for MAX_BACKOFF_MS since its last pause starts over at BACKOFF_MS.
+        const ms = p && Date.now() - p.until < MAX_BACKOFF_MS ? Math.min(p.ms * 2, MAX_BACKOFF_MS) : BACKOFF_MS;
+        this.paused.set(url, { until: Date.now() + ms, ms });
+        this.stats.backoffs = (this.stats.backoffs ?? 0) + 1;
+      }
       return;
     }
     if (m[0] !== 'EVENT') return;
