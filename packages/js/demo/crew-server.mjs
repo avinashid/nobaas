@@ -25,7 +25,7 @@ const TYPES = {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/') {
-    res.writeHead(302, { location: start });
+    res.writeHead(302, { location: start + url.search });
     return res.end();
   }
   const rel = path.normalize(decodeURIComponent(url.pathname));
