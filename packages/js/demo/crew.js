@@ -11,8 +11,13 @@
 //   host -> one      role {role, tasks, partners} at the start, cd {ms} to an impostor
 //
 // Every message from a peer is untrusted: the host checks phase, roles, distances
-// and cooldowns before acting on one. ?turn=turn:host:3478&tu=user&tp=pass adds a
-// TURN server for networks that can't link directly (symmetric NAT on both sides).
+// and cooldowns before acting on one.
+//
+// Two peers WebRTC can't link (symmetric NAT on both sides) still play: joinRoom
+// relays them through another player, else over the Nostr relays (slower), with
+// no setup on either side. The network panel shows each peer's route.
+// ?turn=turn:host:3478&tu=user&tp=pass adds a TURN server; ?rtc=off makes every
+// WebRTC link of this tab fail, as between two symmetric NATs (tests).
 
 import { joinRoom, DEFAULT_ICE_SERVERS } from '../src/index.js';
 
@@ -84,6 +89,18 @@ function log(line) {
 
 // ---------- joining ----------
 
+// An RTCPeerConnection that never learns or gives out a candidate, so ICE fails.
+class NoIcePc extends RTCPeerConnection {
+  set onicecandidate(fn) {}
+  get localDescription() {
+    const d = super.localDescription;
+    return d && { type: d.type, sdp: strip(d.sdp), toJSON: () => ({ type: d.type, sdp: strip(d.sdp) }) };
+  }
+  setRemoteDescription(d) { return super.setRemoteDescription({ type: d.type, sdp: strip(d.sdp) }); }
+  addIceCandidate() { return Promise.resolve(); }
+}
+const strip = (sdp) => sdp.split('\r\n').filter((l) => !l.startsWith('a=candidate:')).join('\r\n');
+
 function iceServers() {
   const turn = params.get('turn');
   if (!turn) return undefined;
@@ -104,6 +121,7 @@ async function enter(asHost) {
       signaling: params.get('signal') === 'local' ? 'local' : 'nostr',
       presence: { name: myName, host: asHost },
       iceServers: iceServers(),
+      ...(params.get('rtc') === 'off' && { RTCPeerConnection: NoIcePc }),
     });
   } catch (e) {
     $('host').disabled = $('join').disabled = false;
@@ -644,7 +662,7 @@ function findingMsg() {
   const linked = heard.filter((p) => room.peers.includes(p)).length;
   let msg = `${relays}${secs}s: heard ${heard.length} peer(s) in this room, linked to ${linked}.`;
   if (secs > 15 && heard.length > linked) {
-    msg += '<br><br><b>Found peers but could not connect.</b> Both networks block direct connections (strict, "symmetric" NAT, typical of mobile hotspots). Try another network for one side, or add a TURN server: <code>?turn=turn:HOST:3478&amp;tu=USER&amp;tp=PASS</code>.';
+    msg += '<br><br><b>Found peers but could not connect.</b> WebRTC failed (both networks block direct connections: strict, "symmetric" NAT), so the fallback through another player or the signalling relays is being tried. If this stays, the host may run an older copy of the game.';
   } else if (secs > 15 && heard.length === 0) {
     msg += '<br><br>No one with this room code yet. Check the code; the host must click "Host a game" first.';
   }
@@ -673,6 +691,14 @@ async function pathOf(peer) {
   } catch { return ''; }
 }
 
+// The fallback routes, for peers WebRTC couldn't link.
+async function routeOf(peer) {
+  const r = room.route(peer);
+  if (r?.kind === 'peer') return `relayed by ${esc(room.getPresence(r.via)?.name ?? short(r.via))} (WebRTC failed)`;
+  if (r?.kind === 'signaling') return 'over the signalling relays (WebRTC failed; slower)';
+  return pathOf(peer);
+}
+
 setInterval(async () => {
   if (!room) return;
   if (S.phase === 'finding' || S.phase === 'meeting') render();
@@ -681,7 +707,7 @@ setInterval(async () => {
     const name = room.getPresence(peer)?.name ?? short(peer);
     const rtt = room.rtt(peer);
     const tag = peer === hostId ? ' <b>host</b>' : '';
-    rows.push(`<li>${esc(name)}${tag}: ${rtt == null ? '…' : `${Math.round(rtt)} ms`} <span class="dim">${await pathOf(peer)}</span></li>`);
+    rows.push(`<li>${esc(name)}${tag}: ${rtt == null ? '…' : `${Math.round(rtt)} ms`} <span class="dim">${await routeOf(peer)}</span></li>`);
   }
   for (const [peer, t] of seen) {
     if (room.peers.includes(peer)) continue;
@@ -740,6 +766,8 @@ else if (params.get('auto') === 'join') enter(false);
 window.crew = {
   get phase() { return S.phase; }, get state() { return S; }, get role() { return role; }, get me() { return me; },
   get self() { return room?.self; }, get hostId() { return hostId; }, pos, done,
+  routes: () => Object.fromEntries((room?.peers ?? []).map((p) => [room.getPresence(p)?.name, room.route(p)?.kind])),
+  netStats: () => room && ({ rtt: room.peers.map((p) => room.rtt(p)), core: room.stats(), piped: room.transport.piped, signaling: room.signaling.stats }),
   goto(x, y) { me.x = x; me.y = y; }, use, kill, report, killTarget, nearestTask,
   vote(t) { myVote = t; toHost({ t: 'vote', target: t }); }, start: () => toHost({ t: 'start' }), say: (text) => toHost({ t: 'chat', text }),
   finishTask(i) { done.add(i); toHost({ t: 'task', i }); },

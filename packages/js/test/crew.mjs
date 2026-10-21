@@ -5,6 +5,10 @@
 // in which the crew wins by finishing every task.
 //
 //   node packages/js/test/crew.mjs [tabs=4] [screenshot-prefix]
+//
+// RTC_OFF=all fails every WebRTC link (?rtc=off), as if every tab were behind its
+// own symmetric NAT, so the game runs over the signalling fallback; RTC_OFF=<i>
+// fails tab i's links only, so it plays relayed by the others.
 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +17,8 @@ import path from 'node:path';
 const PW = process.env.PLAYWRIGHT ?? '/home/ubuntu/.local/share/playwright-tools/node_modules/playwright/index.mjs';
 const { chromium } = await import(PW);
 const tabs = Number(process.argv[2] ?? 4);
+const rtcOff = process.env.RTC_OFF;
+const offAt = (i) => rtcOff === 'all' || rtcOff === String(i);
 const shot = process.argv[3];
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const port = 8765 + Math.floor(Math.random() * 1000);
@@ -28,7 +34,7 @@ try {
   for (let i = 0; i < tabs; i++) {
     const p = await ctx.newPage();
     p.on('pageerror', (e) => console.log(`tab ${i} error: ${e.message}`));
-    const q = new URLSearchParams({ signal: 'local', room: `t${port}`, name: `p${i}`, auto: i ? 'join' : 'host' });
+    const q = new URLSearchParams({ signal: 'local', room: `t${port}`, name: `p${i}`, auto: i ? 'join' : 'host', ...(offAt(i) && { rtc: 'off' }) });
     await p.goto(`http://127.0.0.1:${port}/demo/crew.html?${q}`);
     pages.push(p);
   }
@@ -37,6 +43,14 @@ try {
 
   await all((n) => window.crew.phase === 'lobby' && Object.keys(window.crew.state.players).length === n, tabs);
   step(`${tabs} tabs in the waiting room`);
+  if (rtcOff) {
+    await all((n) => window.crew.routes() && Object.keys(window.crew.routes()).length === n - 1, tabs, 40000).catch(() => {});
+    const routes = await Promise.all(pages.map((p) => p.evaluate(() => window.crew.routes())));
+    routes.forEach((r, i) => console.log(`  p${i} reaches ${Object.entries(r).map(([n, k]) => `${n}:${k}`).join(' ')}`));
+    // A tab whose every WebRTC link fails has no member linked to it to relay it: signalling.
+    const off = rtcOff === 'all' ? 1 : Number(rtcOff);
+    if (routes[off].p0 !== 'signaling') throw new Error(`expected the host by signaling, got ${routes[off].p0}`);
+  }
   if (shot) await pages[1].screenshot({ path: `${shot}-lobby.png` });
 
   await ev(0, () => window.crew.start());
