@@ -208,7 +208,7 @@ impl PeerwireMultiplayerPeer {
 
     fn join_room_of(&mut self, app_id: GString, room: GString, host: Option<PeerId>) -> Error {
         self.close();
-        match self.net.bind("0.0.0.0:0") {
+        match self.net.bind("[::]:0") {
             Ok(node) => {
                 self.install(Session::join_room(node, &app_id.to_string(), &room.to_string(), host));
                 Error::OK
@@ -282,7 +282,7 @@ impl PeerwireMultiplayerPeer {
     #[func]
     fn join(&mut self, invite: GString) -> Error {
         self.close();
-        let node = match self.net.bind("0.0.0.0:0") {
+        let node = match self.net.bind("[::]:0") {
             Ok(n) => n,
             Err(e) => {
                 godot_error!("PeerwireMultiplayerPeer.join: {e}");
@@ -343,7 +343,7 @@ impl PeerwireMultiplayerPeer {
 impl PeerwireMultiplayerPeer {
     fn start_host(&mut self, port: i32, make: impl FnOnce(Node) -> Session) -> GString {
         self.close();
-        match self.net.bind(&format!("0.0.0.0:{}", port.clamp(0, 65535))) {
+        match self.net.bind(&format!("[::]:{}", port.clamp(0, 65535))) {
             Ok(node) => {
                 let s = make(node);
                 let invite = s.invite();

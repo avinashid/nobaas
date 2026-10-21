@@ -15,10 +15,10 @@ loop) and read events with `Node::try_recv_event`.
 ```rust,no_run
 use peerwire::{Event, Lane, Node};
 
-let mut host = Node::bind("0.0.0.0:0")?;
+let mut host = Node::bind("[::]:0")?;
 let invite = host.invite(); // hand this "pw:…" string to the other peer
 
-let mut guest = Node::bind("0.0.0.0:0")?;
+let mut guest = Node::bind("[::]:0")?;
 guest.connect(&invite)?;
 loop {
     host.poll();
@@ -45,7 +45,7 @@ use peerwire::{Node, NostrSignaling};
 
 let mut node = Node::builder()
     .signaling(NostrSignaling::new(["wss://relay.damus.io", "wss://nos.lol"]))
-    .bind("0.0.0.0:0")?;
+    .bind("[::]:0")?;
 node.join_room("my-app", "lobby"); // finds and connects the room's peers
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

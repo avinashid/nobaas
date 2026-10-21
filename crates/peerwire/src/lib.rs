@@ -9,9 +9,9 @@
 //! ```no_run
 //! use peerwire::{Event, Lane, Node};
 //!
-//! let mut host = Node::bind("0.0.0.0:0")?;
+//! let mut host = Node::bind("[::]:0")?;
 //! let invite = host.invite(); // hand this "pw:…" string to the other peer
-//! # let mut guest = Node::bind("0.0.0.0:0")?;
+//! # let mut guest = Node::bind("[::]:0")?;
 //! let peer = guest.connect(&invite)?;
 //! loop {
 //!     guest.poll();

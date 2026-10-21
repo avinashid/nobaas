@@ -13,13 +13,14 @@ unchanged; this layer feeds it addresses.
 | Signaling | A publish/subscribe carrier keyed by 32-byte topics (`trait Signaling`): `MemoryHub` in-process, `NostrSignaling` over Nostr relays (feature `nostr`) |
 | Rooms | Presence on a room topic; peers that hear each other swap sealed offers |
 | Offers | Candidate addresses, NAT type and connected peers, sealed to one peer |
+| Dual stack | One `[::]` socket for IPv4 and IPv6: global IPv6 host addresses are offered next to IPv4 ones |
 | Port mapping | Opt-in (`Builder::port_mapping`): the router forwards a public port to the socket, by PCP, NAT-PMP or UPnP-IGD |
 | Dialling | Both sides call `Endpoint::connect_with` on every candidate (plus `Path::Via` a mutual peer): a simultaneous open |
 
 ## STUN
 
 - Servers: `Builder::stun_servers`, default `stun.l.google.com:19302` and `stun.cloudflare.com:3478`, resolved once
-  at bind (sockets bound to loopback skip STUN).
+  at bind (sockets bound to loopback skip STUN). A dual-stack socket asks over IPv4 only (see [IPv6](#ipv6-dual-stack)).
 - A round every 25 s (it also keeps the mapping alive); each request is retransmitted at 0.5 s and 1 s, then
   dropped until the next round.
 - A response counts only if it comes from the queried server's address and carries the request's random 96-bit
@@ -57,6 +58,43 @@ sequence, though:
   ports of the one IP the offer named (see the reflection bound below).
 - Datagrams are told apart by their first byte (RFC 7983): STUN goes to the traversal, everything else to the
   endpoint.
+
+## IPv6 (dual stack)
+
+Mobile carriers often give a phone a global IPv6 address next to an IPv4 one behind a carrier-grade NAT, which is
+often symmetric (NB-042). IPv6 has no NAT, so a simultaneous dial only has to get through each side's stateful
+firewall. A firewall lets a packet in once its side has sent one to that address and port, and both sides send at
+once: the punch through a port-restricted cone, with no port to guess.
+
+- **Binding.** `Node::bind("[::]:0")` binds one socket with `IPV6_V6ONLY` off, for both families.
+  - Where IPv6 is missing (the socket can't be made or bound), it binds `0.0.0.0` on the same port instead and
+    works as an IPv4 node. A port already in use fails as before.
+  - `0.0.0.0` binds IPv4 only; a given address binds that address only.
+  - The Godot binding binds `[::]`.
+- **Addresses.** IPv4 peers reach a dual-stack socket as `::ffff:a.b.c.d`. The node turns them back into IPv4
+  addresses on receipt and maps IPv4 destinations on send. A peer then has one address whichever socket sees it,
+  and filters see `127.0.0.1` rather than `::ffff:127.0.0.1`.
+- **Candidates.** Bound to any interface, a dual-stack node offers, after the STUN, mapped and observed addresses:
+  the address of each family's default route, then both loopbacks.
+  - The IPv6 address is the one the kernel picks as the source towards the internet: global (or ULA), never
+    link-local. With no NAT, that is the address peers see.
+  - `PublicOnly` offers a global IPv6 address but not a ULA one; `RelayOnly` offers none.
+- **STUN** is asked over IPv4 only. Answers over both families would be two different mappings, which reads as a
+  symmetric NAT, and an IPv6 answer would only repeat the host address. The NAT type and port prediction are
+  about IPv4.
+- **Dialling.** In offers and invites alike, a node skips candidates of a family its socket can't send to: an IPv4
+  socket skips IPv6 addresses, one bound to `::1` skips IPv4 ones. The rest are dialled at once, as before. The
+  link takes the first path whose handshake answers, whichever its family.
+- **Port mapping** maps the IPv4 side of a dual-stack socket. IPv6 isn't mapped, and no firewall pinhole is asked
+  for (PCP can, but the simultaneous dial already opens one).
+- **What a peer learns:** the IPv6 address, like a public IPv4 one, in sealed offers and in invites.
+  - It can name the device more closely than an address shared behind a carrier NAT.
+  - Without privacy extensions (RFC 8981), its last 64 bits can stay the same across networks.
+  - `RelayOnly` hides it, as it hides every address.
+- **Not done:**
+  - IPv6 STUN;
+  - more than one IPv6 address per host;
+  - NAT64 / 464XLAT discovery, so an IPv6-only network reaches IPv4-only peers only through its own translator.
 
 ## Router port mapping
 
@@ -187,6 +225,7 @@ prediction with step 0 or above 8 is dropped.
 - **Dialable addresses.** Never port 0, unspecified, multicast or broadcast. Never loopback (including
   `::ffff:127.0.0.1`), unless the node is itself bound to loopback. The same filter applies to addresses peers
   report seeing (`AddrObserved`) and to STUN answers. An offer can't aim a node at services on its own host.
+  Addresses of a family the socket can't send to are skipped too (`Traversal::reaches`).
 - **Invites.** `Node::connect` dials the invite's addresses, then sends the host a version-3 offer (proved with
   the invite's key) with `reply=1`, so the host dials back at the same time. An invite without a key (version 1)
   still dials, but gets no dial-back. A host that is announcing in a room turns away invite
@@ -400,6 +439,9 @@ Crates added to `peerwire` by NAT traversal:
   - the room-of-two matrix over 8 NAT kinds with 150 ms signaling latency, each failure naming the right side;
   - sequential symmetric NATs against port-restricted ones, over 10 seeds each way round: 80/80 direct;
   - a symmetric pair relayed through a third room peer;
+  - IPv6 (`Sim::add_ipv6`: a global address behind a stateful firewall): a pair behind random-port symmetric NATs
+    links directly over IPv6, and with IPv6 on one side only fails as before; port-restricted and full-cone peers
+    offer both families and link on the first to answer;
   - an invite join that punches only with signaling;
   - the per-mode matrix above.
 - `crates/peerwire/tests/privacy.rs`: invites per mode and switched at runtime, `NoRelay`, relay-only room peers
@@ -408,6 +450,10 @@ Crates added to `peerwire` by NAT traversal:
   dial and from a relayed link; a relay-only link ignores them.
 - `crates/peerwire-sim/tests/nat.rs` `relay_only_links_stay_relayed`: no packet between the two ends, either side
   dialling, and no punch.
+- `crates/peerwire/tests/dual_stack.rs`, over 127.0.0.1 and ::1: a `[::]` node links an IPv4 and an IPv6 peer on
+  one socket, each seen at its plain address (no `::ffff:`); IPv4 and `::1` sockets skip the family they can't
+  reach (`NoPath`); two dual-stack nodes link on the first answer; STUN goes to the IPv4 server only.
+  `node.rs` checks which local addresses each binding lists.
 - `crates/peerwire/tests/nat_loopback.rs` (mock STUN servers, `MemoryHub`; an invite without its key gets no
   dial-back) and `crates/peerwire/tests/nostr.rs` (local
   relay; `--ignored`: public relays and STUN, run by `scripts/gate.sh --nostr`).
