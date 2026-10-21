@@ -63,7 +63,7 @@ fn nodes_meet_in_a_room_over_a_local_relay() {
     }));
 }
 
-/// Two nodes on this host find each other through relay.damus.io and nos.lol and
+/// Two nodes on this host find each other through relay.damus.io, nos.lol and relay.primal.net and
 /// learn their public address from Google's and Cloudflare's STUN. A few events.
 #[test]
 #[ignore = "touches public Nostr relays and STUN: run with scripts/gate.sh --nostr"]

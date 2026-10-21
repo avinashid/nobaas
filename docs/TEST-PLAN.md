@@ -38,7 +38,7 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 | Poll | `node packages/js/test/poll.mjs 3` | three tabs driven only by `poll()`/`sendTo()` see each other; a closed tab leaves |
 | WebRTC signals | `node packages/js/test/webrtc_signals.mjs` | NB-014: malformed offers leave no link and no unhandled rejection; 300 random signals neither throw nor reject; real offers are still answered |
 | Tab close | `node packages/js/test/leave.mjs --runs=5 --crash=0` | a tab streaming reliable data to two others is closed; both see its `peer-leave` within 5 s, every run (the Bye and the core's close go out from `pagehide`). By hand: `--runs=10 --stress=3` on a loaded host, and the default `--crash=1` crashes a tab (`chrome://crash`, no `pagehide`), whose leave comes by the 30 s idle timeout |
-| Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `relay.damus.io` / `nos.lol` and connect over public STUN |
+| Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `relay.damus.io` / `nos.lol` / `relay.primal.net` and connect over public STUN |
 
 The script runs every step even after a failure, prints a PASS/FAIL/SKIP summary and exits non-zero if any step
 failed. A full run takes about 2.5 minutes on the 4-core aarch64 dev host (Rust tests ~65 s, wasm build ~20 s,

@@ -19,7 +19,8 @@ const KIND = 25059;
 const MAX_CONTENT = 64 * 1024; // event content we are willing to decode (base64 characters)
 export const MAX_SEEN = 4096; // event ids remembered for de-duplication; the oldest is forgotten first
 const EVENT_ID = /^[0-9a-f]{64}$/; // NIP-01: the event hash in lowercase hex, so `seen` stays ~256 KiB
-export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
+// Three: a relay may rate-limit or ban an IP that several devices share (a phone hotspot).
+export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net'];
 // A relay that refuses an event for its rate limit (NIP-01 'rate-limited:', or
 // 'blocked:'/'banned') gets nothing from us for this long, doubling to the cap.
 export const BACKOFF_MS = 30000;
