@@ -333,6 +333,7 @@ function onTrace(peer, what, d) {
   }
   const text = SIG_TEXT[what]?.(d) ?? what;
   if (p.sig.length < 60) p.sig.push({ at, what, ...d });
+  if (what === 'offer-received' || what === 'answer-received') setTimeout(() => noteTheirHosts(p, peer), 500);
   const bad = d.resend || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'));
   log(bad ? 'warn' : 'info', `WebRTC with ${nameOf(peer)}: ${text}${at != null ? ` (${secs(at)} after hearing it)` : ''}`);
 }
@@ -468,6 +469,16 @@ function notePair(p, r, stats) {
   for (const k of ['requestsSent', 'responsesReceived', 'requestsReceived', 'responsesSent']) q[k] = Math.max(q[k], r[k] ?? 0);
 }
 
+// The other side's LAN addresses as its description gave them (counts alone can't
+// tell a phone's hotspot address, 192.168.x.1, from its mobile-data one).
+function noteTheirHosts(p, peer) {
+  const t = room?.transport;
+  const sdp = t?.links?.get(t.byPeer?.get(peer))?.pc?.remoteDescription?.sdp;
+  if (typeof sdp !== 'string') return;
+  const hosts = [...sdp.matchAll(/^a=candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ host/gm)].map((m) => m[1]).filter((h) => !h.endsWith('.local'));
+  p.theirHosts = [...new Set(hosts)].slice(0, 8);
+}
+
 // The offer/answer exchange, as "offer sent 0.2 s · answer received 1.9 s · 1 resend".
 function sigText(p) {
   const first = (w) => p.sig.find((e) => e.what === w && !e.resend);
@@ -476,7 +487,7 @@ function sigText(p) {
     .map(([w, label]) => { const e = first(w); return e ? `${label}${e.at != null ? ` ${secs(e.at)}` : ''}` : null; }).filter(Boolean);
   const theirs = first('offer-received') ?? first('answer-received');
   // With trickle (local signalling) candidates come separately, not in the description.
-  if (theirs && !room.transport?.trickle) parts.push(`their addresses: ${esc(addrText(theirs))}`);
+  if (theirs && !room.transport?.trickle) parts.push(`their addresses: ${esc(addrText(theirs))}${p.theirHosts?.length ? ` (LAN ${esc(p.theirHosts.join(', '))})` : ''}`);
   if (resends) parts.push(`<span class="warn">${resends} resent</span>`);
   if (first('offer-sent') && !first('answer-received') && !p.rtcOpenAt) parts.push('<span class="warn">no answer received</span>');
   return parts.join(' · ');
@@ -666,7 +677,7 @@ function report() {
       coreRttMs: room?.peers.includes(p.id) ? room.rtt(p.id) : null, webrtc: p.ice,
       heardToRtcMs: p.heardAt && p.rtcOpenAt ? Math.round(p.rtcOpenAt - p.heardAt) : null,
       heardToJoinMs: p.heardAt && p.joinedAt ? Math.round(p.joinedAt - p.heardAt) : null,
-      signaling: p.sig, iceChecks: [...p.pairs.values()],
+      signaling: p.sig, theirHosts: p.theirHosts ?? [], iceChecks: [...p.pairs.values()],
       rtcFailed: !!p.rtcFailedAt, left: p.leftAt ? p.leaveReason : null,
     })),
     log: events.map((e) => ({ t: new Date(e.at).toISOString(), level: e.level, msg: e.msg })),

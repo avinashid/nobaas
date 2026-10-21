@@ -28,11 +28,11 @@ export const MAX_BACKOFF_MS = 600000;
 const LIMITED = /^(rate-limited|blocked)|banned|rate.?limit/i;
 // A relay socket that closes (the phone switched networks or turned on its hotspot,
 // Android froze the tab, the relay dropped us) is dialled again after this long,
-// doubling to the cap; going online, a network change or the page showing again
-// redials at once.
+// doubling to the cap; a network change or the page showing again redials it at
+// once, and going online redials every relay.
 export const RECONNECT_MS = 1000;
 export const MAX_RECONNECT_MS = 30000;
-// A socket still connecting this long after a network change is given up and redialled.
+// A socket still connecting this long when the network changes is given up and redialled.
 const CONNECT_TIMEOUT_MS = 5000;
 
 const enc = new TextEncoder();
@@ -71,9 +71,12 @@ export class NostrSignaling {
     this.myTag = hex(await sha256(enc.encode(`peerwire/peer/${this.id}`)));
     this.roomTag = hex(await sha256(enc.encode(`peerwire/room/${this.room}`)));
     this.sub = hex(crypto.getRandomValues(new Uint8Array(8)));
+    // Only going online recycles open sockets: navigator.connection's 'change' also
+    // fires when Chrome's speed estimate moves (rtt 450 -> 300 ms), and redialling every
+    // relay on each of those got an IP banned for too many connections.
     this.wake = (e) => {
       if (e?.type === 'visibilitychange' && globalThis.document?.visibilityState !== 'visible') return;
-      this.redial(e?.type !== 'visibilitychange');
+      this.redial(e?.type === 'online');
     };
     globalThis.addEventListener?.('online', this.wake);
     globalThis.document?.addEventListener?.('visibilitychange', this.wake);
@@ -124,7 +127,7 @@ export class NostrSignaling {
   }
 
   // The network came back or changed, or the page is showing again: every relay that
-  // isn't open is redialled now. After a network change (`all`), open sockets are too,
+  // isn't open is redialled now. On going online (`all`), open sockets are too,
   // since their TCP connection may be on the old network and take minutes to time out.
   redial(all) {
     if (this.closed) return;

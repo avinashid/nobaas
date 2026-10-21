@@ -71,6 +71,9 @@ try {
   if (traced.length !== tabs - 1) throw new Error(`signalling not traced for every peer: ${JSON.stringify(r.peers.map((p) => p.signaling))}`);
   const checked = r.peers.filter((p) => p.iceChecks.length);
   step(`report: signalling traced for ${traced.length} peers, ICE checks for ${checked.length}`);
+  // The other side's LAN addresses are listed (a phone's hotspot address shows here).
+  if (!r.peers.every((p) => Array.isArray(p.theirHosts))) throw new Error('theirHosts missing from the report');
+  step(`report: their LAN addresses ${JSON.stringify(r.peers.map((p) => p.theirHosts))}`);
   step(`report: ${r.peers.length} peers, ${r.log.length} log lines, no room key`);
 
   const shown = await pages[0].evaluate(() => ({ cards: document.querySelectorAll('.peer').length, wide: document.documentElement.scrollWidth }));

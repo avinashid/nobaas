@@ -346,7 +346,7 @@ export declare class NostrSignaling implements SignalingAdapter {
   /** `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close. */
   readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; reconnects: number; lastRejection?: string };
   onHello: (peer: PeerId, meta?: unknown) => void;
-  /** A relay opened again after its socket closed (it is redialled on its own, and at once on going online, a network change or the page showing again). */
+  /** A relay opened again after its socket closed (it is redialled on its own, and at once on a network change or the page showing again; going online redials every relay). */
   onReconnect: (url: string) => void;
   hello(meta?: unknown): Promise<void>;
   send(to: PeerId, body: unknown): Promise<void>;
