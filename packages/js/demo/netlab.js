@@ -245,7 +245,7 @@ function peerState(peer) {
   let p = peers.get(peer);
   if (!p) {
     p = { id: peer, heardAt: null, rtcOpenAt: null, rtcFailedAt: null, joinedAt: null, leftAt: null, leaveReason: null, presence: null,
-      route: null, routeLog: [], ice: null, pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set() };
+      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set() };
     peers.set(peer, p);
   }
   return p;
@@ -270,6 +270,7 @@ function hook() {
     hello(peer, meta);
   };
   const t = room.transport;
+  if (t && 'trace' in t) t.trace = onTrace;
   if (t?.onPeer) {
     const onPeer = t.onPeer;
     t.onPeer = (peer, state) => {
@@ -300,6 +301,39 @@ function hook() {
     log(reason === 'left' || reason === 'closed' ? 'info' : 'warn', `${nameOf(peer)} left: ${reason}`);
   });
   room.on('message', onMessage);
+}
+
+// The addresses in an offer, answer or late batch, as "1 IPv6 public, 2 hidden (mDNS)".
+function addrText(d) {
+  const parts = [[d.host6, 'IPv6 host'], [d.host4, 'IPv4 host'], [d.srflx6, 'IPv6 public'], [d.srflx4, 'IPv4 public'], [d.mdns, 'hidden (mDNS)'], [d.relay, 'TURN']]
+    .filter(([n]) => n).map(([n, k]) => `${n} ${k}`);
+  return parts.length ? parts.join(', ') : 'no addresses';
+}
+
+const SIG_TEXT = {
+  'offer-sent': (d) => d.resend ? 'no answer yet: offer sent again' : `offer sent (${addrText(d)})`,
+  'offer-received': (d) => `offer received (${addrText(d)})`,
+  'answer-sent': (d) => d.resend ? 'their offer came again (our answer lost?): answer sent again' : `answer sent (${addrText(d)})`,
+  'answer-received': (d) => `answer received (${addrText(d)})`,
+  'ice-batch-sent': (d) => `late addresses sent (${addrText(d)})`,
+  'ice-batch-received': (d) => `late addresses received (${addrText(d)})`,
+  'ice-state': (d) => `ICE ${d.state}`,
+};
+
+// The WebRTC transport's diagnostics for one link.
+function onTrace(peer, what, d) {
+  const p = peerState(peer);
+  const at = p.heardAt ? Math.round(now() - p.heardAt) : null;
+  if (what === 'candidate-error') {
+    // Chrome reports one per local address and STUN server that failed; log each kind once.
+    const fam = String(d.address ?? '').includes(':') ? 'IPv6' : 'IPv4';
+    warnOnce(p, `cerr ${d.url} ${d.code} ${fam}`, `STUN ${clip(d.url, 60)} over ${fam}: error ${d.code} ${clip(d.text, 80)}`);
+    return;
+  }
+  const text = SIG_TEXT[what]?.(d) ?? what;
+  if (p.sig.length < 60) p.sig.push({ at, what, ...d });
+  const bad = d.resend || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'));
+  log(bad ? 'warn' : 'info', `WebRTC with ${nameOf(peer)}: ${text}${at != null ? ` (${secs(at)} after hearing it)` : ''}`);
 }
 
 function onMessage(data, peer, info) {
@@ -391,10 +425,12 @@ async function iceOf(peer) {
     const stats = await pc.getStats();
     let pair = null;
     let local = 0, remote = 0;
+    const p = peerState(peer);
     stats.forEach((r) => {
       if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId);
       if (r.type === 'local-candidate') local++;
       if (r.type === 'remote-candidate') remote++;
+      if (r.type === 'candidate-pair') notePair(p, r, stats);
     });
     if (!pair) stats.forEach((r) => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
     out.candidates = { local, remote };
@@ -413,6 +449,57 @@ async function iceOf(peer) {
   return out;
 }
 
+// Chrome deletes candidate pairs that never got an answer (after ~15 s), so the
+// counts are kept here: the most each pair ever reached.
+const MAX_PAIRS = 24;
+function notePair(p, r, stats) {
+  const l = stats.get(r.localCandidateId), rc = stats.get(r.remoteCandidateId);
+  const addr = (c) => c?.address ?? c?.ip ?? '';
+  const fam = (c) => (String(addr(c)).includes(':') ? 'v6' : 'v4');
+  const key = `${l?.candidateType}/${fam(l)} ↔ ${rc?.candidateType}/${fam(rc)} ${addr(rc)}:${rc?.port ?? ''}`;
+  let q = p.pairs.get(key);
+  if (!q) {
+    if (p.pairs.size >= MAX_PAIRS) return;
+    q = { pair: key, protocol: l?.protocol, state: r.state, requestsSent: 0, responsesReceived: 0, requestsReceived: 0, responsesSent: 0 };
+    p.pairs.set(key, q);
+  }
+  q.state = r.state;
+  for (const k of ['requestsSent', 'responsesReceived', 'requestsReceived', 'responsesSent']) q[k] = Math.max(q[k], r[k] ?? 0);
+}
+
+// The offer/answer exchange, as "offer sent 0.2 s · answer received 1.9 s · 1 resend".
+function sigText(p) {
+  const first = (w) => p.sig.find((e) => e.what === w && !e.resend);
+  const resends = p.sig.filter((e) => e.resend).length;
+  const parts = [['offer-sent', 'offer sent'], ['offer-received', 'offer received'], ['answer-sent', 'answer sent'], ['answer-received', 'answer received'], ['ice-batch-received', 'late addresses received']]
+    .map(([w, label]) => { const e = first(w); return e ? `${label}${e.at != null ? ` ${secs(e.at)}` : ''}` : null; }).filter(Boolean);
+  const theirs = first('offer-received') ?? first('answer-received');
+  // With trickle (local signalling) candidates come separately, not in the description.
+  if (theirs && !room.transport?.trickle) parts.push(`their addresses: ${esc(addrText(theirs))}`);
+  if (resends) parts.push(`<span class="warn">${resends} resent</span>`);
+  if (first('offer-sent') && !first('answer-received') && !p.rtcOpenAt) parts.push('<span class="warn">no answer received</span>');
+  return parts.join(' · ');
+}
+
+// What the connectivity checks say about the path between the two sides.
+function checksText(p) {
+  if (!p.pairs.size) return '';
+  let sent = 0, replies = 0, inbound = 0, ok = false;
+  for (const q of p.pairs.values()) {
+    sent += q.requestsSent;
+    replies += q.responsesReceived;
+    inbound += q.requestsReceived;
+    ok ||= q.state === 'succeeded';
+  }
+  let verdict = '';
+  if (!ok && sent > 0) {
+    if (inbound > 0 && !replies) verdict = 'their checks reach us, but ours get no reply: our packets do not reach them, or their replies do not reach us';
+    else if (!inbound && !replies) verdict = 'no check got through in either direction: something between the two sides (a carrier or NAT filter) drops the packets';
+    else if (replies) verdict = 'some checks answered, but no pair completed';
+  }
+  return `${p.pairs.size} pairs tried · ${sent} checks sent, ${replies} answered, ${inbound} received from them${verdict ? ` <span class="bad">· ${esc(verdict)}</span>` : ''}`;
+}
+
 const KIND = { host: 'LAN', srflx: 'public (STUN)', prflx: 'public (peer-seen)', relay: 'TURN' };
 function iceText(ice) {
   if (!ice) return '<span class="dim">no WebRTC link</span>';
@@ -425,7 +512,7 @@ function iceText(ice) {
 // What the two NAT results mean for a direct link.
 function pairHint(pres) {
   if (!myNet || !pres) return '';
-  if (myNet.ipv6 && pres.v6) return 'Both have IPv6: a direct IPv6 link should work.';
+  if (myNet.ipv6 && pres.v6) return 'Both have IPv6: a direct IPv6 link should work, unless a carrier or firewall drops packets between the two (see ICE checks).';
   const a = myNet.nat, b = pres.nat;
   if (a === 'symmetric' && b === 'symmetric') return 'Both behind symmetric NAT and not both on IPv6: direct WebRTC cannot work without TURN; a member relay or the slow signalling route is expected.';
   if (a === 'symmetric' || b === 'symmetric') return 'One side is behind symmetric NAT: direct works only if the other side is open enough (cone NAT).';
@@ -505,7 +592,7 @@ async function render() {
     const cards = [];
     for (const p of list) {
       const isLinked = linked.includes(p.id);
-      if (isLinked) p.ice = await iceOf(p.id);
+      if (isLinked || room.transport?.has?.(p.id)) p.ice = await iceOf(p.id);
       const st = pingStats(p);
       const pres = p.presence ?? {};
       const state = p.leftAt ? `<span class="dim">left (${esc(p.leaveReason)})</span>`
@@ -519,11 +606,14 @@ async function render() {
         <dl>
           <dt>Ping</dt><dd>avg <b class="${pingCls(st.avg)}">${ms(st.avg)}</b> · min ${ms(st.min)} · max ${ms(st.max)} · jitter ${ms(st.jitter)} · loss ${st.loss.toFixed(0)}% <span class="dim">(${p.recv}/${p.sent})</span></dd>
           <dt>Core RTT</dt><dd>${ms(isLinked ? room.rtt(p.id) : null)}</dd>
-          <dt>WebRTC</dt><dd>${isLinked ? iceText(p.ice) : p.rtcFailedAt ? '<span class="bad">failed</span>' : '–'}${p.ice?.pair?.iceRttMs != null ? ` · ICE RTT ${p.ice.pair.iceRttMs} ms` : ''}</dd>
+          <dt>WebRTC</dt><dd>${p.ice ? iceText(p.ice) : p.rtcFailedAt ? '<span class="bad">failed</span>' : '–'}${p.ice?.pair?.iceRttMs != null ? ` · ICE RTT ${p.ice.pair.iceRttMs} ms` : ''}</dd>
+          ${p.sig.length ? `<dt>Signalling</dt><dd>${sigText(p)}</dd>` : ''}
+          ${p.pairs.size ? `<dt>ICE checks</dt><dd>${checksText(p)}</dd>` : ''}
           <dt>Timing</dt><dd>heard→WebRTC ${secs(p.heardAt && p.rtcOpenAt ? p.rtcOpenAt - p.heardAt : null)} · heard→joined ${secs(p.heardAt && p.joinedAt ? p.joinedAt - p.heardAt : null)}</dd>
           <dt>Their side</dt><dd>${esc(clip(pres.dev, 40) || '–')} · NAT <b>${esc(clip(pres.nat, 20) || '?')}</b> · IPv6 ${pres.v6 ? 'yes' : 'no'}${pres.conn && pres.conn !== 'unknown' ? ` · ${esc(clip(pres.conn, 40))}` : ''}</dd>
         </dl>
         ${hint ? `<div class="note dim">${esc(hint)}</div>` : ''}
+        ${p.pairs.size ? `<details><summary>candidate pairs</summary><div class="mono">${[...p.pairs.values()].map((q) => `${esc(q.pair)} ${esc(q.state)}: sent ${q.requestsSent}, answered ${q.responsesReceived}, received ${q.requestsReceived}`).join('<br>')}</div></details>` : ''}
         ${p.routeLog.length > 1 ? `<details><summary>route history</summary><div class="mono">${p.routeLog.map((r) => `${secs(r.at)}: ${esc(r.route)}`).join('<br>')}</div></details>` : ''}
       </div>`);
     }
@@ -573,6 +663,7 @@ function report() {
       coreRttMs: room?.peers.includes(p.id) ? room.rtt(p.id) : null, webrtc: p.ice,
       heardToRtcMs: p.heardAt && p.rtcOpenAt ? Math.round(p.rtcOpenAt - p.heardAt) : null,
       heardToJoinMs: p.heardAt && p.joinedAt ? Math.round(p.joinedAt - p.heardAt) : null,
+      signaling: p.sig, iceChecks: [...p.pairs.values()],
       rtcFailed: !!p.rtcFailedAt, left: p.leftAt ? p.leaveReason : null,
     })),
     log: events.map((e) => ({ t: new Date(e.at).toISOString(), level: e.level, msg: e.msg })),

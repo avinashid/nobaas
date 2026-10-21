@@ -33,6 +33,33 @@ export const PIPE_BURST = 6;
 export const PIPE_QUEUE = 64 * 1024;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
 export const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
+// Without trickle, an offer or answer goes once ICE gathering is complete, or
+// GATHER_SETTLE_MS after the first public (srflx/relay) candidate, or at
+// GATHER_MAX_MS. Candidates found later go in one 'ice-batch', LATE_ICE_MS after
+// the description at the latest.
+export const GATHER_SETTLE_MS = 300;
+export const GATHER_MAX_MS = 2000;
+export const LATE_ICE_MS = 3000;
+// Signalling relays drop messages: an offer with no answer is sent again at these
+// times after the first; an offer seen twice is answered with the same answer.
+export const OFFER_RESEND_MS = [3000, 6000];
+const MAX_ICE_BATCH = 32; // candidates in one 'ice-batch', and held before a remote description
+
+// Counts the ICE candidates in an SDP by type and family: host candidates with an
+// mDNS name (.local) are `mdns`, as only the same LAN can resolve them.
+export function candidateSummary(sdp) {
+  const out = { host4: 0, host6: 0, mdns: 0, srflx4: 0, srflx6: 0, prflx: 0, relay: 0 };
+  if (typeof sdp !== 'string') return out;
+  for (const l of sdp.split(/\r?\n/)) {
+    const m = /^a=candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ (\w+)/.exec(l);
+    if (!m) continue;
+    const fam = m[1].includes(':') ? 6 : 4;
+    if (m[2] === 'host') out[m[1].endsWith('.local') ? 'mdns' : `host${fam}`]++;
+    else if (m[2] === 'srflx') out[`srflx${fam}`]++;
+    else if (m[2] in out) out[m[2]]++;
+  }
+  return out;
+}
 
 // Removes `host` candidates (LAN, loopback, mDNS .local names) from an SDP, keeping
 // server-reflexive (public, from STUN) and relay ones.
@@ -58,6 +85,10 @@ export class WebRtcTransport {
   // `onPeer(peer, state)`: 'open' and 'closed' for a DataChannel, and 'failed' once
   //   when one isn't open `fallbackMs` after its offer or answer (or ICE failed).
   // `pipes`: carry datagrams over signalling for peers allowed with allowPipe().
+  // `trace(peer, what, detail)`, settable later: diagnostics of each link's
+  //   signalling ('offer-sent', 'offer-received', 'answer-sent', 'answer-received',
+  //   'ice-batch-sent', 'ice-batch-received'; detail has candidateSummary counts)
+  //   and of ICE ('ice-state', 'candidate-error').
   constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, pipes = false, fallbackMs = RTC_FALLBACK_MS, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
     if (privacy === 'relay-only' && !isPeerId(relay)) throw new TypeError("privacy 'relay-only' needs a relay peer id");
@@ -72,6 +103,8 @@ export class WebRtcTransport {
     this.dropped = 0; // datagrams dropped by the simulated `loss`
     this.congested = 0; // datagrams dropped because the DataChannel was full or refused them
     this.badSignals = 0; // signals refused as malformed or unproven (see onSignal)
+    this.resent = 0; // offers and answers sent again (OFFER_RESEND_MS)
+    this.trace = null;
     this.sig = signaling;
     this.iceServers = iceServers;
     this.onPeer = onPeer;
@@ -116,7 +149,10 @@ export class WebRtcTransport {
     const pc = new this.Pc({ iceServers: this.iceServers });
     const dc = pc.createDataChannel('peerwire', { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 });
     dc.binaryType = 'arraybuffer';
-    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, failed: false };
+    // Without trickle: `described` once the offer or answer is out, `late` holds the
+    // candidates found after it, `held` the peer's that came before its description.
+    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, failed: false, described: false, late: [], lateSent: false, lateTimer: null,
+      held: [], offerMsg: null, offerSdp: null, answerMsg: null, resends: [] };
     dc.onopen = () => {
       clearTimeout(l.timer);
       if (l.dialer) this.ep.connect(h, peer);
@@ -131,10 +167,17 @@ export class WebRtcTransport {
       if (e.data instanceof ArrayBuffer && e.data.byteLength <= MAX_DATAGRAM) this.ep.receive(h, new Uint8Array(e.data));
     };
     pc.onicecandidate = (e) => {
-      if (!e.candidate || !this.trickle) return;
-      if (this.privacy !== 'direct' && / typ host( |$)/.test(e.candidate.candidate)) return;
-      this.sig.send(peer, { kind: 'ice', candidate: e.candidate.toJSON() });
+      const c = e.candidate;
+      if (c && this.privacy !== 'direct' && / typ host( |$)/.test(c.candidate)) return;
+      if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: c.toJSON() }));
+      if (!l.described) return; // still to go in the description
+      if (!c) this.sendLate(l); // gathering is complete
+      else if (l.late.length < MAX_ICE_BATCH) l.late.push(c.toJSON());
     };
+    if (typeof pc.addEventListener === 'function') {
+      pc.addEventListener('iceconnectionstatechange', () => this.tr(peer, 'ice-state', { state: pc.iceConnectionState }));
+      pc.addEventListener('icecandidateerror', (e) => this.tr(peer, 'candidate-error', { url: e.url, code: e.errorCode, text: e.errorText, address: e.address }));
+    }
     this.links.set(h, l);
     this.byPeer.set(peer, h);
     return l;
@@ -164,6 +207,41 @@ export class WebRtcTransport {
     return this.privacy === 'direct' ? d : { type: d.type, sdp: withoutHostCandidates(d.sdp) };
   }
 
+  // Sends a signal; a closed or failing signalling channel loses it, like a relay would.
+  signal(peer, msg) {
+    try {
+      Promise.resolve(this.sig.send(peer, msg)).catch(() => {});
+    } catch {
+      // lost
+    }
+  }
+
+  tr(peer, what, detail) {
+    try {
+      this.trace?.(peer, what, detail);
+    } catch {
+      // diagnostics never break a link
+    }
+  }
+
+  // Takes the description to send (and starts collecting late candidates).
+  describe(l) {
+    const d = this.description(l.pc);
+    l.described = true;
+    if (!this.trickle && l.pc.iceGatheringState !== 'complete') l.lateTimer = setTimeout(() => this.sendLate(l), LATE_ICE_MS);
+    return d;
+  }
+
+  // Sends the candidates found after the description, once.
+  sendLate(l) {
+    clearTimeout(l.lateTimer);
+    if (l.lateSent || this.links.get(l.handle) !== l) return;
+    l.lateSent = true;
+    if (!l.late.length) return;
+    this.signal(l.peer, { kind: 'ice-batch', c: l.late });
+    this.tr(l.peer, 'ice-batch-sent', candidateSummary(l.late.map((c) => `a=${c.candidate}`).join('\n')));
+  }
+
   // Opens a DataChannel to `peer` and, once open, runs the Peerwire handshake.
   async dial(peer) {
     if (!isPeerId(peer)) throw new TypeError('dial: not a peer id (64 lowercase hex characters)');
@@ -174,8 +252,20 @@ export class WebRtcTransport {
     await l.pc.setLocalDescription(await l.pc.createOffer());
     await this.gathered(l.pc);
     const p = this.offerProof ? await this.offerProof.sign(peer) : undefined;
-    this.sig.send(peer, { kind: 'offer', sdp: this.description(l.pc), p });
+    if (this.links.get(l.handle) !== l) return; // dropped meanwhile
+    l.offerMsg = { kind: 'offer', sdp: this.describe(l), p };
+    this.signal(peer, l.offerMsg);
+    this.tr(peer, 'offer-sent', candidateSummary(l.offerMsg.sdp.sdp));
     this.watch(l);
+    // No answer yet: the offer (or the answer) was lost on the way; send it again.
+    for (const ms of OFFER_RESEND_MS) {
+      l.resends.push(setTimeout(() => {
+        if (this.links.get(l.handle) !== l || l.pc.remoteDescription || l.failed || l.dc.readyState === 'open') return;
+        this.resent++;
+        this.signal(peer, l.offerMsg);
+        this.tr(peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), resend: true });
+      }, ms));
+    }
   }
 
   async onSignal(from, msg) {
@@ -204,7 +294,21 @@ export class WebRtcTransport {
     if (msg.kind !== 'offer' && !this.byPeer.has(from)) return;
     if (msg.kind === 'offer') {
       const fresh = !this.byPeer.has(from);
+      const sdp = typeof msg.sdp?.sdp === 'string' ? msg.sdp.sdp : null;
+      if (!fresh) {
+        // The same offer again: our answer was lost (or is still being made). Send it again.
+        const l = this.links.get(this.byPeer.get(from));
+        if (sdp !== null && sdp === l.offerSdp) {
+          if (l.answerMsg) {
+            this.resent++;
+            this.signal(from, l.answerMsg);
+            this.tr(from, 'answer-sent', { ...candidateSummary(l.answerMsg.sdp.sdp), resend: true });
+          }
+          return;
+        }
+      }
       const l = this.link(from);
+      l.offerSdp = sdp; // a copy that comes while this one is answered is ignored
       try {
         await l.pc.setRemoteDescription(msg.sdp);
         await l.pc.setLocalDescription(await l.pc.createAnswer());
@@ -213,35 +317,71 @@ export class WebRtcTransport {
         if (fresh && this.links.get(l.handle) === l) this.drop(from);
         return void this.badSignals++;
       }
+      this.tr(from, 'offer-received', candidateSummary(sdp));
+      await this.addHeld(l);
       await this.gathered(l.pc);
-      this.sig.send(from, { kind: 'answer', sdp: this.description(l.pc) });
+      if (this.links.get(l.handle) !== l) return; // dropped meanwhile
+      l.answerMsg = { kind: 'answer', sdp: this.describe(l) };
+      this.signal(from, l.answerMsg);
+      this.tr(from, 'answer-sent', candidateSummary(l.answerMsg.sdp.sdp));
       this.watch(l);
     } else if (msg.kind === 'answer') {
       const l = this.link(from);
+      if (l.pc.remoteDescription) return; // a copy of one already applied
       try {
         await l.pc.setRemoteDescription(msg.sdp);
       } catch {
-        // Malformed, or a copy for a link already answered: ignored, the dial times out or stands.
+        // Malformed: ignored, the dial times out or a resent offer gets a good one.
+        return;
       }
-    } else if (msg.kind === 'ice') {
+      this.tr(from, 'answer-received', candidateSummary(msg.sdp?.sdp));
+      await this.addHeld(l);
+    } else if (msg.kind === 'ice' || msg.kind === 'ice-batch') {
+      const cands = msg.kind === 'ice' ? [msg.candidate] : msg.c;
+      if (!Array.isArray(cands) || cands.length > MAX_ICE_BATCH) return void this.badSignals++;
       const l = this.link(from);
+      if (msg.kind === 'ice-batch') this.tr(from, 'ice-batch-received', candidateSummary(cands.map((c) => `a=${c?.candidate}`).join('\n')));
+      // Candidates can overtake the description they belong to: hold them until it comes.
+      if (!l.pc.remoteDescription) return void l.held.push(...cands.slice(0, MAX_ICE_BATCH - l.held.length));
+      await this.addCandidates(l, cands);
+    }
+  }
+
+  async addHeld(l) {
+    const held = l.held.splice(0);
+    await this.addCandidates(l, held);
+  }
+
+  async addCandidates(l, cands) {
+    for (const c of cands) {
       try {
-        await l.pc.addIceCandidate(msg.candidate);
-      } catch (e) {
-        // Candidates can race the remote description; the next ones will do.
+        await l.pc.addIceCandidate(c);
+      } catch {
+        // malformed, or for another description: the others may do
       }
     }
   }
 
-  // Without trickle, waits (up to 2 s) for ICE gathering to finish.
+  // Without trickle, waits for ICE gathering: until it is complete, GATHER_SETTLE_MS
+  // after the first public candidate, or GATHER_MAX_MS.
   gathered(pc) {
     if (this.trickle || pc.iceGatheringState === 'complete') return Promise.resolve();
     return new Promise((resolve) => {
+      let settle = null;
       const done = () => {
-        if (pc.iceGatheringState === 'complete') resolve();
+        clearTimeout(settle);
+        clearTimeout(max);
+        pc.removeEventListener('icegatheringstatechange', onState);
+        pc.removeEventListener('icecandidate', onCandidate);
+        resolve();
       };
-      pc.addEventListener('icegatheringstatechange', done);
-      setTimeout(resolve, 2000);
+      const onState = () => pc.iceGatheringState === 'complete' && done();
+      const onCandidate = (e) => {
+        if (!settle && e.candidate && / typ (srflx|relay)( |$)/.test(e.candidate.candidate)) settle = setTimeout(done, GATHER_SETTLE_MS);
+      };
+      const max = setTimeout(done, GATHER_MAX_MS);
+      pc.addEventListener('icegatheringstatechange', onState);
+      pc.addEventListener('icecandidate', onCandidate);
     });
   }
 
@@ -335,13 +475,18 @@ export class WebRtcTransport {
   dropRtc(peer) {
     const h = this.byPeer.get(peer);
     if (h === undefined) return;
-    const l = this.links.get(h);
+    this.shut(this.links.get(h));
+    this.links.delete(h);
+    this.byPeer.delete(peer);
+  }
+
+  shut(l) {
     clearTimeout(l.timer);
+    clearTimeout(l.lateTimer);
+    for (const t of l.resends) clearTimeout(t);
     l.dc.onclose = null;
     l.pc.onconnectionstatechange = null;
     l.pc.close();
-    this.links.delete(h);
-    this.byPeer.delete(peer);
   }
 
   // Forgets every path to `peer`: its WebRTC link and its pipe.
@@ -363,12 +508,7 @@ export class WebRtcTransport {
     for (const p of this.pipes.values()) clearTimeout(p.timer);
     this.pipes.clear();
     this.pipeByPeer.clear();
-    for (const l of this.links.values()) {
-      clearTimeout(l.timer);
-      l.dc.onclose = null;
-      l.pc.onconnectionstatechange = null;
-      l.pc.close();
-    }
+    for (const l of this.links.values()) this.shut(l);
     this.links.clear();
     this.byPeer.clear();
     this.sig.close();
