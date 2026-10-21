@@ -1,7 +1,7 @@
 use crate::addr::{Address, Path};
 use crate::crypto::{self, ReplayWindow};
 use crate::identity::{Identity, PeerId};
-use crate::reliable::{PushError, RelRecv, RelSend, MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW};
+use crate::reliable::{PushError, RecoveryStats, RelRecv, RelSend, MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW};
 use crate::time::Instant;
 use crate::wire::{
     self, Frame, Packet, FWD_OVERHEAD, MAX_DATAGRAM, MAX_PLAINTEXT, MAX_RELAYED_PACKET, MAX_UNRELIABLE,
@@ -553,6 +553,16 @@ impl<A: Address> Endpoint<A> {
                 inflight: l.tx.inflight(),
                 delay_backoffs: l.tx.delay_backoffs,
             }),
+            State::Dialing(_) => None,
+        }
+    }
+
+    /// How the reliable lanes to `peer` have recovered from loss, for the
+    /// simulator's benchmarks; not a stable API.
+    #[doc(hidden)]
+    pub fn recovery_stats(&self, peer: &PeerId) -> Option<RecoveryStats> {
+        match &self.sessions.get(self.peers.get(peer)?)?.state {
+            State::Live(l) => Some(l.tx.recovery),
             State::Dialing(_) => None,
         }
     }

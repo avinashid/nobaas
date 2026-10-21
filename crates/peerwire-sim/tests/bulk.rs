@@ -45,6 +45,24 @@ fn bulk_transfer_survives_one_percent_loss() {
     assert!(s.retransmits < 4 * 1024 * 1024 / 1100 / 10, "{s:?}");
 }
 
+/// PERF-10: while a hole is repaired, fragments more than 64 above it can't be
+/// reported by the ACK's bitmap; their timers ran out by the hundred (309 of
+/// 340 timeouts at 1% loss with seed 1) and they were all sent again.
+#[test]
+fn nothing_beyond_the_sack_bitmaps_reach_times_out() {
+    let mut deferred = 0;
+    for seed in 1..=3 {
+        let s = run(Args { mib: 16, loss: 0.01, seed, ..Args::default() });
+        assert!(s.done && s.dropped.is_none(), "{s:?}");
+        let r = s.recovery;
+        assert_eq!(r.timed_out_beyond_reach, 0, "{s:?}");
+        assert!(r.timed_out < 60, "{s:?}");
+        deferred += r.deferred;
+    }
+    // Only when the window outgrew the bitmap (seed 1 reaches 336).
+    assert!(deferred > 0);
+}
+
 /// Reordering (independent jitter per packet) looked like loss to fast
 /// retransmit and stalled the transfer; the reordering window absorbs it.
 /// A few timeouts remain where jitter outruns the RTO (up to 38 of 3870
