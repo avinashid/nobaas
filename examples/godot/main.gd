@@ -8,7 +8,10 @@ extends Node2D
 ## room instead. `--stun=a:3478,b:3478` and `--relay=wss://…,…` set the STUN servers
 ## and Nostr relays (`none` turns either off); `--privacy=public-only|relay-only`
 ## which addresses this peer gives out; `--port-mapping` asks the router to forward
-## a port (off by default; the state line shows how it went). Both move by themselves, chat, and
+## a port (off by default; the state line shows how it went); `--relay-peer=pw:…[,…]`
+## keeps a link to always-on relay peers (`peerwire-peer`), through which two
+## players link when their NATs can't be punched (the log says whether each link
+## is direct or through a relay). Both move by themselves, chat, and
 ## quit with 0 once they have seen another peer's square move and its chat line,
 ## or 1 on timeout.
 
@@ -30,6 +33,9 @@ var got_chat := false
 var done_at := -1.0
 var elapsed := 0.0
 var nat_logged := false
+var relays_linked := -1
+## Godot peer id -> "direct" or "relay", as last logged.
+var routes := {}
 
 
 func _ready() -> void:
@@ -63,6 +69,9 @@ func _ready() -> void:
 		_log("privacy: %s" % args["privacy"])
 	if args.has("port-mapping"):
 		peer.set_port_mapping(true)
+	if args.has("relay-peer"):
+		if peer.set_relay_peers(_list(args["relay-peer"])) != OK:
+			_log("--relay-peer: not a pw: invite")
 	peer.port_mapping_changed.connect(func(info: Dictionary): _log("port mapping: %s" % _mapping_line(info)))
 	headless = args.has("host") or args.has("join") or args.has("host-room") or args.has("join-room")
 	if args.has("host"):
@@ -183,6 +192,7 @@ func _process(delta: float) -> void:
 	if not nat_logged and multiplayer.has_multiplayer_peer() and peer.get_nat_type() != "unknown":
 		nat_logged = true
 		_log("public address %s, NAT %s" % [peer.get_public_address(), peer.get_nat_type()])
+	_log_links()
 	if not headless:
 		return
 	elapsed += delta
@@ -196,6 +206,21 @@ func _process(delta: float) -> void:
 	elif done_at < 0.0 and elapsed > TIMEOUT:
 		print("PEERWIRE_DEMO_TIMEOUT chat=%s moved=%s" % [got_chat, _other_square_moved()])
 		get_tree().quit(1)
+
+
+## Logs how many relay peers are linked, and each link's route, when they change.
+func _log_links() -> void:
+	if not multiplayer.has_multiplayer_peer() or not args.has("relay-peer"):
+		return
+	var linked := peer.get_relay_peers_linked()
+	if linked != relays_linked:
+		relays_linked = linked
+		_log("relay peers: %d linked" % linked)
+	for id in multiplayer.get_peers():
+		var route := peer.get_peer_route(id)
+		if not route.is_empty() and routes.get(id, "") != route:
+			routes[id] = route
+			_log("route to peer %d: %s" % [id, "direct" if route == "direct" else "through a relay"])
 
 
 func _other_square_moved() -> bool:

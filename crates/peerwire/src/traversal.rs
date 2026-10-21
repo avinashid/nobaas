@@ -288,6 +288,8 @@ pub struct Traversal<A: Address> {
     picked: Option<PeerId>,
     /// Whoever holds this, from our invite, may ask us to dial back.
     invite_key: [u8; 32],
+    /// Always-on peers kept linked as relays: named first in offers, tried first as vias.
+    relay_peers: Vec<PeerId>,
     transmits: VecDeque<Transmit<A>>,
     signals: VecDeque<Signal>,
 }
@@ -331,6 +333,7 @@ impl<A: Address> Traversal<A> {
             privacy: Privacy::Direct,
             picked: None,
             invite_key,
+            relay_peers: Vec::new(),
             transmits: VecDeque::new(),
             signals: VecDeque::from([Signal::Subscribe(inbox)]),
         }
@@ -413,6 +416,14 @@ impl<A: Address> Traversal<A> {
     pub fn relay(&self) -> Option<PeerId> {
         let Privacy::RelayOnly { via } = self.privacy else { return None };
         via.or_else(|| self.room.as_ref()?.expect).or(self.picked)
+    }
+
+    /// Always-on peers (such as `peerwire-peer`) this node keeps linked so that
+    /// peers it can't punch to can reach it through one: its offers name them
+    /// first among its links, and its dials try them first among the relays an
+    /// offer names. Linking with them is the host's job ([`Node`](crate::Node) does it).
+    pub fn set_relay_peers(&mut self, peers: Vec<PeerId>) {
+        self.relay_peers = peers;
     }
 
     /// The key this node's invites carry: an offer proved with it is from a peer
@@ -760,8 +771,10 @@ impl<A: Address> Traversal<A> {
             if ep.is_connected(&from) {
                 ep.add_candidates(now, &from, &addrs);
             } else {
-                let vias = o.relays.iter().filter(|p| **p != from && **p != self.id && ep.is_connected(p));
-                let mut targets: Vec<Path<A>> = vias.take(VIA_PER_DIAL).map(|p| Path::Via(*p)).collect();
+                let mut vias: Vec<PeerId> =
+                    o.relays.iter().filter(|p| **p != from && **p != self.id && ep.is_connected(p)).copied().collect();
+                vias.sort_by_key(|p| !self.relay_peers.contains(p)); // ours first, else the sender's order
+                let mut targets: Vec<Path<A>> = vias.into_iter().take(VIA_PER_DIAL).map(Path::Via).collect();
                 targets.extend(addrs.into_iter().map(Path::Direct));
                 if !targets.is_empty() {
                     let _ = ep.connect_with(now, from, &targets);
@@ -800,7 +813,9 @@ impl<A: Address> Traversal<A> {
                 (self.candidates_for(&to), relay.into_iter().collect())
             }
             _ if full => {
-                let links = ep.connected_peers().filter(|p| **p != to).take(MAX_RELAYS);
+                let ours = self.relay_peers.iter().filter(|p| ep.is_connected(p));
+                let others = ep.connected_peers().filter(|p| !self.relay_peers.contains(p));
+                let links = ours.chain(others).filter(|p| **p != to).take(MAX_RELAYS);
                 (self.candidates_for(&to), links.copied().collect())
             }
             _ => (self.addresses(true), Vec::new()),
@@ -1608,6 +1623,55 @@ mod tests {
             &Event::Connected { peer: relay.peer_id(), path: Path::Direct(at_relay), initiator: true },
         );
         assert_eq!(dials(&mut ep, now), vec![at_relay]);
+    }
+
+    /// NB-041: a relay peer is named first in offers, though it linked last and
+    /// the node has more links than an offer names, and is tried first among the
+    /// relays an offer names, though that offer lists it last.
+    #[test]
+    fn relay_peers_come_first_in_offers_and_dials() {
+        let me = id(1).peer_id();
+        let lan: SocketAddr = "10.0.0.1:7000".parse().unwrap();
+        let (mut t, mut ep) = in_room(Role::Peer, None, lan);
+        let now = Instant::from_millis(10);
+        let at = |i: u8| -> SocketAddr { format!("198.51.100.{i}:9").parse().unwrap() };
+        for i in 10..20 {
+            link(&mut ep, lan, &id(i), at(i), now);
+        }
+        let relay = id(30);
+        link(&mut ep, lan, &relay, at(30), now);
+        let key = room_key(ROOM.0, ROOM.1);
+        let (member, other) = (id(2), id(3));
+        let ask = |t: &mut Traversal<SocketAddr>, ep: &mut Endpoint<SocketAddr>, who: &Identity, nonce: u64| {
+            t.handle_signal(now, ep, Topic::peer(&me), &offer_from(who, &me, Some(&key), nonce, Role::Peer, vec![]));
+            sent_offers(t, who).remove(0).relays
+        };
+        let before = ask(&mut t, &mut ep, &member, 1);
+        assert_eq!(before.len(), MAX_RELAYS);
+        assert!(!before.contains(&relay.peer_id()), "11 links, 8 named: the last one linked is left out");
+        t.set_relay_peers(vec![relay.peer_id()]);
+        let after = ask(&mut t, &mut ep, &other, 2);
+        assert_eq!((after.len(), after[0]), (MAX_RELAYS, relay.peer_id()));
+
+        // An offer naming two links before the relay peer: the relay peer and the first are dialled through.
+        let relays = vec![id(10).peer_id(), id(11).peer_id(), relay.peer_id()];
+        let o: Offer<SocketAddr> = Offer {
+            kind: Proof::Room,
+            reply: false,
+            role: Role::Peer,
+            nat: NatType::Symmetric,
+            ts: 0,
+            nonce: 3,
+            addrs: vec![],
+            predict: None,
+            relays,
+        };
+        let mut body = o.encode();
+        let joiner = id(4);
+        body.extend(mac(&key, &[b"pw-offer", joiner.peer_id().as_bytes(), me.as_bytes(), &body]));
+        while ep.poll_transmit(now).is_some() {}
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed::seal(&joiner, &me, [7; 32], &body).unwrap());
+        assert_eq!(dials(&mut ep, now), vec![at(30), at(10)]);
     }
 
     /// The offers `t` published, opened with `to`'s key and decoded.

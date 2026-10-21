@@ -270,6 +270,8 @@ pub struct NetOptions {
     pub privacy: Privacy,
     /// Ask the router to forward a port (PCP, NAT-PMP, UPnP). Default: off.
     pub port_mapping: bool,
+    /// Invites of always-on peers (`peerwire-peer`) to keep linked as relays.
+    pub relay_peers: Vec<String>,
     /// Tests: map through this fake gateway and SSDP address instead.
     #[cfg(test)]
     pub portmap_at: Option<(SocketAddr, SocketAddr)>,
@@ -278,7 +280,8 @@ pub struct NetOptions {
 impl NetOptions {
     /// Binds a node with these settings.
     pub fn bind(&self, addr: &str) -> io::Result<Node> {
-        let mut b = Node::builder().privacy(self.privacy).port_mapping(self.port_mapping);
+        let mut b =
+            Node::builder().privacy(self.privacy).port_mapping(self.port_mapping).relay_peers(self.relay_peers.clone());
         #[cfg(test)]
         if let Some((gateway, ssdp)) = self.portmap_at {
             b = b.port_mapping_at(gateway, ssdp);
@@ -487,6 +490,23 @@ impl Session {
     /// How router port mapping ([`NetOptions::port_mapping`]) stands.
     pub fn port_mapping(&self) -> PortMapping {
         self.node.port_mapping()
+    }
+
+    /// Keeps links to these always-on relay peers, by their invites (see
+    /// `Node::set_relay_peers`); fails, changing nothing, on a bad invite.
+    pub fn set_relay_peers(&mut self, invites: &[String]) -> Result<(), peerwire::Error> {
+        self.node.set_relay_peers(invites)
+    }
+
+    /// How many relay peers are linked now.
+    pub fn relay_peers_linked(&self) -> usize {
+        self.node.relay_peers().iter().filter(|(_, s)| *s == peerwire::Status::Connected).count()
+    }
+
+    /// Whether the link to Godot peer `id` goes through another peer (a relay
+    /// peer, or a peer linked to both): `None` if it isn't linked.
+    pub fn is_relayed(&self, id: i32) -> Option<bool> {
+        self.node.path(&self.ids.peer(id)?).map(|p| matches!(p, peerwire::Path::Via(_)))
     }
 
     /// Joiner: why the dial to the host failed, once it has.
@@ -1083,6 +1103,46 @@ mod tests {
         let mut host = Session::host(local());
         host.on_message(mallory, Lane::Reliable, &encode_assign(5));
         assert_eq!((host.unique_id(), host.available()), (HOST_ID, 0), "a host takes no id");
+    }
+
+    /// NB-041: a relay peer both sides keep linked is no player: the host
+    /// assigns it no id and a room client doesn't hang up on it.
+    #[test]
+    fn relay_peers_are_not_players() {
+        let hub = MemoryHub::new();
+        let mut relay = local();
+        let invite = vec![relay.invite()];
+        let net =
+            NetOptions { stun: Some(vec![]), relays: Some(vec![]), relay_peers: invite.clone(), ..Default::default() };
+        assert_eq!(net.bind("127.0.0.1:0").unwrap().relay_peers().len(), 1, "NetOptions passes them on");
+        let with_relay =
+            || Node::builder().signaling(hub.connect()).relay_peers(invite.clone()).bind("127.0.0.1:0").unwrap();
+        let mut host = Session::host_room(with_relay(), "pw-test", "relayed");
+        let mut joiner = Session::join_room(with_relay(), "pw-test", "relayed", None);
+        let mut relay_poll = move || {
+            relay.poll();
+            while relay.try_recv_event().is_some() {}
+            relay.peers().count()
+        };
+        assert!(pump(&mut [&mut host, &mut joiner], |s| {
+            relay_poll() == 2 && s[0].relay_peers_linked() == 1 && s[1].status() == Status::Connected
+        }));
+        pump(&mut [&mut host, &mut joiner], |_| false);
+        assert_eq!((host.relay_peers_linked(), joiner.relay_peers_linked()), (1, 1), "still linked");
+        let id = joiner.unique_id();
+        assert_eq!(host.peer_ids(), vec![id]);
+        // Only the joiner shows up (a simultaneous dial may replace its first link).
+        let events = drain_events(&mut host);
+        assert!(events.iter().all(|e| matches!(e, PeerEvent::Connected(i) | PeerEvent::Disconnected(i) if *i == id)));
+        assert_eq!(events.last(), Some(&PeerEvent::Connected(id)), "{events:?}");
+        assert_eq!(drain_events(&mut joiner), vec![PeerEvent::Connected(HOST_ID)]);
+        assert_eq!(
+            (joiner.is_relayed(HOST_ID), host.is_relayed(id), host.is_relayed(12345)),
+            (Some(false), Some(false), None)
+        );
+        assert!(joiner.set_relay_peers(&["pw:nope".into()]).is_err());
+        joiner.set_relay_peers(&[]).unwrap();
+        assert_eq!(joiner.relay_peers_linked(), 0);
     }
 
     #[test]

@@ -20,6 +20,9 @@ const MAX_SIGNALS_PER_POLL: usize = 256;
 const MAX_PENDING_SENDS: usize = 1024;
 /// Signaling carriers are polled, so a host sleeping on `next_timeout` wakes at least this often.
 const SIGNAL_POLL: Duration = Duration::from_millis(50);
+/// A relay peer that drops is dialled again at once, then after 1 s, 2 s, ... up to 30 s.
+const RELAY_REDIAL: Duration = Duration::from_secs(1);
+const RELAY_REDIAL_MAX: Duration = Duration::from_secs(30);
 
 /// Public STUN servers [`Node::bind`] asks for the node's public address.
 pub const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
@@ -65,6 +68,7 @@ pub struct Builder {
     port_mapping: bool,
     /// PCP/NAT-PMP server and SSDP target, instead of the default gateway's (tests).
     portmap_at: Option<(SocketAddr, SocketAddr)>,
+    relay_peers: Vec<String>,
 }
 
 impl Builder {
@@ -124,6 +128,14 @@ impl Builder {
         self
     }
 
+    /// Always-on peers to keep linked as relays, by their invites: see
+    /// [`Node::set_relay_peers`]. [`bind`](Builder::bind) fails with
+    /// [`ErrorKind::InvalidInput`] if one is not an invite. Default: none.
+    pub fn relay_peers<S: Into<String>>(mut self, invites: impl IntoIterator<Item = S>) -> Self {
+        self.relay_peers = invites.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Binds the UDP socket (`"0.0.0.0:0"` for any interface and a free port).
     pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
         let sock = UdpSocket::bind(addr)?;
@@ -156,9 +168,11 @@ impl Builder {
             port_mapping,
             portmap_at: self.portmap_at,
             releasing: None,
+            relay_peers: Vec::new(),
         };
         node.sync_port_mapping();
         node.pump_signals();
+        node.set_relay_peers(&self.relay_peers).map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
         Ok(node)
     }
 }
@@ -180,6 +194,16 @@ pub struct Node {
     portmap_at: Option<(SocketAddr, SocketAddr)>,
     /// A worker stopped by a switch to relay-only, deleting its mapping.
     releasing: Option<Worker>,
+    relay_peers: Vec<RelayPeer>,
+}
+
+/// An always-on peer kept linked as a relay ([`Node::set_relay_peers`]).
+struct RelayPeer {
+    invite: String,
+    peer: PeerId,
+    /// While unlinked, dial again from then; the wait after that doubles.
+    retry_at: Instant,
+    wait: Duration,
 }
 
 impl Node {
@@ -204,6 +228,7 @@ impl Node {
             privacy: Privacy::Direct,
             port_mapping: false,
             portmap_at: None,
+            relay_peers: Vec::new(),
         }
     }
 
@@ -327,6 +352,70 @@ impl Node {
         Ok(inv.peer)
     }
 
+    /// Keeps a link to each of these always-on peers (by their invites, such as
+    /// the one `peerwire-peer` prints), dialling one again when its link drops or
+    /// a dial fails, so that peers this node can't punch to (both behind
+    /// symmetric NATs, say) still link with it, through one both are linked to
+    /// ([`Path::Via`]). Offers name them first among this node's links. Direct
+    /// paths are still dialled too, and a relayed link moves to a direct path
+    /// when one turns out to work. Replaces the last list (links to peers no
+    /// longer on it are closed); empty stops. Fails, changing nothing, if one is
+    /// not an invite.
+    ///
+    /// Relay links carry no app traffic: they raise no [`Event`]s and are not in
+    /// [`peers`](Node::peers); [`relay_peers`](Node::relay_peers) shows them.
+    /// A room admits them, as peers this node dialled. Not dialled under
+    /// [`Privacy::RelayOnly`], which links through its own relay only.
+    pub fn set_relay_peers<S: AsRef<str>>(&mut self, invites: &[S]) -> Result<(), Error> {
+        let mut new: Vec<RelayPeer> = Vec::new();
+        for invite in invites {
+            let invite = invite.as_ref().trim();
+            let inv: Invite<SocketAddr> = Invite::parse(invite).ok_or(Error::InvalidInvite)?;
+            if inv.peer != self.peer_id() && new.iter().all(|r| r.peer != inv.peer) {
+                let now = Instant::now();
+                new.push(RelayPeer { invite: invite.to_string(), peer: inv.peer, retry_at: now, wait: RELAY_REDIAL });
+            }
+        }
+        for old in std::mem::take(&mut self.relay_peers) {
+            if new.iter().all(|r| r.peer != old.peer) {
+                self.ep.disconnect(&old.peer);
+                self.status.remove(&old.peer);
+            }
+        }
+        self.trav.set_relay_peers(new.iter().map(|r| r.peer).collect());
+        self.relay_peers = new;
+        self.poll(); // dials them
+        Ok(())
+    }
+
+    /// The relay peers set with [`set_relay_peers`](Node::set_relay_peers), and
+    /// where this node stands with each.
+    pub fn relay_peers(&self) -> Vec<(PeerId, Status)> {
+        self.relay_peers.iter().map(|r| (r.peer, self.status(&r.peer))).collect()
+    }
+
+    fn is_relay_peer(&self, peer: &PeerId) -> bool {
+        self.relay_peers.iter().any(|r| r.peer == *peer)
+    }
+
+    /// Dials the relay peers that are neither linked nor being dialled, once their wait is over.
+    fn keep_relay_links(&mut self, now: Instant) {
+        if matches!(self.privacy(), Privacy::RelayOnly { .. }) {
+            return;
+        }
+        for i in 0..self.relay_peers.len() {
+            let (peer, at) = (self.relay_peers[i].peer, self.relay_peers[i].retry_at);
+            if self.status(&peer) != Status::Disconnected || now < at {
+                continue;
+            }
+            let invite = self.relay_peers[i].invite.clone();
+            let _ = self.connect(&invite);
+            let r = &mut self.relay_peers[i];
+            r.retry_at = now + r.wait;
+            r.wait = (r.wait * 2).min(RELAY_REDIAL_MAX);
+        }
+    }
+
     /// Joins room `room` of application `app_id` on the signaling carrier, as a mesh
     /// [`Role::Peer`]: this node connects to every other peer in it, and keeps
     /// announcing itself for those that join later. Leaves any other room. Needs a
@@ -390,9 +479,9 @@ impl Node {
         self.status.get(peer).copied().unwrap_or(Status::Disconnected)
     }
 
-    /// Peers with a live link.
+    /// Peers with a live link, except [relay peers](Node::set_relay_peers).
     pub fn peers(&self) -> impl Iterator<Item = &PeerId> {
-        self.ep.connected_peers()
+        self.ep.connected_peers().filter(|p| !self.is_relay_peer(p))
     }
 
     /// RTT and loss for a connected peer.
@@ -426,6 +515,7 @@ impl Node {
     /// [`poll_at`](Node::poll_at), returning whether the socket was read until empty
     /// (`false` when the per-poll read cap stopped it first).
     pub(crate) fn poll_drained(&mut self, now: Instant) -> bool {
+        let wall = now;
         let now = self.at(now);
         if let Some(s) = self.portmap.as_ref().and_then(|w| w.poll()) {
             self.port_mapping = s;
@@ -478,8 +568,23 @@ impl Node {
             }
             self.trav.handle_event(now, &mut self.ep, &e);
             self.track(&e);
+            let subject = match &e {
+                Event::AddrObserved { by, .. } => by,
+                Event::Connected { peer, .. }
+                | Event::Message { peer, .. }
+                | Event::Disconnected { peer, .. }
+                | Event::PathChanged { peer, .. }
+                | Event::ConnectFailed { peer } => peer,
+            };
+            if let Some(r) = self.relay_peers.iter_mut().find(|r| r.peer == *subject) {
+                if matches!(e, Event::Connected { .. }) {
+                    r.wait = RELAY_REDIAL;
+                }
+                continue; // a relay link is the node's own business, not the app's
+            }
             self.events.push_back(e);
         }
+        self.keep_relay_links(wall);
         self.flush(now);
         self.pump_signals();
         drained
@@ -494,9 +599,14 @@ impl Node {
     /// sleeps should wake at this or when the socket is readable, whichever is first.
     /// With a signaling carrier it is at most 50 ms, as carriers are polled.
     pub fn next_timeout(&self) -> Option<Duration> {
-        let now = self.at(Instant::now());
+        let wall = Instant::now();
+        let now = self.at(wall);
         let t = [self.ep.poll_timeout(), self.trav.poll_timeout()].into_iter().flatten().min();
         let t = t.map(|t| t.saturating_duration_since(now));
+        let redial = self.relay_peers.iter().filter(|r| self.status(&r.peer) == Status::Disconnected);
+        let redial = redial.map(|r| r.retry_at.saturating_duration_since(wall)).min();
+        let redial = redial.filter(|_| !matches!(self.privacy(), Privacy::RelayOnly { .. }));
+        let t = [t, redial].into_iter().flatten().min();
         match self.signaling {
             Some(_) => Some(t.map_or(SIGNAL_POLL, |t| t.min(SIGNAL_POLL))),
             None => t,
