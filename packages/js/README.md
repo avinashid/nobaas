@@ -125,6 +125,7 @@ Types are in `src/index.d.ts`.
 | `demo/index.html` | Mesh chat on the low-level API: every tab links to every other. |
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
+| `demo/netlab.html` | Net Lab, a connection diagnostics page (not a game), mobile-friendly: join the global room or a private one shared as a `#key=` link, and every member links to every other. Per peer: ping measured on the route in use (min/avg/max, jitter, loss), the route (direct, relayed by a member, or over signalling), the ICE candidate pair (IPv4/IPv6, UDP/TCP), time to link and the other side's NAT. Also this device's public addresses, IPv6 and a NAT mapping estimate, the signalling relays' state, chat, an event log with warnings and errors, and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it at `/`. |
 | `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player, so a player needs a link to the host only. Network panel: per-peer RTT and route (ICE path, or the fallback). `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server; `?rtc=off` fails this tab's WebRTC links (testing the fallback). `demo/crew-server.mjs` serves it for hosting. |
 
 Signalling is untrusted by design: whatever carries the offers, the Peerwire Noise
@@ -234,6 +235,10 @@ Run these with Node and the Playwright install on this host:
   a report, a meeting with chat, the impostor voted out, then a second round won on tasks.
   `RTC_OFF=all` fails every WebRTC link, so the game runs over the signalling fallback;
   `RTC_OFF=1` fails tab 1's links only.
+- `node packages/js/test/netlab.mjs [tabs=3] [shot-prefix]`: opens `demo/netlab.html` in phone-sized tabs
+  joined by one `#key=` link: every tab links to every other, pings come back, chat arrives, the
+  report holds every peer and not the room key, and the page doesn't scroll sideways. `RTC_OFF=<i>`
+  fails tab i's WebRTC links: it is still reached, by fallback, and pinged.
 - `node packages/js/test/room_fallback.mjs`: a fake RTCPeerConnection blocks chosen
   pairs. A blocked pair links through a third member, or over signalling when there is
   none (a 100 KB message arrives whole), and stays apart with `fallback: 'peers'`/`'off'`.

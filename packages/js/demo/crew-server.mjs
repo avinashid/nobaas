@@ -1,9 +1,11 @@
-// Serves the JS package (demo/crew.html and what it imports) for hosting the
-// Crew demo somewhere other than this machine. It is only a file server: players
-// link peer to peer, and when WebRTC can't link two of them, joinRoom falls back
-// on its own (through another player, else over the Nostr relays). No dependencies.
+// Serves the JS package (the demos and what they import) for hosting them
+// somewhere other than this machine; `/` opens Net Lab (demo/netlab.html), the
+// connection diagnostics page, and demo/crew.html is the Crew game. It is only a
+// file server: peers link peer to peer, and when WebRTC can't link two of them,
+// joinRoom falls back on its own (through another peer, else over the Nostr
+// relays). No dependencies.
 //
-//   node packages/js/demo/crew-server.mjs [port=8000] [host=127.0.0.1]
+//   node packages/js/demo/crew-server.mjs [port=8000] [host=127.0.0.1] [start=/demo/netlab.html]
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -12,6 +14,7 @@ import path from 'node:path';
 
 const port = Number(process.argv[2] ?? 8000);
 const host = process.argv[3] ?? '127.0.0.1';
+const start = process.argv[4] ?? '/demo/netlab.html';
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const TYPES = {
@@ -22,7 +25,7 @@ const TYPES = {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/') {
-    res.writeHead(302, { location: '/demo/crew.html' });
+    res.writeHead(302, { location: start + url.search });
     return res.end();
   }
   const rel = path.normalize(decodeURIComponent(url.pathname));
@@ -42,4 +45,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, host, () => console.log(`crew: http://${host}:${port}/`));
+server.listen(port, host, () => console.log(`peerwire demos: http://${host}:${port}/ -> ${start}`));
