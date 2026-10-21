@@ -262,6 +262,8 @@ export declare function decodeEvent(bytes: Uint8Array): EndpointEvent;
 export declare function toHex(bytes: Uint8Array): string;
 /** Removes `host` candidates (LAN, loopback, mDNS) from an SDP. */
 export declare function withoutHostCandidates(sdp: string): string;
+/** Counts an SDP's ICE candidates by type and family; `mdns` are host candidates named `*.local`. */
+export declare function candidateSummary(sdp: string): { host4: number; host6: number; mdns: number; srflx4: number; srflx6: number; prflx: number; relay: number };
 export declare function fromHex(hex: string): Uint8Array;
 /** Whether `id` is a PeerId as text: 64 lowercase hex characters. Check ids from signalling with it. */
 export declare function isPeerId(id: unknown): id is PeerId;
@@ -298,10 +300,19 @@ export declare class WebRtcTransport implements Transport {
   readonly congested: number;
   /**
    * Signals refused: a `from` that isn't a PeerId or an empty message, an offer whose `offerProof` fails or whose
-   * SDP doesn't apply, or one that failed unexpectedly. Answers and ICE candidates that don't apply are not counted
-   * (copies and races are normal). The WebRTC counterpart of NostrSignaling's `stats.rejected`.
+   * SDP doesn't apply, an `ice-batch` that isn't a list of at most 32, or one that failed unexpectedly. Answers and
+   * ICE candidates that don't apply are not counted (copies and races are normal). The WebRTC counterpart of
+   * NostrSignaling's `stats.rejected`.
    */
   readonly badSignals: number;
+  /** Offers sent again for want of an answer, and answers sent again for a repeated offer. */
+  readonly resent: number;
+  /**
+   * Diagnostics: called for each link's signalling (`offer-sent`, `offer-received`, `answer-sent`, `answer-received`,
+   * `ice-batch-sent`, `ice-batch-received`, with `candidateSummary` counts and `resend: true` on a copy) and ICE
+   * (`ice-state` with `state`, `candidate-error` with the STUN server `url`, `code`, `text`, `address`).
+   */
+  trace: ((peer: PeerId, what: string, detail: Record<string, unknown>) => void) | null;
   dial(peer: PeerId): Promise<void>;
   has(peer: PeerId): boolean;
   drop(peer: PeerId): void;

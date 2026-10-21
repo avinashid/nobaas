@@ -66,6 +66,11 @@ try {
   const r = JSON.parse(rep);
   if (r.peers.filter((p) => p.linked).length !== tabs - 1 || !r.log.length || r.room.kind !== 'private' || !r.me.network) throw new Error(`bad report: ${rep.slice(0, 400)}`);
   if (rep.includes(key)) throw new Error('the report must not contain the private room key');
+  // Every linked peer's offer/answer exchange is traced, and its ICE checks recorded.
+  const traced = r.peers.filter((p) => p.linked && p.signaling.some((e) => /^(offer|answer)-/.test(e.what)));
+  if (traced.length !== tabs - 1) throw new Error(`signalling not traced for every peer: ${JSON.stringify(r.peers.map((p) => p.signaling))}`);
+  const checked = r.peers.filter((p) => p.iceChecks.length);
+  step(`report: signalling traced for ${traced.length} peers, ICE checks for ${checked.length}`);
   step(`report: ${r.peers.length} peers, ${r.log.length} log lines, no room key`);
 
   const shown = await pages[0].evaluate(() => ({ cards: document.querySelectorAll('.peer').length, wide: document.documentElement.scrollWidth }));
