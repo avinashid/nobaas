@@ -11,6 +11,8 @@
 //
 //   ?signal=local      BroadcastChannel signalling (tabs of one browser; tests)
 //   ?rtc=off           fail every WebRTC link of this tab, as behind a symmetric NAT
+//   ?gw=a,b            hotspot gateways tried for a phone sharing mobile data
+//                      (default 192.168.43.1); ?synth=off turns that off
 //   ?relays=wss://a,…  other Nostr relays
 //   ?name=…            the name; ?auto=global joins the global room
 //   #key=…             joins that private room (a hash, so it never reaches the server)
@@ -30,6 +32,10 @@ const HEARD_WARN_MS = 20000;
 const SLOW_MS = 400;
 
 const params = new URLSearchParams(location.search);
+// The usual Android hotspot gateway (192.168.43.1), or ?gw=a,b; tried for a peer
+// whose host address starts with HOTSPOT_FROM (the CLAT range; ?gwfrom= in tests).
+const HOTSPOT_GATEWAYS = (params.get('gw') ?? '192.168.43.1').split(',').map((s) => s.trim()).filter((s) => /^[\d.]+$/.test(s)).slice(0, 4);
+const HOTSPOT_FROM = params.get('gwfrom') ?? '192.0.0.';
 const $ = (id) => document.getElementById(id);
 const now = () => performance.now();
 const short = (id) => String(id).slice(0, 6);
@@ -333,7 +339,10 @@ function onTrace(peer, what, d) {
   }
   const text = SIG_TEXT[what]?.(d) ?? what;
   if (p.sig.length < 60) p.sig.push({ at, what, ...d });
-  if (what === 'offer-received' || what === 'answer-received') setTimeout(() => noteTheirHosts(p, peer), 500);
+  if (what === 'offer-received' || what === 'answer-received' || what === 'ice-batch-received') {
+    tryHotspot(p, peer);
+    setTimeout(() => { noteTheirHosts(p, peer); tryHotspot(p, peer); }, 500);
+  }
   const bad = d.resend || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'));
   log(bad ? 'warn' : 'info', `WebRTC with ${nameOf(peer)}: ${text}${at != null ? ` (${secs(at)} after hearing it)` : ''}`);
 }
@@ -477,6 +486,53 @@ function noteTheirHosts(p, peer) {
   if (typeof sdp !== 'string') return;
   const hosts = [...sdp.matchAll(/^a=candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ host/gm)].map((m) => m[1]).filter((h) => !h.endsWith('.local'));
   p.theirHosts = [...new Set(hosts)].slice(0, 8);
+}
+
+// A phone sharing its mobile data: Chrome on Android, without mic/camera
+// permission, lists no interfaces and offers only its mobile-data address, which
+// on IPv6-only carriers (Jio) is the CLAT one, 192.0.0.0/29. Its socket is bound to
+// every address, so the same port may answer on the hotspot side too: this adds a
+// candidate at the hotspot gateway with that port. The phone learns this side's
+// address from the first check that arrives (peer-reflexive), so the mDNS name it
+// can't resolve doesn't matter.
+function hotspotCandidates(sdp, gateways = HOTSPOT_GATEWAYS, from = HOTSPOT_FROM) {
+  if (typeof sdp !== 'string') return [];
+  const mid = /^a=mid:(\S+)/m.exec(sdp)?.[1] ?? '0';
+  const out = [];
+  const seen = new Set();
+  for (const m of sdp.matchAll(/^a=candidate:\S+ 1 udp \d+ (\S+) (\d+) typ host/gim)) {
+    if (!m[1].startsWith(from)) continue;
+    for (const gw of gateways) {
+      const key = `${gw}:${m[2]}`;
+      if (seen.has(key) || out.length >= 4) continue;
+      seen.add(key);
+      out.push({ candidate: `candidate:pwgw${out.length} 1 udp 1677729535 ${gw} ${m[2]} typ host generation 0`, sdpMid: mid, sdpMLineIndex: 0, gw: key });
+    }
+  }
+  return out;
+}
+
+const hotspotAdded = new WeakMap(); // pc -> the gateway:port candidates given to it
+async function tryHotspot(p, peer) {
+  if (params.get('synth') === 'off') return;
+  const pc = room?.transport?.links?.get(room.transport.byPeer?.get(peer))?.pc;
+  if (!pc) return;
+  const added = hotspotAdded.get(pc) ?? new Set();
+  hotspotAdded.set(pc, added);
+  const fresh = [];
+  for (const { gw, ...c } of hotspotCandidates(pc.remoteDescription?.sdp)) {
+    if (added.has(gw)) continue;
+    added.add(gw);
+    try {
+      await pc.addIceCandidate(c);
+      fresh.push(gw);
+    } catch (e) {
+      warnOnce(p, `gw ${gw}`, `could not add hotspot address ${gw}: ${e.message}`);
+    }
+  }
+  if (!fresh.length) return;
+  p.hotspot = [...new Set([...(p.hotspot ?? []), ...fresh])].slice(0, 8);
+  log('info', `${nameOf(peer)} looks like a phone sharing mobile data: also trying its hotspot address ${fresh.join(', ')}`);
 }
 
 // The offer/answer exchange, as "offer sent 0.2 s · answer received 1.9 s · 1 resend".
@@ -677,7 +733,7 @@ function report() {
       coreRttMs: room?.peers.includes(p.id) ? room.rtt(p.id) : null, webrtc: p.ice,
       heardToRtcMs: p.heardAt && p.rtcOpenAt ? Math.round(p.rtcOpenAt - p.heardAt) : null,
       heardToJoinMs: p.heardAt && p.joinedAt ? Math.round(p.joinedAt - p.heardAt) : null,
-      signaling: p.sig, theirHosts: p.theirHosts ?? [], iceChecks: [...p.pairs.values()],
+      signaling: p.sig, theirHosts: p.theirHosts ?? [], hotspotTried: p.hotspot ?? [], iceChecks: [...p.pairs.values()],
       rtcFailed: !!p.rtcFailedAt, left: p.leftAt ? p.leaveReason : null,
     })),
     log: events.map((e) => ({ t: new Date(e.at).toISOString(), level: e.level, msg: e.msg })),
@@ -740,6 +796,7 @@ window.netlab = {
   say: (text) => { $('chatin').value = text; $('chatform').requestSubmit(); },
   chat: () => chat.map((c) => `${c.from}: ${c.text}`),
   report,
+  hotspotCandidates,
   joinGlobal: () => enter('global'),
   joinPrivate: (key) => enter('private', key ?? randomRoomId()),
 };

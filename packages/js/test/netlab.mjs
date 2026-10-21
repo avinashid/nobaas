@@ -7,6 +7,8 @@
 //
 // RTC_OFF=<i> fails tab i's WebRTC links (?rtc=off): it must still be reached,
 // relayed by a member or over the signalling fallback, with pings on that route.
+// Tab 0 treats every 10.x/172.x/192.168.x host as a phone sharing mobile data
+// (?gwfrom=), so it adds a synthesized 127.0.0.1 hotspot candidate per peer.
 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +23,10 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const port = 8765 + Math.floor(Math.random() * 1000);
 const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
 const step = (s) => console.log(`ok: ${s}`);
+// The first octets of this machine's LAN address, as its host candidates show it.
+const { networkInterfaces } = await import('node:os');
+const lan = Object.values(networkInterfaces()).flat().find((a) => a?.family === 'IPv4' && !a.internal)?.address ?? '10.0.0.1';
+const HOST_FROM = lan.split('.').slice(0, 2).join('.') + '.';
 let browser;
 let ok = false;
 try {
@@ -33,7 +39,7 @@ try {
   for (let i = 0; i < tabs; i++) {
     const p = await ctx.newPage();
     p.on('pageerror', (e) => errors.push(`tab ${i}: ${e.message}`));
-    const q = new URLSearchParams({ signal: 'local', name: `n${i}`, ...(off === String(i) && { rtc: 'off' }) });
+    const q = new URLSearchParams({ signal: 'local', name: `n${i}`, ...(off === String(i) && { rtc: 'off' }), ...(i === 0 && { gw: '127.0.0.1', gwfrom: HOST_FROM }) });
     await p.goto(`http://127.0.0.1:${port}/demo/netlab.html?${q}#key=${key}`);
     pages.push(p);
   }
@@ -75,6 +81,27 @@ try {
   if (!r.peers.every((p) => Array.isArray(p.theirHosts))) throw new Error('theirHosts missing from the report');
   step(`report: their LAN addresses ${JSON.stringify(r.peers.map((p) => p.theirHosts))}`);
   step(`report: ${r.peers.length} peers, ${r.log.length} log lines, no room key`);
+
+  // Hotspot synthesis: only for a CLAT host (192.0.0.0/29 by default), UDP, one per gateway and port.
+  const synth = await pages[0].evaluate(() => {
+    const h = window.netlab.hotspotCandidates;
+    const sdp = 'v=0\r\na=mid:0\r\na=candidate:1 1 udp 2122260223 192.0.0.4 51796 typ host generation 0\r\n'
+      + 'a=candidate:2 1 udp 2122262783 2409:40d0::1 51797 typ host generation 0\r\na=candidate:3 1 tcp 1518280447 192.0.0.4 9 typ host tcptype active\r\n'
+      + 'a=candidate:4 1 udp 2122260223 192.0.0.4 51796 typ host generation 0\r\na=candidate:5 1 udp 1686052607 157.49.1.2 40000 typ srflx raddr 192.0.0.4 rport 51796\r\n';
+    return { clat: h(sdp, ['192.168.43.1'], '192.0.0.'), lan: h(sdp.replaceAll('192.0.0.4', '192.168.1.5'), ['192.168.43.1'], '192.0.0.'), none: h(null) };
+  });
+  if (synth.clat.length !== 1 || !synth.clat[0].candidate.includes(' 192.168.43.1 51796 typ host') || synth.clat[0].sdpMid !== '0' || synth.lan.length || synth.none.length) {
+    throw new Error(`hotspotCandidates wrong: ${JSON.stringify(synth)}`);
+  }
+  step(`hotspot candidate from a CLAT host: ${synth.clat[0].candidate}`);
+  // Only peers whose LAN address came through (not a tab with WebRTC off).
+  if (off !== '0') {
+    const r0 = await pages[0].evaluate(() => window.netlab.report());
+    const want = r0.peers.filter((p) => p.theirHosts.some((h) => h.startsWith(HOST_FROM)));
+    const tried = want.filter((p) => p.hotspotTried.some((g) => g.startsWith('127.0.0.1:')));
+    if (!want.length || tried.length !== want.length) throw new Error(`tab 0 did not add a hotspot candidate for every peer: ${JSON.stringify(r0.peers.map((p) => [p.theirHosts, p.hotspotTried]))}`);
+    step(`tab 0 (gwfrom=${HOST_FROM}) added hotspot candidates ${JSON.stringify(tried.map((p) => p.hotspotTried))}, links still up`);
+  }
 
   const shown = await pages[0].evaluate(() => ({ cards: document.querySelectorAll('.peer').length, wide: document.documentElement.scrollWidth }));
   if (shown.cards !== tabs - 1) throw new Error(`expected ${tabs - 1} peer cards, got ${shown.cards}`);
