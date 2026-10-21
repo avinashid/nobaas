@@ -181,9 +181,9 @@ prediction with step 0 or above 8 is dropped.
 
   The nonce is stored only for an offer that passes all of them, and at most 1024 are kept. The node then dials
   every candidate that is *dialable* and not one of its own addresses, plus `Via(r)` for up to 2 listed peers it
-  is itself connected to. If already linked, it calls `add_candidates` instead (punching a relayed link). If
-  `reply=1`, it answers with its own offer (`reply=0`). A relay-only node instead dials anyone but its relay as
-  `Via(relay)` only (see below).
+  is itself connected to, its own [relay peers](#relay-peers) first. If already linked, it calls `add_candidates`
+  instead (punching a relayed link). If `reply=1`, it answers with its own offer (`reply=0`). A relay-only node
+  instead dials anyone but its relay as `Via(relay)` only (see below).
 - **Dialable addresses.** Never port 0, unspecified, multicast or broadcast. Never loopback (including
   `::ffff:127.0.0.1`), unless the node is itself bound to loopback. The same filter applies to addresses peers
   report seeing (`AddrObserved`) and to STUN answers. An offer can't aim a node at services on its own host.
@@ -208,6 +208,40 @@ prediction with step 0 or above 8 is dropped.
   `Display` is a sentence for users, such as "the peer's NAT is symmetric (a new public port per destination)
   and this side's router only lets in packets from ports it has sent to, so hole punching can't work, and no
   peer linked to both could relay". Godot shows it as `get_connect_error_message()`.
+
+## Relay peers
+
+Two peers that can't punch (two symmetric NATs, as on many phone hotspots and carrier NATs, or a random-port
+symmetric NAT against a port-restricted cone) link through a peer both are linked to. In a Godot star or a room of
+two there is no such peer, so `Node::set_relay_peers(&[invite])` (or `Builder::relay_peers`, Godot
+`set_relay_peers`) adds one: an always-on peer such as [`peerwire-peer`](../crates/peerwire-peer), by its invite
+(NB-041). There is still no TURN server: a relay peer is an ordinary Peerwire node that forwards sealed packets
+with the core's peer relay.
+
+- **The link.** `Node` dials each relay peer when the list is set and keeps the link. When it drops, or a dial
+  fails, it dials again at once, then after 1 s, 2 s, 4 s, ... up to every 30 s; `next_timeout` wakes the host for
+  it. Setting a new list closes links to peers no longer on it.
+- **Out of the app's sight.** Relay links raise no events and are not in `Node::peers`; `Node::relay_peers` shows
+  them with their status. The Godot binding never takes a relay peer for a player. A relay peer is dialled from an
+  invite, so a room admits it like any peer the node dialled.
+- **Used first, direct still tried.** Offers name the node's linked relay peers first among its links (at most 8
+  are named), and a dial tries the node's own relay peers first among the relays an offer names (up to 2). The
+  direct candidates are dialled alongside, and the core moves a relayed link to a direct path when one starts
+  working, as for any relayed link.
+- **Not under `RelayOnly`**, which links through its own relay only: relay peers are not dialled then.
+- **Rate.** A relay peer forwards at most `Config::relay_rate` per requesting peer (`PEERWIRE_RELAY_RATE`,
+  256 KiB/s by default) and `PEERWIRE_RELAY_TOTAL` (8 MiB/s in `peerwire-peer`) for all together. The per-peer
+  budget is the sum over everything one player sends through it, to every peer: **theoretical**
+  262144 B/s ÷ 60 ticks ≈ 4.3 KB per tick at 60 Hz. In the simulator two `sym-random` peers relay 1 KB unreliable
+  every 10 ms each way (about 100 KB/s, 5 s) with every packet delivered and no relay drops:
+  `cargo test -p peerwire-sim --release --test traversal symmetric_pair_links_through_a_relay_peer -- --nocapture`.
+  A host relaying snapshots to many players can need more: raise `PEERWIRE_RELAY_RATE`.
+- **Cost.** Latency `rtt(A,R) + rtt(R,B)`, so run the relay peer near the players, and its upload carries every
+  relayed byte again.
+- **What a relay peer learns**: each linked node's IP and port, the PeerIds of the pairs it relays between, and
+  their packets' sizes and timing. It can't read or forge them (they are sealed end to end), but it can drop or
+  delay them, and it can refuse to relay. A node names its relay peers in offers to room members and to peers it
+  dialled, as it names any link.
 
 ## Privacy modes
 
