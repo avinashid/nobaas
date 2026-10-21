@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peerwire: Crew</title>
+<style>
+  :root { color-scheme: dark; --bg: #0f1117; --panel: #181b24; --line: #2a2f3d; --text: #e6e8ee; --dim: #8b91a3; --red: #e5484d; --green: #46a758; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans-serif; display: flex; gap: 16px; padding: 16px; justify-content: center; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  p { margin: 0 0 12px; color: var(--dim); }
+  main { position: relative; width: 960px; height: 600px; flex: none; }
+  canvas { width: 960px; height: 600px; display: block; background: #05060a; border: 1px solid var(--line); border-radius: 12px; }
+  aside { width: 300px; font-size: 13px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+  .card h2 { font-size: 13px; margin: 0 0 6px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  input, button { font: inherit; color: var(--text); background: #222634; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--dim); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.danger { background: #4a1a1c; border-color: var(--red); }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .row input { flex: 1; min-width: 0; }
+  .overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(5, 6, 10, .82); border-radius: 12px; }
+  .overlay .card { width: 520px; max-height: 560px; overflow: auto; }
+  .hidden { display: none !important; }
+  #actions { position: absolute; right: 12px; bottom: 12px; display: flex; gap: 8px; }
+  #actions button { padding: 10px 16px; font-weight: 600; }
+  #hud { position: absolute; left: 12px; top: 10px; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  #bar { width: 220px; height: 10px; background: #222634; border-radius: 5px; overflow: hidden; margin-top: 4px; }
+  #bar div { height: 100%; width: 0; background: var(--green); }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { padding: 2px 0; }
+  .dim { color: var(--dim); }
+  .vote { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
+  #chatlog { height: 120px; overflow: auto; background: #10131b; border-radius: 8px; padding: 6px; margin: 8px 0; }
+  code { color: var(--text); }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+</style>
+<main>
+  <canvas id="view" width="960" height="600"></canvas>
+  <div id="hud"></div>
+  <div id="actions" class="hidden">
+    <button id="use" title="E">Use (E)</button>
+    <button id="report" title="R">Report (R)</button>
+    <button id="kill" class="danger hidden" title="Q">Kill (Q)</button>
+  </div>
+  <div id="lobby" class="overlay">
+    <div class="card">
+      <h1>Crew</h1>
+      <p>A tiny Among Us over Peerwire: no game server. Players find each other through Nostr relays and connect by WebRTC; the host runs the game.</p>
+      <div class="row"><input id="name" placeholder="your name" maxlength="14"></div>
+      <div class="row"><input id="code" placeholder="room code (share it with friends)" maxlength="40"><button id="random">random</button></div>
+      <div class="row"><button id="host">Host a game</button><button id="join">Join</button></div>
+      <p id="lobbymsg" class="dim"></p>
+    </div>
+  </div>
+  <div id="wait" class="overlay hidden">
+    <div class="card">
+      <h1 id="waittitle">Waiting room</h1>
+      <p id="waitmsg"></p>
+      <ul id="roster"></ul>
+      <div class="row" style="margin-top:12px"><button id="start" class="hidden">Start game</button></div>
+    </div>
+  </div>
+  <div id="meeting" class="overlay hidden">
+    <div class="card">
+      <h1 id="meettitle">Meeting</h1>
+      <p id="meetmsg"></p>
+      <div id="votes"></div>
+      <div id="chatlog"></div>
+      <form id="chat" class="row"><input id="say" autocomplete="off" placeholder="say something" maxlength="120"><button>Send</button></form>
+    </div>
+  </div>
+  <div id="over" class="overlay hidden">
+    <div class="card"><h1 id="overtitle"></h1><p id="overmsg"></p><button id="again" class="hidden">Back to the waiting room</button></div>
+  </div>
+</main>
+<aside>
+  <div class="card"><h2>You</h2><div id="me" class="dim">not in a room</div></div>
+  <div class="card"><h2>Network</h2><div id="net" class="dim">not in a room</div></div>
+  <div class="card"><h2>How to play</h2>
+    <p>WASD or arrows to move. Crew: walk to your yellow task spots and hold <b>E</b>. Impostor: <b>Q</b> next to someone to kill (20 s cooldown). Anyone: <b>R</b> next to a body, or <b>E</b> at the red button in the cafeteria, calls a meeting. Vote someone out.</p>
+    <p>Crew wins when every task is done or the impostor is voted out. The impostor wins when it equals the crew.</p>
+  </div>
+  <div class="card"><h2>Log</h2><ul id="log" class="dim"></ul></div>
+</aside>
+<script type="module" src="crew.js"></script>
+</html>
