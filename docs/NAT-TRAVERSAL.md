@@ -225,7 +225,10 @@ prediction with step 0 or above 8 is dropped.
 - **Dialable addresses.** Never port 0, unspecified, multicast or broadcast. Never loopback (including
   `::ffff:127.0.0.1`), unless the node is itself bound to loopback. The same filter applies to addresses peers
   report seeing (`AddrObserved`) and to STUN answers. An offer can't aim a node at services on its own host.
-  Addresses of a family the socket can't send to are skipped too (`Traversal::reaches`).
+  Addresses of a family the socket can't send to are skipped too (`Traversal::reaches`). Offered and observed
+  `::ffff:a.b.c.d` addresses count as `a.b.c.d`, so a mapped copy of the node's own LAN address is not dialled
+  and an observed one is not kept twice. A NAT64 address (`64:ff9b::/96`) is judged by the IPv4 address it
+  embeds: `64:ff9b::127.0.0.1` is loopback.
 - **Invites.** `Node::connect` dials the invite's addresses, then sends the host a version-3 offer (proved with
   the invite's key) with `reply=1`, so the host dials back at the same time. An invite without a key (version 1)
   still dials, but gets no dial-back. A host that is announcing in a room turns away invite

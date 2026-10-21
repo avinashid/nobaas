@@ -606,6 +606,7 @@ impl<A: Address> Traversal<A> {
             }
             Event::Disconnected { peer, .. } if self.picked == Some(*peer) => self.picked = None,
             Event::AddrObserved { addr, .. } => {
+                let addr = &canonical(addr.clone());
                 let real = dialable(addr, false); // a peer that sees us on loopback is on this host
                 if real && !self.observed.contains(addr) && !self.local.contains(addr) {
                     if self.observed.len() >= MAX_OBSERVED {
@@ -718,7 +719,8 @@ impl<A: Address> Traversal<A> {
     }
 
     /// An offer that opened, and whose room proof (in a room) checked out.
-    fn on_offer(&mut self, now: Instant, ep: &mut Endpoint<A>, from: PeerId, o: Offer<A>) {
+    fn on_offer(&mut self, now: Instant, ep: &mut Endpoint<A>, from: PeerId, mut o: Offer<A>) {
+        o.addrs = o.addrs.into_iter().map(canonical).collect(); // `::ffff:` copies compare as the IPv4 address
         let room = o.kind == Proof::Room;
         let role_ok = if room { self.links_with(&from, o.role) } else { from != self.id };
         if !role_ok || self.wall_ms(now).abs_diff(o.ts) > FRESH_MS || self.nonces.contains_key(&(from, o.nonce)) {
@@ -875,13 +877,29 @@ fn allowed(mine: Option<Role>, theirs: Role) -> bool {
     )
 }
 
+/// `a` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as the plain IPv4 one.
+fn canonical<A: Address>(a: A) -> A {
+    match a.to_socket_addr() {
+        Some(s) if s.ip().to_canonical() != s.ip() => {
+            A::from_socket_addr(std::net::SocketAddr::new(s.ip().to_canonical(), s.port())).unwrap_or(a)
+        }
+        _ => a,
+    }
+}
+
 /// Whether an address from a peer or STUN is worth dialling: never port 0, an
 /// unspecified, multicast, broadcast or link-local address, and loopback only for a
 /// node bound to loopback (so an offer can't aim a node at services on its own host).
+/// A NAT64 address (`64:ff9b::/96`) is judged by the IPv4 address it embeds.
 fn dialable<A: Address>(a: &A, loopback: bool) -> bool {
     use std::net::IpAddr;
     let Some(s) = a.to_socket_addr() else { return true };
-    let ip = s.ip().to_canonical();
+    let ip = match s.ip().to_canonical() {
+        IpAddr::V6(v) if v.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0] => {
+            IpAddr::V4(std::net::Ipv4Addr::from_bits(v.to_bits() as u32))
+        }
+        ip => ip,
+    };
     let special = match ip {
         IpAddr::V4(v) => v.is_broadcast() || v.is_link_local(),
         IpAddr::V6(v) => v.segments()[0] & 0xffc0 == 0xfe80,
@@ -1445,7 +1463,7 @@ mod tests {
         };
         assert_eq!(run("10.0.0.1:7000"), vec!["198.51.100.7:9".parse().unwrap()]);
         let on_lo = run("127.0.0.1:7000");
-        assert!(on_lo.contains(&"127.0.0.1:5".parse().unwrap()) && on_lo.len() == 3, "{on_lo:?}");
+        assert_eq!(on_lo, vec!["127.0.0.1:5".parse().unwrap(), "198.51.100.7:9".parse().unwrap()], "::ffff: folded in");
         // Observed addresses are filtered the same way.
         let ia = id(1);
         let mut ep = Endpoint::new(&ia, Config::default(), [1; 32]);
@@ -1454,6 +1472,47 @@ mod tests {
             t.handle_event(now, &mut ep, &Event::AddrObserved { by: id(2).peer_id(), addr: *a });
         }
         assert_eq!(t.candidates(), vec!["198.51.100.7:9".parse().unwrap(), "10.0.0.1:7000".parse().unwrap()]);
+    }
+
+    /// NB42-I1: an IPv4-mapped copy (`::ffff:a.b.c.d`) of an address counts as
+    /// that address: an offer can't make a node dial its own LAN address that
+    /// way, nor an observation add a second copy of one it has.
+    #[test]
+    fn mapped_addresses_count_as_ipv4() {
+        let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        let (me, now) = (id(1).peer_id(), Instant::from_millis(10));
+        let (lan, public) = (at("10.0.0.1:7000"), at("198.51.100.7:9"));
+        let local = vec![lan, at("[2001:db8::1]:7000")];
+        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+        let mut t = Traversal::new(&id(1), [3; 32], 0, local.clone(), vec![]);
+        let k = t.invite_key();
+        let o = proved_offer(&id(2), &me, Some((Proof::Invite, &k)), 1, Role::Peer, vec![at("[::ffff:10.0.0.1]:7000")]);
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &o);
+        assert_eq!(dials(&mut ep, now), vec![], "our own LAN address");
+        let o =
+            proved_offer(&id(3), &me, Some((Proof::Invite, &k)), 2, Role::Peer, vec![at("[::ffff:198.51.100.7]:9")]);
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &o);
+        assert_eq!(dials(&mut ep, now), vec![public], "dialled as IPv4");
+
+        for a in ["[::ffff:198.51.100.7]:9", "198.51.100.7:9", "[::ffff:10.0.0.1]:7000"] {
+            t.handle_event(now, &mut ep, &Event::AddrObserved { by: id(2).peer_id(), addr: at(a) });
+        }
+        assert_eq!(t.candidates(), [vec![public], local].concat());
+    }
+
+    /// NB42-I2: a NAT64 address (`64:ff9b::/96`) is dialled only if the IPv4
+    /// address it embeds would be.
+    #[test]
+    fn nat64_addresses_are_judged_by_their_ipv4_address() {
+        let ok = |s: &str, lo: bool| dialable(&s.parse::<SocketAddr>().unwrap(), lo);
+        for a in ["[64:ff9b::c633:6407]:9", "[64:ff9b::a00:1]:9", "[2001:db8::7f00:1]:9"] {
+            assert!(ok(a, false), "{a}");
+        }
+        for a in ["[64:ff9b::7f00:1]:9", "[64:ff9b::a9fe:101]:9", "[64:ff9b::ffff:ffff]:9", "[64:ff9b::e000:1]:9"] {
+            assert!(!ok(a, false), "{a}");
+        }
+        assert!(!ok("[64:ff9b::]:9", true), "embeds 0.0.0.0");
+        assert!(ok("[64:ff9b::7f00:1]:9", true), "loopback between loopback nodes, as for IPv4");
     }
 
     /// Links `ep` (at `at`) with a fresh endpoint for `peer` (at `peer_at`), in memory.
