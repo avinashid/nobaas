@@ -819,8 +819,10 @@ impl<A: Address> Traversal<A> {
         // dialled; anyone else, such as a stranger holding our invite, gets public
         // addresses only, even after its dial failed (a holder can make that happen).
         // Relay fallback for it still works: it names its links, and we dial through
-        // whichever of them we link with (`handle_event`).
+        // whichever of them we link with (`handle_event`). A relay peer gets our
+        // addresses (a LAN relay is dialled on them) but not who else we link with.
         let full = room || self.remotes.get(&to).is_some_and(|r| r.invited);
+        let named = !self.relay_peers.contains(&to);
         let (addrs, relays) = match self.privacy {
             Privacy::RelayOnly { .. } => {
                 let relay = self.relay().filter(|r| *r != to && ep.is_connected(r));
@@ -829,7 +831,7 @@ impl<A: Address> Traversal<A> {
             _ if full => {
                 let ours = self.relay_peers.iter().filter(|p| ep.is_connected(p));
                 let others = ep.connected_peers().filter(|p| !self.relay_peers.contains(p));
-                let links = ours.chain(others).filter(|p| **p != to).take(MAX_RELAYS);
+                let links = ours.chain(others).filter(|p| **p != to && named).take(MAX_RELAYS);
                 (self.candidates_for(&to), links.copied().collect())
             }
             _ => (self.addresses(true), Vec::new()),
@@ -1641,7 +1643,8 @@ mod tests {
 
     /// NB-041: a relay peer is named first in offers, though it linked last and
     /// the node has more links than an offer names, and is tried first among the
-    /// relays an offer names, though that offer lists it last.
+    /// relays an offer names, though that offer lists it last. An offer to the
+    /// relay peer itself names no links, only addresses (NB41-1).
     #[test]
     fn relay_peers_come_first_in_offers_and_dials() {
         let me = id(1).peer_id();
@@ -1686,6 +1689,11 @@ mod tests {
         while ep.poll_transmit(now).is_some() {}
         t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed::seal(&joiner, &me, [7; 32], &body).unwrap());
         assert_eq!(dials(&mut ep, now), vec![at(30), at(10)]);
+
+        // The relay peer itself learns none of our links, but our LAN address (a relay on the LAN).
+        t.handle_signal(now, &mut ep, Topic::peer(&me), &offer_from(&relay, &me, Some(&key), 4, Role::Peer, vec![]));
+        let o = sent_offers(&mut t, &relay).remove(0);
+        assert_eq!((o.relays, o.addrs.contains(&lan)), (vec![], true));
     }
 
     /// NB-042: an offer's addresses are dialled only in the families the socket

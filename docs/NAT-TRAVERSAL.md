@@ -259,7 +259,9 @@ with the core's peer relay.
 
 - **The link.** `Node` dials each relay peer when the list is set and keeps the link. When it drops, or a dial
   fails, it dials again at once, then after 1 s, 2 s, 4 s, ... up to every 30 s; `next_timeout` wakes the host for
-  it. Setting a new list closes links to peers no longer on it.
+  it. The wait starts over at 1 s only once a link has held for 30 s, so a relay peer that hangs up on every link
+  costs a handshake and an offer every 30 s, not every second. Setting a new list closes links to peers no longer
+  on it.
 - **Out of the app's sight.** Relay links raise no events and are not in `Node::peers`; `Node::relay_peers` shows
   them with their status. The Godot binding never takes a relay peer for a player. A relay peer is dialled from an
   invite, so a room admits it like any peer the node dialled.
@@ -267,7 +269,9 @@ with the core's peer relay.
   are named), and a dial tries the node's own relay peers first among the relays an offer names (up to 2). The
   direct candidates are dialled alongside, and the core moves a relayed link to a direct path when one starts
   working, as for any relayed link.
-- **Not under `RelayOnly`**, which links through its own relay only: relay peers are not dialled then.
+- **Not under `RelayOnly`**, which links through its own relay only: relay peers are not dialled then, and
+  `Node::set_privacy` to `RelayOnly` closes the relay-peer links already up (not the one to its own relay, if that
+  is a relay peer). Switching out of it dials them again.
 - **Rate.** A relay peer forwards at most `Config::relay_rate` per requesting peer (`PEERWIRE_RELAY_RATE`,
   256 KiB/s by default) and `PEERWIRE_RELAY_TOTAL` (8 MiB/s in `peerwire-peer`) for all together. The per-peer
   budget is the sum over everything one player sends through it, to every peer: **theoretical**
@@ -280,7 +284,9 @@ with the core's peer relay.
 - **What a relay peer learns**: each linked node's IP and port, the PeerIds of the pairs it relays between, and
   their packets' sizes and timing. It can't read or forge them (they are sealed end to end), but it can drop or
   delay them, and it can refuse to relay. A node names its relay peers in offers to room members and to peers it
-  dialled, as it names any link.
+  dialled, as it names any link. The offers a node sends a relay peer name none of its links, but they carry its
+  addresses as its privacy mode allows, so that a relay on the LAN or loopback still links: under `Direct` the
+  relay peer learns the node's **LAN addresses** too (`PublicOnly` hides them).
 
 ## Privacy modes
 
