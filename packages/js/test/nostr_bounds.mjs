@@ -162,8 +162,12 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
     `the reopened relay subscribes again and onReconnect fires (${JSON.stringify(back)}, open ${s6.stats.relaysOpen})`);
   await s6.publish(s6.roomTag, 'e30=');
   check(a3.sent.some((m) => m.startsWith('["EVENT"')) && made[0].sent.every((m) => !m.startsWith('["EVENT"')), 'events go to the new socket, not the dead one');
-  s6.redial(true); // a network change: open sockets may be on the old network
-  check(made.length === 6 && s6.stats.relaysOpen === 0 && made.slice(-2).map((w) => w.url).sort().join() === 'wss://a,wss://b', 'a network change redials every relay at once');
+  // Chrome's connection 'change' also fires on a new speed estimate: open sockets stay.
+  s6.wake({ type: 'change' });
+  s6.wake({ type: 'visibilitychange' });
+  check(made.length === 4 && s6.stats.relaysOpen === 2 && s6.stats.reconnects === 1, `a connection change or the page showing leaves open relays alone (${made.length} sockets made)`);
+  s6.wake({ type: 'online' }); // back online: open sockets may be on the old network
+  check(made.length === 6 && s6.stats.relaysOpen === 0 && made.slice(-2).map((w) => w.url).sort().join() === 'wss://a,wss://b', 'going online redials every relay at once');
   made.slice(-2).forEach((w) => w.open());
   check(s6.stats.relaysOpen === 2 && s6.sockets.length === 2, `after it, both are open again with one socket each (${s6.sockets.length})`);
   s6.close();
