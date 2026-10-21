@@ -568,6 +568,10 @@ impl RelRecv {
         max_message: usize,
         out: &mut Vec<Vec<u8>>,
     ) -> Result<(), ()> {
+        // Every sender cuts at FRAGMENT; a larger one would buffer past the bound.
+        if data.len() > FRAGMENT {
+            return Err(());
+        }
         self.ack_pending = true;
         if seq < self.next || seq - self.next >= self.window || self.buf.contains_key(&seq) {
             return Ok(());

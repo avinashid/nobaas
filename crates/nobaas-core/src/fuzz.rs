@@ -592,12 +592,13 @@ fn hostile_peer_pins_bounded_receive_memory() {
     net.nodes[m].1.connect(net.now, Net::addr(a), ids[a]).unwrap();
     net.settle();
     assert!(net.connected(a, m, &ids));
-    let send = |net: &mut Net, urgent: bool, seq: u32| {
+    let send_len = |net: &mut Net, urgent: bool, seq: u32, len: usize| {
         let mut pt = Vec::new();
-        wire::put_reliable(&mut pt, seq, false, &[seq as u8; FRAGMENT], urgent);
+        wire::put_reliable(&mut pt, seq, false, &vec![seq as u8; len], urgent);
         let pkt = net.nodes[m].1.seal_raw(&ids[a], &pt).unwrap();
         net.nodes[a].1.handle_datagram(net.now, Net::addr(m), &pkt);
     };
+    let send = |net: &mut Net, urgent: bool, seq: u32| send_len(net, urgent, seq, FRAGMENT);
     let mut bound = [0; 2];
     for (u, urgent, window, max) in
         [(0, false, RECV_WINDOW, Config::default().max_message), (1, true, URGENT_RECV_WINDOW, MAX_URGENT)]
@@ -631,4 +632,17 @@ fn hostile_peer_pins_bounded_receive_memory() {
     net.settle();
     let got = |e: &Event<SocketAddr>| matches!(e, Event::Message { data, .. } if data.len() == MAX_URGENT);
     assert!(net.events.iter().any(|(n, e)| *n == a && got(e)));
+
+    // A fragment longer than FRAGMENT, which the parser would accept, is a
+    // violation on either stream, so the bound above holds.
+    for urgent in [false, true] {
+        net.nodes[m].1.disconnect(&ids[a]);
+        net.nodes[m].1.connect(net.now, Net::addr(a), ids[a]).unwrap();
+        net.settle();
+        assert!(net.connected(a, m, &ids));
+        net.events.clear();
+        send_len(&mut net, urgent, 1, FRAGMENT + 1);
+        net.deliver();
+        assert!(net.events.iter().any(|(n, e)| *n == a && dropped(e)), "urgent {urgent}");
+    }
 }
