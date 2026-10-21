@@ -62,7 +62,7 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `get_invite() -> String` | This peer's invite again (public address first, once STUN answered) |
 | `get_public_address() -> String` | `ip:port` STUN reported, `""` until a server answers |
 | `get_nat_type() -> String` | `open`, `cone`, `symmetric` or `unknown` (needs answers from two STUN servers). `cone` doesn't promise a punch: see [Through NATs](#through-nats) |
-| `get_connect_error() -> String` | After `connection_failed`: `symmetric` (one side's NAT is symmetric and the other's router filters by port, so punching can't work), `unreachable`, or `""` |
+| `get_connect_error() -> String` | After `connection_failed`: `symmetric` (one side's NAT is symmetric and the other's router filters by port, so punching can't work, and no relay peer linked to both carried the link), `unreachable`, or `""` |
 | `get_connect_error_message() -> String` | After `connection_failed`: the reason as a sentence to show the player, naming the symmetric side; `""` if nothing failed |
 | `set_stun_servers(PackedStringArray)` | `host:port` list, from the next host/join. Default Google + Cloudflare; empty: off |
 | `set_signaling_relays(PackedStringArray)` | Nostr relay URLs, from the next host/join. Default `wss://relay.damus.io`, `wss://nos.lol`; empty: off |
@@ -70,6 +70,9 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `get_privacy_mode() -> int` | The mode set |
 | `set_port_mapping(on: bool)` | Ask the router to forward this peer's UDP port (PCP, NAT-PMP or UPnP), from the next host/join. **Off by default**; it opens a port on the player's router. See [Router port mapping](#router-port-mapping) |
 | `get_port_mapping() -> Dictionary` | `{state, address, protocol}`: `state` is `off`, `trying`, `mapped`, `not_public`, `unavailable` or `relay_only`; `address` (`ip:port`) and `protocol` (`pcp`, `natpmp`, `upnp`) are `""` until the router names them. Signal `port_mapping_changed(info)` fires on each change |
+| `set_relay_peers(PackedStringArray) -> Error` | Invites of always-on relay peers (`peerwire-peer`) to keep linked, from the next host/join and at once for a running session; empty: none (default). `ERR_INVALID_PARAMETER`, changing nothing, if one is not a `pw:` invite. See [Relay peers](#relay-peers) |
+| `get_relay_peers_linked() -> int` | How many of them are linked now |
+| `get_peer_route(id) -> String` | `direct`, `relay` (through another peer, such as a relay peer) or `""` if `id` isn't linked (on a joiner, only the host is) |
 | `get_peer_key(id) -> PackedByteArray` | The 32-byte Ed25519 key that authenticated peer `id`'s link (empty if not directly connected) |
 | `set_max_peers(max: int)` / `get_max_peers()` | Host: the most joiners it keeps (default 32). Past it, a newcomer is disconnected before `peer_connected`, as with `refuse_new_connections`. Applies at once; links already up stay |
 | `get_public_key() -> PackedByteArray` | This peer's own key |
@@ -97,15 +100,39 @@ GDScript.
    around it, which punches restricted and port-restricted cones too.
 5. What still fails: two symmetric NATs, or a symmetric NAT with random ports against a *port-restricted* cone,
    one that only lets in packets from ports it has sent to. STUN reports all cones as `cone`, so
-   `get_nat_type() == "cone"` doesn't promise a punch. Godot's star has no third peer both sides are linked to, so
-   `join*()` fails with `get_connect_error() == "symmetric"`, and `get_connect_error_message()` says which side
-   is symmetric, e.g. "the peer's NAT is symmetric (a new public port per destination) and this side's router
-   only lets in packets from ports it has sent to, ...". Peerwire runs no TURN relay, by design. The Rust `Node`
-   relays such pairs through any peer connected to both.
+   `get_nat_type() == "cone"` doesn't promise a punch. Godot's star has no third peer both sides are linked to,
+   unless the game sets a [relay peer](#relay-peers). Without one, `join*()` fails with
+   `get_connect_error() == "symmetric"`, and `get_connect_error_message()` says which side is symmetric, e.g.
+   "the peer's NAT is symmetric (a new public port per destination) and this side's router only lets in packets
+   from ports it has sent to, ...". Peerwire runs no TURN relay, by design.
 
 ```gdscript
 multiplayer.connection_failed.connect(func(): print("could not reach the host: ", peer.get_connect_error_message()))
 ```
+
+### Relay peers
+
+Phones on mobile hotspots and players behind carrier NATs often have symmetric NATs on both sides, and those can't
+punch. For them, run one always-on [`peerwire-peer`](../crates/peerwire-peer) on a public address and give every
+player its invite. Each peer then keeps a link to it, and a pair that can't punch links through it:
+
+```gdscript
+peer.set_relay_peers(PackedStringArray(["pw:…"]))  # the invite peerwire-peer prints; before host*() / join*()
+peer.host_room("my-game", room)
+# once linked: peer.get_relay_peers_linked() == 1; peer.get_peer_route(id) is "direct" or "relay"
+```
+
+- The relay peer is not a player: it never gets `peer_connected`, an id or packets, and the game needs no other
+  change. Its link is dialled again whenever it drops.
+- Direct paths are still tried, and a relayed link moves to a direct one as soon as that works.
+  `get_peer_route(id)` says which a link uses.
+- The relay peer forwards sealed packets it can't read. It does see both players' IP addresses, which of them
+  talk, and how much. It forwards up to 256 KiB/s per player by default (`PEERWIRE_RELAY_RATE`), enough for
+  typical game traffic: see [`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md#relay-peers).
+- Not used in `PRIVACY_RELAY_ONLY`, where a joiner links through its host only.
+
+`examples/godot` takes `--relay-peer=pw:…` and logs `relay peers: 1 linked` and `route to peer N: direct` or
+`through a relay`.
 
 ### Router port mapping
 
@@ -304,8 +331,8 @@ binary:
 ## Limits
 
 - **NATs.** Cone NATs punch, and sequential symmetric NATs mostly do; two symmetric NATs, or a random-port
-  symmetric one against a port-restricted cone, fail with `get_connect_error() == "symmetric"` (no TURN; see
-  [Through NATs](#through-nats)). Some networks block UDP or
+  symmetric one against a port-restricted cone, fail with `get_connect_error() == "symmetric"` unless both are
+  linked to a [relay peer](#relay-peers) (no TURN; see [Through NATs](#through-nats)). Some networks block UDP or
   Nostr's websockets altogether.
 - **Rooms have no host election**, and a host takes `max_peers` joiners (default 32). One host per room: a second
   `host_room` with the same name is found by some joiners and not others.

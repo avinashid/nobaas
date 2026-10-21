@@ -3,7 +3,7 @@ use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
 use godot::prelude::*;
-use peerwire::{Failure, NatType, Node, PeerId, PortMapping, Privacy};
+use peerwire::{Failure, Invite, NatType, Node, PeerId, PortMapping, Privacy};
 
 /// A `MultiplayerPeer` over Peerwire: Godot's `@rpc`, `MultiplayerSynchronizer` and
 /// `MultiplayerSpawner` with no server. One instance hosts (peer 1); the others
@@ -61,6 +61,48 @@ impl PeerwireMultiplayerPeer {
     #[func]
     fn set_signaling_relays(&mut self, relays: PackedStringArray) {
         self.net.relays = Some(strings(&relays));
+    }
+
+    /// Invites (`pw:…`) of always-on peers to keep linked as relays, such as the
+    /// one `peerwire-peer` prints, from the next `host` / `join` and at once for a
+    /// running session. Two players whose NATs can't be punched through (both
+    /// symmetric, as on many phone hotspots and carrier NATs) then link through
+    /// one both are linked to. It forwards packets it can't read, and a direct
+    /// path is still tried and used once it works. A relay peer is not a player:
+    /// no `peer_connected` for it. Not used in `PRIVACY_RELAY_ONLY`. Empty: none
+    /// (the default). Returns `ERR_INVALID_PARAMETER`, changing nothing, if one
+    /// is not an invite.
+    #[func]
+    fn set_relay_peers(&mut self, invites: PackedStringArray) -> Error {
+        let invites = strings(&invites);
+        if let Some(bad) = invites.iter().find(|i| Invite::<std::net::SocketAddr>::parse(i.trim()).is_none()) {
+            godot_error!("PeerwireMultiplayerPeer.set_relay_peers: not a pw: invite: {bad:?}");
+            return Error::ERR_INVALID_PARAMETER;
+        }
+        if let Some(s) = self.session.as_mut() {
+            let _ = s.set_relay_peers(&invites);
+        }
+        self.net.relay_peers = invites;
+        Error::OK
+    }
+
+    /// How many of the `set_relay_peers` relays are linked now.
+    #[func]
+    fn get_relay_peers_linked(&self) -> i32 {
+        self.session.as_ref().map_or(0, |s| s.relay_peers_linked() as i32)
+    }
+
+    /// `"direct"` if the link to peer `id` goes straight to it, `"relay"` if
+    /// through another peer (a relay peer), `""` if `id` isn't linked (on a
+    /// joiner only the host, 1, is). A relayed link moves to direct when a
+    /// direct path starts working.
+    #[func]
+    fn get_peer_route(&self, id: i32) -> GString {
+        GString::from(match self.session.as_ref().and_then(|s| s.is_relayed(id)) {
+            Some(true) => "relay",
+            Some(false) => "direct",
+            None => "",
+        })
     }
 
     /// Every address: the lowest latency, and LAN play.
@@ -204,8 +246,9 @@ impl PeerwireMultiplayerPeer {
     }
 
     /// After `connection_failed`: `"symmetric"` if one side's NAT is symmetric and
-    /// the other's router filters by port, so punching can't work (no TURN relay,
-    /// by design), `"unreachable"` if the host never answered, or `""`.
+    /// the other's router filters by port, so punching can't work and no relay
+    /// peer (`set_relay_peers`) linked to both could carry the link, `"unreachable"`
+    /// if the host never answered, or `""`.
     /// `get_connect_error_message()` says which side.
     #[func]
     fn get_connect_error(&self) -> GString {

@@ -396,6 +396,59 @@ fn symmetric_pair_relays_through_a_third_room_peer() {
     assert!(w.sim.nodes[w.peers[r].node].endpoint.stats().relayed > 0);
 }
 
+/// NB-041: two random-port symmetric NATs, alone in a room, can't link; with an
+/// always-on relay peer outside the room (as `peerwire-peer` runs) that both
+/// keep a link to (as `Node::set_relay_peers` does), they link through it, and
+/// game traffic (1 KB unreliable every 10 ms, each way) fits its relay rate.
+#[test]
+fn symmetric_pair_links_through_a_relay_peer_outside_the_room() {
+    for with_relay in [false, true] {
+        let mut w = World::new(11);
+        let (a, b) = (w.add(&kind("sym-random")), w.add(&kind("sym-random")));
+        let r = w.add(&Kind::Public);
+        w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+        let (rid, at) = (w.id(r), w.sim.addr(w.peers[r].node));
+        if with_relay {
+            for p in [a, b] {
+                let now = w.sim.now;
+                w.sim.nodes[w.peers[p].node].endpoint.connect_with(now, rid, &[Path::Direct(at)]).unwrap();
+                w.peers[p].trav.set_relay_peers(vec![rid]);
+            }
+            assert!(w.run_until(Duration::from_secs(2), |w| w.connected(a, r) && w.connected(b, r)));
+        }
+        w.join(a, "pair", Role::Peer);
+        w.join(b, "pair", Role::Peer);
+        let done = w.run_until(Duration::from_secs(45), |w| {
+            w.connected(a, b) || (w.failure(a, b).is_some() && w.failure(b, a).is_some())
+        });
+        assert!(done);
+        if !with_relay {
+            let both = Some(Failure::Symmetric(Side::Both));
+            assert_eq!((w.failure(a, b), w.failure(b, a)), (both, both));
+            continue;
+        }
+        assert!(w.connected(a, b), "a-b {:?}", w.failure(a, b));
+        assert_eq!((w.path(a, b), w.path(b, a)), (Some(Path::Via(rid)), Some(Path::Via(w.id(r)))));
+        let (na, nb) = (w.peers[a].node, w.peers[b].node);
+        w.peers[a].events.clear();
+        w.peers[b].events.clear();
+        for _ in 0..500 {
+            w.sim.send(na, nb, Lane::Unreliable, &[1u8; 1000]).unwrap();
+            w.sim.send(nb, na, Lane::Unreliable, &[2u8; 1000]).unwrap();
+            w.tick();
+        }
+        w.run_until(Duration::from_millis(500), |_| false);
+        let (got_b, got_a) = (w.messages(b).len(), w.messages(a).len());
+        let relay = w.sim.nodes[w.peers[r].node].endpoint.stats();
+        println!(
+            "relayed 5 s of 100 KB/s each way: {got_b} and {got_a} of 500 delivered, {} relay drops",
+            relay.relay_dropped
+        );
+        assert!(got_b >= 490 && got_a >= 490, "{got_b} {got_a}");
+        assert_eq!(relay.relay_dropped, 0);
+    }
+}
+
 #[test]
 fn invite_join_punches_only_with_signaling() {
     // The joiner has the host's invite (its STUN-learned candidates). Both sit behind

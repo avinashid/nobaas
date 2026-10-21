@@ -13,6 +13,19 @@ It:
 
 Anyone who knows its peer id and address can link to it; the invite carries both.
 
+## As a relay peer
+
+Give its invite to the peers of an app, and they keep a link to it (`Node::set_relay_peers` in Rust,
+`set_relay_peers` in Godot). Two of them whose NATs can't punch each other, such as two symmetric NATs on phone
+hotspots, then link through it. Bind it to a public address (`PEERWIRE_BIND=0.0.0.0:7700`, the UDP port open) and
+keep STUN on, or give the host a public IP, so the invite lists an address the peers can reach. With
+`PEERWIRE_DATA` set, the invite stays the same across restarts.
+
+Each peer may have it relay `PEERWIRE_RELAY_RATE` bytes per second (256 KiB by default), summed over everything it
+sends through it; `PEERWIRE_RELAY_TOTAL` caps all peers together. The relay can't read what it forwards, but it sees
+the peers' addresses, which of them talk, and how much. See
+[docs/NAT-TRAVERSAL.md](../../docs/NAT-TRAVERSAL.md#relay-peers).
+
 ## Example
 
 ```sh
