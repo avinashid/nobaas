@@ -3,3 +3,4 @@ packages/js/pkg/
 node_modules/
 *.png
 tasks/
+.env
