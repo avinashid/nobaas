@@ -79,7 +79,12 @@ await room.leave();                             // peers see 'peer-leave' at onc
 - **Signalling:** `'nostr'` publishes ephemeral events to `wss://relay.damus.io` and
   `wss://nos.lol` (override with `relays`) and uses Google and Cloudflare STUN
   (override with `iceServers`). Relays see the room topic and the PeerIds in
-  hellos, not the roomId; offers are sealed to the recipient.
+  hellos, not the roomId; offers are sealed to the recipient. Each side sends one
+  offer or answer with its candidates, once ICE gathering is complete or 300 ms
+  after the first public (STUN) candidate (2 s at most), and any candidates found
+  later in one `ice-batch`. Relays drop events, so an offer with no answer is sent
+  again at 3 s and 6 s, and a repeated offer gets the same answer again.
+  `transport.trace` reports each step (Net Lab shows it).
 - **Node:** Node has no WebRTC. `signaling: 'local'` rooms then carry their
   datagrams over the BroadcastChannel (peers in one process or its workers). For
   real networks pass `RTCPeerConnection` from a WebRTC package such as
@@ -125,7 +130,7 @@ Types are in `src/index.d.ts`.
 | `demo/index.html` | Mesh chat on the low-level API: every tab links to every other. |
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
-| `demo/netlab.html` | Net Lab, a connection diagnostics page (not a game), mobile-friendly: join the global room or a private one shared as a `#key=` link, and every member links to every other. Per peer: ping measured on the route in use (min/avg/max, jitter, loss), the route (direct, relayed by a member, or over signalling), the ICE candidate pair (IPv4/IPv6, UDP/TCP), time to link and the other side's NAT. Also this device's public addresses, IPv6 and a NAT mapping estimate, the signalling relays' state, chat, an event log with warnings and errors, and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it at `/`. |
+| `demo/netlab.html` | Net Lab, a connection diagnostics page (not a game), mobile-friendly: join the global room or a private one shared as a `#key=` link, and every member links to every other. Per peer: ping measured on the route in use (min/avg/max, jitter, loss), the route (direct, relayed by a member, or over signalling), the ICE candidate pair (IPv4/IPv6, UDP/TCP), the offer/answer exchange (times, resends, the addresses each carried), ICE connectivity checks sent, answered and received with a verdict on which way packets are blocked, time to link and the other side's NAT. Also this device's public addresses, IPv6 and a NAT mapping estimate, the signalling relays' state, chat, an event log with warnings and errors, and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it at `/`. |
 | `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player, so a player needs a link to the host only. Network panel: per-peer RTT and route (ICE path, or the fallback). `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server; `?rtc=off` fails this tab's WebRTC links (testing the fallback). `demo/crew-server.mjs` serves it for hosting. |
 
 Signalling is untrusted by design: whatever carries the offers, the Peerwire Noise
@@ -215,7 +220,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/webrtc_signals.mjs` (Chromium, loopback): malformed offers leave no
   link and no unhandled rejection, 300 random signals throw nothing, real offers are still
   answered, and each refused signal is counted in `WebRtcTransport.badSignals` (as Nostr's
-  `stats.rejected` counts refused events).
+  `stats.rejected` counts refused events). Without trickle, a lost first offer or first
+  answer still links two transports (in about 3.2 s), candidates that overtake their
+  description are held, and gathering stops 300 ms after the first public candidate.
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.
