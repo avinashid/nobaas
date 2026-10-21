@@ -34,6 +34,8 @@ const MIN_CWND: f64 = 4.0;
 /// a quarter of the minimum RTT later than its ACK was expected (RACK's
 /// reordering window, RFC 8985): a fragment merely overtaken costs nothing.
 const DUP_THRESHOLD: u32 = 3;
+/// Fragments above the cumulative ACK that an ACK's bitmap can report.
+const SACK_BITS: u32 = 64;
 /// Queueing delay (RTT above the minimum seen) at which the window backs off,
 /// before any loss: keeps buffers short on paths that never drop (a browser
 /// DataChannel, a bloated router), which real-time traffic needs.
@@ -78,6 +80,26 @@ struct Fragment {
     probed: bool,
     /// When to send the duplicate copy of the latest transmission (urgent only).
     dup_at: Option<Instant>,
+}
+
+/// How the reliable lanes have recovered from loss on one link, for the
+/// simulator's benchmarks; not a stable API.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryStats {
+    /// Window cuts for queueing delay (×DELAY_CUT).
+    pub delay_cuts: u64,
+    /// Cuts for a loss found by fast retransmit: with queueing (×LOSS_CUT),
+    /// and taken as random (×RANDOM_LOSS_CUT).
+    pub loss_cuts: u64,
+    pub random_cuts: u64,
+    /// Cuts for a timeout (×LOSS_CUT).
+    pub timeout_cuts: u64,
+    /// Fragments resent because their timer ran out (not fast retransmits).
+    pub timed_out: u64,
+    /// Of those, first sends more than 64 above the lowest unacknowledged
+    /// fragment, beyond the SACK bitmap's reach.
+    pub timed_out_beyond_reach: u64,
 }
 
 /// Index of the reliable and the urgent stream in `RelSend::streams`.
@@ -158,6 +180,7 @@ pub(crate) struct RelSend {
     queue_delay: Option<Duration>,
     pub(crate) delay_backoffs: u64,
     pub(crate) urgent_copies: u64,
+    pub(crate) recovery: RecoveryStats,
 }
 
 pub(crate) enum PushError {
@@ -181,6 +204,7 @@ impl RelSend {
             queue_delay: None,
             delay_backoffs: 0,
             urgent_copies: 0,
+            recovery: RecoveryStats::default(),
         }
     }
 
@@ -215,10 +239,20 @@ impl RelSend {
     }
 
     /// Cuts the window to `keep` of the fragments in flight, at most once per round trip.
-    fn back_off(&mut self, now: Instant, keep: f64) {
+    fn back_off(&mut self, now: Instant, keep: f64, timeout: bool) {
         if now < self.recover_until {
             return;
         }
+        let r = &mut self.recovery;
+        *if timeout {
+            &mut r.timeout_cuts
+        } else if keep == DELAY_CUT {
+            &mut r.delay_cuts
+        } else if keep == RANDOM_LOSS_CUT {
+            &mut r.random_cuts
+        } else {
+            &mut r.loss_cuts
+        } += 1;
         self.ssthresh = (self.slots() as f64 * keep).max(MIN_CWND);
         self.cwnd = self.ssthresh;
         self.recover_until = now + self.srtt.unwrap_or(self.rto);
@@ -291,7 +325,7 @@ impl RelSend {
         let st = &mut self.streams[u];
         let mut sample = None;
         let mut acked: Vec<u32> = st.inflight.range(..cum).map(|(&s, _)| s).collect();
-        for i in 0..64u32 {
+        for i in 0..SACK_BITS {
             if bits >> i & 1 == 1 {
                 if let Some(s) = cum.checked_add(1 + i) {
                     acked.push(s);
@@ -333,7 +367,7 @@ impl RelSend {
         if queued_too_long {
             if now >= self.recover_until {
                 self.delay_backoffs += 1;
-                self.back_off(now, DELAY_CUT);
+                self.back_off(now, DELAY_CUT, false);
             }
         } else if newly > 0 {
             if self.cwnd < self.ssthresh {
@@ -422,10 +456,17 @@ impl RelSend {
         let mut resent = false;
         let st = &mut self.streams[u];
         let sent_end = st.sent_end;
+        let lo = st.inflight.first_key_value().map_or(0, |(&s, _)| s);
         for seq in due_by_seq(&st.by_due, now) {
             let f = st.inflight.get_mut(&seq).expect("indexed fragment in flight");
             if out.len() + REL_OVERHEAD + f.data.len() > max {
                 break;
+            }
+            if !f.fast {
+                self.recovery.timed_out += 1;
+                if f.tries == 1 && seq - lo > SACK_BITS {
+                    self.recovery.timed_out_beyond_reach += 1;
+                }
             }
             lost = true;
             timed_out |= !f.fast;
@@ -453,7 +494,7 @@ impl RelSend {
         }
         if lost {
             let random = !timed_out && self.queue_delay.is_some_and(|q| q < RANDOM_LOSS_QUEUE);
-            self.back_off(now, if random { RANDOM_LOSS_CUT } else { LOSS_CUT });
+            self.back_off(now, if random { RANDOM_LOSS_CUT } else { LOSS_CUT }, timed_out);
         }
         let st = &mut self.streams[u];
         for seq in due_by_seq(&st.by_dup, now) {

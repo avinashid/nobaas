@@ -14,7 +14,7 @@
 //! cargo run --release -p peerwire-sim --example bulk                  # the three variants
 //! cargo run --release -p peerwire-sim --example bulk -- --loss 0.01 --cpu 1
 
-use peerwire_core::{Config, Event, Lane, PeerStats, SendError};
+use peerwire_core::{Config, Event, Lane, PeerStats, RecoveryStats, SendError};
 use peerwire_sim::{NetConfig, Sim};
 use std::time::Duration;
 
@@ -37,6 +37,8 @@ pub struct Args {
     /// Print the window, RTT and delivery rate every 500 ms of virtual time.
     pub trace: bool,
     pub seed: u64,
+    /// Uplink buffer as queueing delay (tail drop); 0 = unlimited.
+    pub buffer_ms: u64,
 }
 
 impl Default for Args {
@@ -53,6 +55,7 @@ impl Default for Args {
             cpu: false,
             trace: false,
             seed: 1,
+            buffer_ms: 0,
         }
     }
 }
@@ -76,6 +79,8 @@ pub struct Summary {
     pub urgent_max_ms: f64,
     /// Urgent send attempts refused with `WouldBlock`; each is retried 1 ms later.
     pub urgent_refused: u64,
+    /// The sender's window cuts and timeouts.
+    pub recovery: RecoveryStats,
     /// Wall-clock CPU inside each endpoint, with `--cpu`.
     pub sender_cpu: Duration,
     pub receiver_cpu: Duration,
@@ -110,6 +115,7 @@ fn args() -> Vec<Args> {
             "--cpu" => a.cpu = val == "1",
             "--trace" => a.trace = val == "1",
             "--seed" => a.seed = val.parse().unwrap(),
+            "--buffer" => a.buffer_ms = val.parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -120,13 +126,14 @@ fn main() {
     for a in args() {
         let s = run(a.clone());
         println!(
-            "{} MiB, rtt {} ms, jitter {} ms{}, loss {}%, {} Mbps",
+            "{} MiB, rtt {} ms, jitter {} ms{}, loss {}%, {} Mbps{}",
             a.mib,
             2 * a.latency_ms,
             a.jitter_ms,
             if a.in_order { " in order" } else { "" },
             a.loss * 100.0,
-            a.up_mbps
+            a.up_mbps,
+            if a.buffer_ms > 0 { format!(", buffer {} ms", a.buffer_ms) } else { String::new() }
         );
         println!(
             "  {}: {:.2} s, {:.2} MB/s; peak cwnd {}, peak inflight {}; delay backoffs {}, retransmits {} of {} fragments",
@@ -146,6 +153,12 @@ fn main() {
         println!(
             "  urgent: {} sent, {} timed, p50 {:.1} ms, p99 {:.1} ms, max {:.1} ms, refused {}",
             s.urgent_sent, s.urgent_delivered, s.urgent_p50_ms, s.urgent_p99_ms, s.urgent_max_ms, s.urgent_refused
+        );
+        let r = s.recovery;
+        println!(
+            "  cuts: delay {}, loss {}, random loss {}, timeout {}; timed-out fragments {}, of which first sends \
+             over 64 above the lowest unacked {}",
+            r.delay_cuts, r.loss_cuts, r.random_cuts, r.timeout_cuts, r.timed_out, r.timed_out_beyond_reach
         );
         if a.cpu {
             println!(
@@ -179,6 +192,7 @@ pub fn run(a: Args) -> Summary {
     let (tx, rx) = (sim.add_node(Config::default()), sim.add_node(Config::default()));
     for n in [tx, rx] {
         sim.nodes[n].uplink_bps = Some(a.up_mbps * 1_000_000);
+        sim.nodes[n].uplink_buffer = (a.buffer_ms > 0).then(|| Duration::from_millis(a.buffer_ms));
     }
     sim.connect(tx, rx).unwrap();
     let connected = |s: &Sim, n: usize| s.nodes[n].events.iter().any(|e| matches!(e, Event::Connected { .. }));
@@ -276,6 +290,7 @@ pub fn run(a: Args) -> Summary {
     s.done = received == total;
     s.mb_per_sec = if s.done { total as f64 / 1e6 / s.secs } else { 0.0 };
     s.delay_backoffs = p.delay_backoffs;
+    s.recovery = sim.nodes[tx].endpoint.recovery_stats(&peer).unwrap_or_default();
     s.retransmits = p.retransmits;
     s.fragments_sent = p.fragments_sent;
     s.urgent_sent = sent_at.len();
