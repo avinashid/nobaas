@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Peerwire: Net Lab</title>
+<style>
+  :root { color-scheme: dark; --bg: #0f1117; --panel: #181b24; --line: #2a2f3d; --text: #e6e8ee; --dim: #8b91a3;
+    --red: #e5484d; --amber: #f5a524; --green: #46a758; --blue: #3e63dd; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; padding: 0 0 env(safe-area-inset-bottom); }
+  header { position: sticky; top: 0; z-index: 2; background: #0b0d12ee; backdrop-filter: blur(6px); border-bottom: 1px solid var(--line);
+    padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+  header h1 { font-size: 16px; margin: 0; flex: 1 0 auto; }
+  .pill { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+  main { max-width: 1180px; margin: 0 auto; padding: 12px; display: grid; gap: 12px; grid-template-columns: 1fr; }
+  @media (min-width: 900px) { main { grid-template-columns: 1.25fr 1fr; align-items: start; } .wide { grid-column: 1 / -1; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; min-width: 0; }
+  .card h2 { font-size: 12px; margin: 0 0 8px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; display: flex; justify-content: space-between; gap: 8px; }
+  input, button, select { font: inherit; color: var(--text); background: #222634; border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px; min-height: 42px; }
+  button { cursor: pointer; }
+  button.primary { background: #23367a; border-color: var(--blue); }
+  button.small { min-height: 30px; padding: 3px 10px; font-size: 13px; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .row input { flex: 1 1 180px; min-width: 0; }
+  .hidden { display: none !important; }
+  .dim { color: var(--dim); }
+  .ok { color: var(--green); } .warn { color: var(--amber); } .bad { color: var(--red); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; word-break: break-all; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0; font-size: 13.5px; }
+  dt { color: var(--dim); } dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  .peer { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: #141720; }
+  .peer .top { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; margin-bottom: 6px; }
+  .peer .name { font-weight: 600; }
+  .big { font-size: 20px; font-weight: 700; }
+  .spark { display: block; width: 100%; height: 34px; margin: 4px 0; }
+  .note { font-size: 13px; margin-top: 6px; }
+  #chatlog, #log { overflow: auto; background: #10131b; border-radius: 8px; padding: 8px; font-size: 13.5px; }
+  #chatlog { height: 220px; margin-bottom: 8px; }
+  #log { max-height: 340px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  #log div { padding: 1px 0; border-bottom: 1px solid #1a1e29; }
+  #log .warn { color: var(--amber); } #log .error { color: var(--red); }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+  .stats div span { display: block; font-size: 12px; color: var(--dim); }
+  details summary { cursor: pointer; color: var(--dim); font-size: 13px; margin-top: 4px; }
+</style>
+
+<header>
+  <h1>Peerwire Net Lab</h1>
+  <span class="pill" id="h-room">not in a room</span>
+  <span class="pill" id="h-peers">0 linked</span>
+  <span class="pill" id="h-ping">ping –</span>
+  <span class="pill" id="h-warn">0 warnings</span>
+</header>
+
+<main>
+  <section class="card wide" id="join">
+    <h2>Connect</h2>
+    <div class="row"><input id="name" placeholder="your name (shown to others)" maxlength="20" autocomplete="nickname"></div>
+    <div class="row">
+      <button class="primary" id="global">Join the global room</button>
+      <button id="create">Create a private room</button>
+    </div>
+    <div class="row"><input id="key" placeholder="private room key or link" autocomplete="off"><button id="joinkey">Join private</button></div>
+    <p class="dim note">The <b>global room</b> is one shared room: anyone who opens Net Lab and joins it sees you, and you see them.
+      A <b>private room</b> has a random key: only people you send the link to can join. Either way, every member tries to link to every other member.</p>
+    <p class="note" id="joinmsg"></p>
+  </section>
+
+  <section class="card wide hidden" id="roomcard">
+    <h2><span>Room</span><span><button class="small" id="share">Share link</button> <button class="small" id="leave">Leave</button></span></h2>
+    <div class="stats" id="roomstats"></div>
+    <div class="note" id="relays"></div>
+  </section>
+
+  <section class="card" id="peerscard">
+    <h2><span>Peers</span><span class="dim" id="peercount"></span></h2>
+    <div id="peers"><p class="dim">Join a room to see peers.</p></div>
+  </section>
+
+  <div style="display: grid; gap: 12px; min-width: 0">
+    <section class="card">
+      <h2><span>My network</span><button class="small" id="reprobe">Re-test</button></h2>
+      <div id="mynet" class="dim">testing…</div>
+    </section>
+
+    <section class="card">
+      <h2>Chat</h2>
+      <div id="chatlog"><div class="dim">Messages go to everyone in the room.</div></div>
+      <form class="row" id="chatform" style="margin: 0"><input id="chatin" placeholder="message" maxlength="500" autocomplete="off"><button id="chatsend" disabled>Send</button></form>
+    </section>
+  </div>
+
+  <section class="card wide">
+    <h2><span>Event log</span><span><button class="small" id="copy">Copy report</button> <button class="small" id="download">Download</button></span></h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script type="module" src="netlab.js"></script>

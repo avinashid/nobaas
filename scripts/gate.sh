@@ -97,6 +97,7 @@ if [ $quick = 1 ]; then
   skip "poll" "--quick"
   skip "webrtc signals" "--quick"
   skip "tab close" "--quick"
+  skip "netlab" "--quick"
 else
   step "browser" node packages/js/test/browser.mjs 2
   step "arena" node packages/js/test/arena.mjs 8 10
@@ -104,6 +105,7 @@ else
   step "poll" node packages/js/test/poll.mjs 3
   step "webrtc signals" node packages/js/test/webrtc_signals.mjs
   step "tab close" node packages/js/test/leave.mjs --runs=5 --crash=0
+  step "netlab" env RTC_OFF=2 node packages/js/test/netlab.mjs 3
 fi
 if [ $nostr = 1 ]; then
   step "nostr" node packages/js/test/nostr.mjs
