@@ -35,7 +35,7 @@ try {
   // A closing tab says Bye on pagehide and its data channels close, so the
   // leave is normally at once. If the renderer goes before either is sent
   // (seen under load), the others only learn of it from the core's idle_timeout
-  // (30 s, EndpointConfig in nobaas-core), so wait past that, not up to it.
+  // (30 s, EndpointConfig in peerwire-core), so wait past that, not up to it.
   const t1 = Date.now();
   await pages[0].close();
   const waits = await Promise.all(pages.slice(1).map(async (p) => {

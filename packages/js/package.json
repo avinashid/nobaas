@@ -1,9 +1,9 @@
 {
-  "name": "@nobaas/js",
+  "name": "@peerwire/js",
   "version": "0.1.0",
-  "description": "Peer-to-peer rooms for the browser and Node with no backend: the Nobaas core as a zero-import wasm, WebRTC DataChannels and Nostr signaling.",
+  "description": "Peer-to-peer rooms for the browser and Node with no backend: the Peerwire core as a zero-import wasm, WebRTC DataChannels and Nostr signaling.",
   "license": "MIT OR Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/avinashid/nobaas.git", "directory": "packages/js" },
+  "repository": { "type": "git", "url": "git+https://github.com/avinashid/peerwire.git", "directory": "packages/js" },
   "type": "module",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
@@ -12,10 +12,10 @@
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
     },
-    "./nobaas_ffi.wasm": "./pkg/nobaas_ffi.wasm",
+    "./peerwire_ffi.wasm": "./pkg/peerwire_ffi.wasm",
     "./package.json": "./package.json"
   },
-  "files": ["src", "pkg/nobaas_ffi.wasm"],
+  "files": ["src", "pkg/peerwire_ffi.wasm"],
   "sideEffects": false,
   "engines": { "node": ">=20" },
   "keywords": ["p2p", "webrtc", "multiplayer", "nostr", "wasm", "rooms"],

@@ -19,7 +19,7 @@ if (!snippet) throw new Error('README chat snippet not found');
 const js = snippet.match(/<script type="module">\n([\s\S]*?)<\/script>/)[1].trim().split('\n');
 console.log(`README chat: ${js.length} lines of JS`);
 if (js.length > 10) throw new Error('the README chat must stay within ten lines');
-const importMap = '<script type="importmap">{"imports":{"@nobaas/js":"/src/index.js"}}</script>';
+const importMap = '<script type="importmap">{"imports":{"@peerwire/js":"/src/index.js"}}</script>';
 const page = `<!doctype html><meta charset="utf-8"><title>readme chat</title>${importMap}\n${snippet}`;
 
 const port = 8765 + Math.floor(Math.random() * 1000);

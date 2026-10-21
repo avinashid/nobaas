@@ -1,8 +1,8 @@
 # NAT traversal
 
-How two `nobaas` nodes behind NATs find and reach each other with no server of their own. The code is
-`crates/nobaas/src/traversal.rs` (sans-IO, deterministic), driven by `Node` on its UDP socket and by the
-simulator in `crates/nobaas-sim/tests/traversal.rs`. The session core (Noise IK, punching, peer relay) is
+How two `peerwire` nodes behind NATs find and reach each other with no server of their own. The code is
+`crates/peerwire/src/traversal.rs` (sans-IO, deterministic), driven by `Node` on its UDP socket and by the
+simulator in `crates/peerwire-sim/tests/traversal.rs`. The session core (Noise IK, punching, peer relay) is
 unchanged; this layer feeds it addresses.
 
 ## Pieces
@@ -62,7 +62,7 @@ sequence, though:
 
 Opt-in, off by default: `Node::builder().port_mapping(true)`. For a node behind a symmetric NAT facing a peer whose
 router filters by port, where punching can't work and no third peer can relay (NB-038). The code is
-`crates/nobaas/src/portmap.rs`: a sans-IO `Mapper` (the protocols, leases and fallback order, tested
+`crates/peerwire/src/portmap.rs`: a sans-IO `Mapper` (the protocols, leases and fallback order, tested
 deterministically) run by one thread with its own UDP socket, so the node's socket and `poll` are untouched.
 
 - **Order.** PCP MAP (RFC 6887), then NAT-PMP (RFC 6886), both to the default gateway's port 5351, then UPnP-IGD:
@@ -101,11 +101,11 @@ deterministically) run by one thread with its own UDP socket, so the node's sock
 
 Topics use the same derivation as `packages/js/src/nostr.js`, so Rust and browser peers can share relays:
 
-- room: `sha256("nobaas/room/" + app_id + "/" + room)`; a JS peer in room `"<app_id>/<room>"` uses the same topic;
-- peer inbox: `sha256("nobaas/peer/" + lowercase hex of the 32-byte PeerId)`.
+- room: `sha256("peerwire/room/" + app_id + "/" + room)`; a JS peer in room `"<app_id>/<room>"` uses the same topic;
+- peer inbox: `sha256("peerwire/peer/" + lowercase hex of the 32-byte PeerId)`.
 
 Every relay subscriber sees topics, so a topic proves nothing. The **room key**,
-`sha256("nobaas/room-key/" + app_id + "/" + room)`, is the same name hashed under another label. It can't be
+`sha256("peerwire/room-key/" + app_id + "/" + room)`, is the same name hashed under another label. It can't be
 derived from the topic, so only peers given the name hold it. Hellos and room offers carry HMAC-SHA256 proofs
 under it. The room name works as the room's password, and a name others can guess makes a public lobby. The
 topic is an unsalted SHA-256 of the name, so whoever sees it can test guesses offline at hash speed: a private
@@ -119,7 +119,7 @@ room needs a name with **at least 128 random bits**, such as 22 or more random b
 {"t":"hello","from":"<64 hex PeerId>","meta":{"nb":1,"role":"peer|host|client","ts":<Unix ms>,"p":"<64 hex>"}}
 ```
 
-- `p = HMAC(room key, "nb-hello" || PeerId || role byte || ts u64 LE)`.
+- `p = HMAC(room key, "pw-hello" || PeerId || role byte || ts u64 LE)`.
 - Parsing is strict: exact prefix, 64 hex digits, known role, 1 to 19 decimal digits of `ts`, 64 hex digits of
   proof, exact suffix.
 - A hello with a wrong or missing proof, or with `|ts - now| > 60 s`, is dropped before anything else happens.
@@ -138,8 +138,8 @@ nonce u64 LE      random
 n     u8 (<= 8)   then n x [len u8][Address::encode], or one port prediction entry:
                   [5][0xfe 0x01][step u8][next port u16 LE]
 m     u8 (<= 8)   then m x 32-byte PeerId (peers the sender is connected to)
-proof 32 B        version 2: HMAC(room key, "nb-offer" || sender || recipient || everything above)
-                  version 3: HMAC(recipient's invite key, "nb-invite" || sender || recipient || everything above)
+proof 32 B        version 2: HMAC(room key, "pw-offer" || sender || recipient || everything above)
+                  version 3: HMAC(recipient's invite key, "pw-invite" || sender || recipient || everything above)
 ```
 
 The invite key is 32 random bytes per node, carried in its invites (`Node::invite`, invite version 2). A node
@@ -244,7 +244,7 @@ gives out. Changing it affects the next invites and offers; links already up kee
     together, unlimited by default).
 
 Per-mode outcome in the simulator: a room with a public host and peers A and B over 36 pairs of NAT kinds (each
-unordered pair once) plus two peers behind one non-hairpinning NAT, from `cargo test -p nobaas-sim --release --test
+unordered pair once) plus two peers behind one non-hairpinning NAT, from `cargo test -p peerwire-sim --release --test
 traversal privacy_modes_matrix -- --nocapture`:
 
 ```text
@@ -325,7 +325,7 @@ traversal privacy_modes_matrix -- --nocapture`:
 
 Router port mapping adds no crates: its HTTP, SSDP and XML handling is a few hand-written functions.
 
-Crates added to `nobaas` by NAT traversal:
+Crates added to `peerwire` by NAT traversal:
 - `sha2` and `hmac`: RustCrypto, MIT/Apache-2.0.
 - Under the `nostr` feature only: `tungstenite`, `rustls` (ring provider), `k256` and `serde_json` (MIT and/or
   Apache-2.0, ISC for ring).
@@ -335,7 +335,7 @@ Crates added to `nobaas` by NAT traversal:
 
 ## Coverage
 
-- `crates/nobaas/src/traversal.rs` unit tests:
+- `crates/peerwire/src/traversal.rs` unit tests:
   - hello and offer round trips (versions 1 to 3), hello timestamps, truncation, browser hellos, roles;
   - offer contents in each privacy mode, the public-address classifier, relay-only dials going only through the
     relay (and the room host as the relay), a relay-only client dialling exactly one of two Hosts directly
@@ -348,7 +348,7 @@ Crates added to `nobaas` by NAT traversal:
   - STUN classification and retransmits, port prediction from the two mappings;
   - predictions round-tripping in offers, and cone (not open or symmetric) receivers probing them;
   - failure messages naming the symmetric side.
-- `crates/nobaas/src/portmap.rs` unit tests: PCP mapping, renewal at half the lease and delete; NAT-PMP after a
+- `crates/peerwire/src/portmap.rs` unit tests: PCP mapping, renewal at half the lease and delete; NAT-PMP after a
   PCP version refusal; UPnP after PCP and NAT-PMP refusals, with port conflicts and permanent leases; the timeout
   schedule through every protocol and the 5-minute retry; a failed renewal starting over; CGNAT and private
   external addresses not advertised; SSDP answers pointing elsewhere refused; description parsing and chunked
@@ -357,28 +357,28 @@ Crates added to `nobaas` by NAT traversal:
   slow gateway answers still sends the delete. `node.rs` checks a mapped address appears in `addresses()` and invites, and that a relay-only
   node asks the gateway nothing, deletes the mapping when switched to `RelayOnly` and maps again when switched
   out; `traversal.rs` where it ranks and which privacy modes give it out.
-- `crates/nobaas/tests/room_security.rs`:
+- `crates/peerwire/tests/room_security.rs`:
   - the security review's `sec_room_topic_only` repro, which no longer links;
   - links from non-members closed unseen;
   - members linking, and a pinned host.
-- `crates/nobaas-sim/tests/traversal.rs`:
+- `crates/peerwire-sim/tests/traversal.rs`:
   - NAT types from simulated STUN;
   - the room-of-two matrix over 8 NAT kinds with 150 ms signaling latency, each failure naming the right side;
   - sequential symmetric NATs against port-restricted ones, over 10 seeds each way round: 80/80 direct;
   - a symmetric pair relayed through a third room peer;
   - an invite join that punches only with signaling;
   - the per-mode matrix above.
-- `crates/nobaas/tests/privacy.rs`: invites per mode and switched at runtime, `NoRelay`, relay-only room peers
+- `crates/peerwire/tests/privacy.rs`: invites per mode and switched at runtime, `NoRelay`, relay-only room peers
   linking `Via(host)` with every event and every sealed offer checked for addresses, relay-only invites.
-- `crates/nobaas-sim/tests/nat.rs` `guessed_ports_punch_a_sequential_symmetric_nat`: guesses punch from a
+- `crates/peerwire-sim/tests/nat.rs` `guessed_ports_punch_a_sequential_symmetric_nat`: guesses punch from a
   dial and from a relayed link; a relay-only link ignores them.
-- `crates/nobaas-sim/tests/nat.rs` `relay_only_links_stay_relayed`: no packet between the two ends, either side
+- `crates/peerwire-sim/tests/nat.rs` `relay_only_links_stay_relayed`: no packet between the two ends, either side
   dialling, and no punch.
-- `crates/nobaas/tests/nat_loopback.rs` (mock STUN servers, `MemoryHub`; an invite without its key gets no
-  dial-back) and `crates/nobaas/tests/nostr.rs` (local
+- `crates/peerwire/tests/nat_loopback.rs` (mock STUN servers, `MemoryHub`; an invite without its key gets no
+  dial-back) and `crates/peerwire/tests/nostr.rs` (local
   relay; `--ignored`: public relays and STUN, run by `scripts/gate.sh --nostr`).
 
-Room of two, signaling only, from `cargo test -p nobaas-sim --release --test traversal -- --nocapture`. D is
+Room of two, signaling only, from `cargo test -p peerwire-sim --release --test traversal -- --nocapture`. D is
 direct, with ms to connect. F S is a failure reported as `Symmetric` on both sides, as A reports it: `S<` A's
 NAT is the symmetric one, `S^` B's, `S2` both. Port prediction raised this from 43/64 direct; what still fails
 is two symmetric NATs, or a random-port symmetric NAT against a port-restricted one:

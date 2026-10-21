@@ -3,7 +3,7 @@
 // - Ephemeral events (kind 25059): relays forward them to live subscribers
 //   and don't store them.
 // - A fresh secp256k1 key per session signs events, so nothing links them to
-//   the Nobaas identity or to other sessions.
+//   the Peerwire identity or to other sessions.
 // - Messages to a peer are sealed to its PeerId (Noise X: encrypted, and the
 //   sender's PeerId authenticated), because WebRTC offers carry IP addresses.
 //   They're tagged with a hash of the recipient's PeerId, not the PeerId.
@@ -13,7 +13,7 @@
 // Same interface as BroadcastSignaling: id, hello(meta), onHello, send(to, body),
 // onMessage(fn), close().
 
-import { isPeerId } from './nobaas.js';
+import { isPeerId } from './peerwire.js';
 
 const KIND = 25059;
 const MAX_CONTENT = 64 * 1024; // event content we are willing to decode (base64 characters)
@@ -34,12 +34,12 @@ export const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const sha256 = async (bytes) => new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
 
 export class NostrSignaling {
-  constructor(nb, endpoint, { room, relays = DEFAULT_RELAYS } = {}) {
-    this.nb = nb;
+  constructor(pw, endpoint, { room, relays = DEFAULT_RELAYS } = {}) {
+    this.pw = pw;
     this.ep = endpoint;
     this.id = endpoint.id;
     this.room = room;
-    this.key = nb.nostrKeypair();
+    this.key = pw.nostrKeypair();
     this.pubkey = hex(this.key.pubkey);
     this.handlers = [];
     this.onHello = () => {};
@@ -50,8 +50,8 @@ export class NostrSignaling {
   }
 
   async start(relays) {
-    this.myTag = hex(await sha256(enc.encode(`nobaas/peer/${this.id}`)));
-    this.roomTag = hex(await sha256(enc.encode(`nobaas/room/${this.room}`)));
+    this.myTag = hex(await sha256(enc.encode(`peerwire/peer/${this.id}`)));
+    this.roomTag = hex(await sha256(enc.encode(`peerwire/room/${this.room}`)));
     const sub = hex(crypto.getRandomValues(new Uint8Array(8)));
     const filter = { kinds: [KIND], '#p': [this.myTag, this.roomTag], since: Math.floor(Date.now() / 1000) - 30 };
     await Promise.all(relays.map((url) => new Promise((resolve) => {
@@ -73,7 +73,7 @@ export class NostrSignaling {
     const created_at = Math.floor(Date.now() / 1000);
     const tags = [['p', tag]];
     const id = await sha256(enc.encode(JSON.stringify([0, this.pubkey, created_at, KIND, tags, content])));
-    const sig = this.nb.nostrSign(this.key.secret, id);
+    const sig = this.pw.nostrSign(this.key.secret, id);
     const ev = { id: hex(id), pubkey: this.pubkey, created_at, kind: KIND, tags, content, sig: hex(sig) };
     const msg = JSON.stringify(['EVENT', ev]);
     for (const ws of this.sockets) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
@@ -130,7 +130,7 @@ export class NostrSignaling {
     if (!isPeerId(to)) throw new TypeError('send: `to` must be a peer id (64 lowercase hex characters)');
     const sealed = this.ep.seal(to, enc.encode(JSON.stringify(body)));
     if (!sealed) return;
-    await this.publish(hex(await sha256(enc.encode(`nobaas/peer/${to}`))), b64(sealed));
+    await this.publish(hex(await sha256(enc.encode(`peerwire/peer/${to}`))), b64(sealed));
   }
 
   onMessage(fn) {

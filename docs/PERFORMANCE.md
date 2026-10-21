@@ -2,7 +2,7 @@
 
 This page separates two kinds of numbers:
 
-- **Measured**: produced by code in this repository (the deterministic simulator in `crates/nobaas-sim`,
+- **Measured**: produced by code in this repository (the deterministic simulator in `crates/peerwire-sim`,
   real UDP loopback, or headless browsers), with the command that reproduces them.
 - **Theoretical**: worked out from the wire format and published figures for links and crypto. These are
   planning estimates, not benchmarks. Each one shows its formula so you can plug in your own numbers.
@@ -15,7 +15,7 @@ column as an upper bound until a real-device test confirms it.
 | Item | Bytes |
 |---|---|
 | IPv4 + UDP header | 28 (IPv6: 48) |
-| Nobaas DATA header: kind, receiver index, nonce | 13 |
+| Peerwire DATA header: kind, receiver index, nonce | 13 |
 | AEAD tag (ChaCha20-Poly1305) | 16 |
 | Frame header: unreliable / reliable | 3 / 8 |
 | Largest datagram | 1232 (fits the IPv6 minimum MTU) |
@@ -29,7 +29,7 @@ message.
 
 | What | Result | How |
 |---|---|---|
-| Reliable messages over UDP loopback, one core (aarch64) | ~1.2 M msg/s | `cargo run --release -p nobaas-core --example udp_pair` |
+| Reliable messages over UDP loopback, one core (aarch64) | ~1.2 M msg/s | `cargo run --release -p peerwire-core --example udp_pair` |
 | Handshake | 1 RTT (Noise IK) | `tests/endpoint.rs` |
 | WebAssembly module | ~300 KB, 0 imports | `./packages/js/build.sh` |
 | Two endpoints in Node: connect, then 1000 × 64 B + 64 KiB | connect 53 ms, transfer 51 ms | `node packages/js/test/node_pair.mjs` |
@@ -59,7 +59,7 @@ Inflight counts window slots: a reliable fragment is one, an urgent fragment its
 jitter rows depend on the seed (the table is seed 1): over seeds 1–60 they average 7.39 MB/s per packet and
 5.42 MB/s in order, against 7.47 and 5.58 MB/s before PERF-9 (`a6e4a69`), with Urgent p99 120–128 ms against
 963–1178 ms. For example:
-`for s in $(seq 1 60); do cargo run -q --release -p nobaas-sim --example bulk -- --jitter 10 --seed $s; done`.
+`for s in $(seq 1 60); do cargo run -q --release -p peerwire-sim --example bulk -- --jitter 10 --seed $s; done`.
 
 What limits it:
 - **One delay backoff costs 15% of the window.** Slow start puts 1024 fragments per RTT on the wire, about
@@ -94,7 +94,7 @@ What limits it:
   **7–9%** of the sender. At about 6 µs per fragment one core sends roughly 190 MB/s. The simulator output is
   unchanged.
 
-Reproduce with `cargo run --release -p nobaas-sim --example bulk` (all variants), or one variant with flags such
+Reproduce with `cargo run --release -p peerwire-sim --example bulk` (all variants), or one variant with flags such
 as `-- --loss 0.01 --cpu 1 --trace 1`. The CPU split is `scripts/perf-relsend.sh [flags]`, for example `--up 1000`
 (set `PERF="sudo perf"` where unprivileged profiling is off). It builds with frame pointers and debug info, records
 with `perf record --call-graph fp`, and counts the samples whose inline-expanded stack contains each function.
@@ -116,7 +116,7 @@ Setup: 12-player islands, 60 Hz lockstep, 20 ms + 0–10 ms jitter, 1% loss, 20%
 - **Overload:** stalls begin at about 2.5× oversubscription. Below that, overload control lowers the update rate
   instead of stalling.
 
-Reproduce with `cargo run --release -p nobaas-sim --example arena -- --players 512 --supers 8` (add `--help`
+Reproduce with `cargo run --release -p peerwire-sim --example arena -- --players 512 --supers 8` (add `--help`
 for the flags).
 
 **Rule of thumb (theoretical).**
@@ -154,12 +154,12 @@ Assume a stroke update of 64 B sent 20 times a second while someone draws.
 - **Gossip delivery:** `log_d(N)` hops.
   - With `d = 6`, a 10,000-member room is reached in **~5–6 hops**, about 150–300 ms on typical internet RTTs.
 - **Offline delivery:** messages for an offline peer are stored by peers who share the room, up to a quota per
-  peer. They are erasure-coded so any k of n holders can rebuild them. This is planned (`nobaas-store`); see the
+  peer. They are erasure-coded so any k of n holders can rebuild them. This is planned (`peerwire-store`); see the
   roadmap.
 
 ## 6. Meetings: audio and video (theoretical)
 
-Media runs over WebRTC media tracks in browsers. Nobaas does the signaling, identity and topology.
+Media runs over WebRTC media tracks in browsers. Peerwire does the signaling, identity and topology.
 
 | Stream | Typical bitrate |
 |---|---|

@@ -1,25 +1,25 @@
-//! Godot's high-level multiplayer model on a Nobaas [`Node`], with no Godot types,
+//! Godot's high-level multiplayer model on a Peerwire [`Node`], with no Godot types,
 //! so all of it runs under plain `cargo test`.
 //!
 //! The topology is a star, like Godot's ENet peer: the host is peer 1 and every
 //! joiner holds one link, to the host. Joiners reach each other through
 //! SceneMultiplayer's server relay. The host gives each joiner its Godot id in a
-//! control frame right after the Nobaas handshake.
+//! control frame right after the Peerwire handshake.
 //!
 //! A joiner finds its host by invite ([`Session::join`]) or by room
 //! ([`Session::join_room`]): the host announces itself in the room as a
 //! [`Role::Host`] and joiners as [`Role::Client`], so joiners link to the host
 //! only. Either way, with signaling the two dial each other at once and punch
-//! through NATs (see `nobaas::traversal`).
+//! through NATs (see `peerwire::traversal`).
 //!
-//! Every Godot packet travels in one Nobaas message:
+//! Every Godot packet travels in one Peerwire message:
 //!
 //! ```text
 //! data:    0x01 mode(u8) channel(u8) [seq(u32 LE), unreliable-ordered only] payload
 //! control: 0x00 op(u8) ...            op 1 = ASSIGN id(i32 LE), host -> joiner
 //! ```
 
-use nobaas::{
+use peerwire::{
     Event, Failure, Invite, Lane, MapProtocol, NatType, Node, NostrSignaling, PeerId, PeerStats, PortMapping, Privacy,
     Role, SendError, MAX_UNRELIABLE,
 };
@@ -33,7 +33,7 @@ pub const HOST_ID: i32 = 1;
 const TAG_CONTROL: u8 = 0;
 const TAG_DATA: u8 = 1;
 const OP_ASSIGN: u8 = 1;
-/// Largest reliable message: `nobaas::Config::max_message` by default.
+/// Largest reliable message: `peerwire::Config::max_message` by default.
 const MAX_RELIABLE: usize = 1 << 20;
 /// Packets waiting for Godot, and their bytes; past either the oldest are dropped.
 const MAX_INBOX: usize = 4096;
@@ -50,7 +50,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The Nobaas lane a mode travels on. Unreliable-ordered is the unreliable
+    /// The Peerwire lane a mode travels on. Unreliable-ordered is the unreliable
     /// lane plus a sequence number: the receiver drops anything older than what
     /// it has already delivered.
     pub fn lane(self) -> Lane {
@@ -140,7 +140,7 @@ pub fn derive_id(peer: &PeerId, attempt: u32) -> i32 {
     }
 }
 
-/// Godot ids and Nobaas peers, one to one.
+/// Godot ids and Peerwire peers, one to one.
 #[derive(Default)]
 pub struct IdMap {
     by_id: HashMap<i32, PeerId>,
@@ -261,7 +261,7 @@ impl Ordered {
 /// Network settings for the node behind a [`Session`].
 #[derive(Clone, Debug, Default)]
 pub struct NetOptions {
-    /// STUN servers (`host:port`). `None`: Nobaas's defaults; empty: no STUN.
+    /// STUN servers (`host:port`). `None`: Peerwire's defaults; empty: no STUN.
     pub stun: Option<Vec<String>>,
     /// Nostr relays for signaling (`wss://…`, `ws://…`). `None`: the default public
     /// relays; empty: no signaling (rooms can't work, invites don't punch).
@@ -288,7 +288,7 @@ impl NetOptions {
         }
         let relays = match &self.relays {
             Some(r) => r.clone(),
-            None => nobaas::nostr::DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect(),
+            None => peerwire::nostr::DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect(),
         };
         if !relays.is_empty() {
             b = b.signaling(NostrSignaling::new(relays));
@@ -405,7 +405,7 @@ impl Session {
         }
     }
 
-    /// This peer's `nb:` invite.
+    /// This peer's `pw:` invite.
     pub fn invite(&self) -> String {
         self.node.invite()
     }
@@ -463,13 +463,13 @@ impl Session {
         v
     }
 
-    /// The authenticated Nobaas identity (Ed25519 public key) behind Godot peer `id`.
+    /// The authenticated Peerwire identity (Ed25519 public key) behind Godot peer `id`.
     /// Godot ids are short labels; authorize on this key, never on the id.
     pub fn peer_key(&self, id: i32) -> Option<PeerId> {
         self.ids.peer(id)
     }
 
-    /// This peer's own Nobaas identity.
+    /// This peer's own Peerwire identity.
     pub fn public_key(&self) -> PeerId {
         self.node.peer_id()
     }
@@ -499,7 +499,7 @@ impl Session {
         self.node.peer_stats(&self.ids.peer(id)?)
     }
 
-    /// Runs the network: reads, timers, sends, and turns Nobaas events into
+    /// Runs the network: reads, timers, sends, and turns Peerwire events into
     /// packets and peer events. Godot calls it once per frame.
     pub fn poll(&mut self) {
         if self.status == Status::Disconnected {
@@ -690,14 +690,14 @@ pub fn port_mapping_info(m: PortMapping) -> (&'static str, String, &'static str)
 /// Why [`Session::join`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinError {
-    /// Not an `nb:` invite, or one with no usable address.
+    /// Not an `pw:` invite, or one with no usable address.
     InvalidInvite,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nobaas::MemoryHub;
+    use peerwire::MemoryHub;
     use std::time::{Duration, Instant};
 
     fn local() -> Node {
@@ -939,7 +939,7 @@ mod tests {
     /// it knows, and keeps the inbox within its caps.
     #[test]
     fn fuzz_frames_from_peers() {
-        use nobaas_sim::fuzz::{cases, mutate, run, Rng};
+        use peerwire_sim::fuzz::{cases, mutate, run, Rng};
         let modes = [Mode::Unreliable, Mode::UnreliableOrdered, Mode::Reliable];
         let frame = |rng: &mut Rng| {
             let mut b = match rng.below(4) {
@@ -1032,7 +1032,7 @@ mod tests {
         let mut a = Session::join(relay_only, &invite).unwrap();
         assert_eq!(a.node.privacy(), Privacy::RelayOnly { via: Some(host.public_key()) });
         assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
-        assert!(matches!(a.node.path(&host.public_key()), Some(nobaas::Path::Direct(_))));
+        assert!(matches!(a.node.path(&host.public_key()), Some(peerwire::Path::Direct(_))));
         assert_eq!(addrs(&a), vec![], "a relay-only joiner's invite names no address");
         a.target = HOST_ID;
         a.put(b"hi").unwrap();
@@ -1045,8 +1045,8 @@ mod tests {
     fn relay_only_room_client_keeps_its_host_as_relay() {
         let hub = MemoryHub::new();
         let node = |p| Node::builder().signaling(hub.connect()).privacy(p).bind("127.0.0.1:0").unwrap();
-        let mut host = Session::host_room(node(Privacy::Direct), "nb-test", "godot-relay");
-        let mut a = Session::join_room(node(Privacy::RelayOnly { via: None }), "nb-test", "godot-relay", None);
+        let mut host = Session::host_room(node(Privacy::Direct), "pw-test", "godot-relay");
+        let mut a = Session::join_room(node(Privacy::RelayOnly { via: None }), "pw-test", "godot-relay", None);
         assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
         assert_eq!(a.node.privacy(), Privacy::RelayOnly { via: Some(host.public_key()) });
         let inv = Invite::<SocketAddr>::parse(&a.invite()).unwrap();
@@ -1087,17 +1087,17 @@ mod tests {
 
     #[test]
     fn bad_invite_is_refused() {
-        assert_eq!(Session::join(local(), "nb:nope").err(), Some(JoinError::InvalidInvite));
+        assert_eq!(Session::join(local(), "pw:nope").err(), Some(JoinError::InvalidInvite));
     }
 
     #[test]
     fn room_clients_find_the_host_and_only_the_host() {
         let hub = MemoryHub::new();
         let node = || Node::builder().signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
-        let mut host = Session::host_room(node(), "nb-test", "godot-room");
-        let mut a = Session::join_room(node(), "nb-test", "godot-room", None);
-        let mut b = Session::join_room(node(), "nb-test", "godot-room", None);
-        let mut stranger = Session::join_room(node(), "nb-test", "another room", None);
+        let mut host = Session::host_room(node(), "pw-test", "godot-room");
+        let mut a = Session::join_room(node(), "pw-test", "godot-room", None);
+        let mut b = Session::join_room(node(), "pw-test", "godot-room", None);
+        let mut stranger = Session::join_room(node(), "pw-test", "another room", None);
         assert_eq!(a.status(), Status::Connecting);
         assert!(pump(&mut [&mut host, &mut a, &mut b, &mut stranger], |s| {
             s[0].peer_ids().len() == 2 && s[1].status() == Status::Connected && s[2].status() == Status::Connected
@@ -1112,7 +1112,7 @@ mod tests {
 
         // A refusing host is not announced: a newcomer finds nobody.
         host.set_refuse_new_connections(true);
-        let mut late = Session::join_room(node(), "nb-test", "godot-room", None);
+        let mut late = Session::join_room(node(), "pw-test", "godot-room", None);
         let found = pump(&mut [&mut host, &mut late], |s| s[1].status() == Status::Connected);
         assert!(!found);
     }
@@ -1122,16 +1122,16 @@ mod tests {
     /// host key, the client takes that host only.
     #[test]
     fn room_clients_take_only_a_proven_host() {
-        use nobaas::{Signaling, Topic};
+        use peerwire::{Signaling, Topic};
         let hub = MemoryHub::new();
         let node = || Node::builder().signaling(hub.connect()).bind("127.0.0.1:0").unwrap();
-        let mut a = Session::join_room(node(), "nb-test", "secret-room", None);
+        let mut a = Session::join_room(node(), "pw-test", "secret-room", None);
         let mut impostor = node();
         let mut side = hub.connect();
         let hex: String = impostor.peer_id().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
         let forged =
             format!(r#"{{"t":"hello","from":"{hex}","meta":{{"nb":1,"role":"host","p":"{}"}}}}"#, "00".repeat(32));
-        side.publish(Topic::room("nb-test", "secret-room"), forged.as_bytes());
+        side.publish(Topic::room("pw-test", "secret-room"), forged.as_bytes());
         impostor.connect(&a.invite()).unwrap();
         let end = Instant::now() + Duration::from_millis(1500);
         while Instant::now() < end {
@@ -1143,11 +1143,11 @@ mod tests {
         assert_eq!((a.status(), a.peer_ids()), (Status::Connecting, vec![]));
 
         // The real host: found. Another host, when the client names one: ignored.
-        let mut host = Session::host_room(node(), "nb-test", "secret-room");
+        let mut host = Session::host_room(node(), "pw-test", "secret-room");
         assert!(pump(&mut [&mut host, &mut a], |s| s[1].status() == Status::Connected));
         assert_eq!(a.peer_key(HOST_ID), Some(host.public_key()));
-        let mut other = Session::host_room(node(), "nb-test", "secret-room");
-        let mut c = Session::join_room(node(), "nb-test", "secret-room", Some(other.public_key()));
+        let mut other = Session::host_room(node(), "pw-test", "secret-room");
+        let mut c = Session::join_room(node(), "pw-test", "secret-room", Some(other.public_key()));
         assert!(pump(&mut [&mut host, &mut other, &mut c], |s| s[2].status() == Status::Connected));
         assert_eq!(c.peer_key(HOST_ID), Some(other.public_key()));
         assert_eq!(host.peer_ids().len(), 1, "only a");

@@ -5,7 +5,7 @@ Guidance for AI coding agents (and humans) working in this repository. Read this
 
 ## What this is
 
-Nobaas ("no backend as a service") is a peer-to-peer networking toolkit in Rust: multiplayer games, whiteboards,
+Peerwire is a peer-to-peer networking toolkit in Rust: multiplayer games, whiteboards,
 chat and meetings without developer-owned servers or paid relays. It ships as Rust crates, a ~300 KB zero-import
 WebAssembly module with a small JS package, and a C ABI. Status: early development (v0.1).
 
@@ -13,11 +13,11 @@ WebAssembly module with a small JS package, and a C ABI. Status: early developme
 
 | Path | What it is |
 |---|---|
-| `crates/nobaas-core` | Sans-IO session core: identity, Noise IK handshake, lanes (reliable/unreliable/urgent), NAT traversal, peer relay, STUN codec, invites (`nb:` prefix) |
-| `crates/nobaas-sim` | Deterministic network simulator and the multiplayer arena benchmark; integration tests live in `crates/nobaas-sim/tests/` |
-| `crates/nobaas-ffi` | C ABI (`nb_*` symbols, `NB_ERR_*`), the one surface for wasm and native bindings |
-| `crates/nobaas-game` | Deterministic fixed-point maths, Hilbert-curve islands, desync detection |
-| `packages/js` | `@nobaas/js`: `src/room.js` (`joinRoom`), `src/nobaas.js` (`loadNobaas`, class `Nobaas`), WebRTC transport, Nostr signaling, types in `src/index.d.ts`, demos, tests |
+| `crates/peerwire-core` | Sans-IO session core: identity, Noise IK handshake, lanes (reliable/unreliable/urgent), NAT traversal, peer relay, STUN codec, invites (`pw:` prefix) |
+| `crates/peerwire-sim` | Deterministic network simulator and the multiplayer arena benchmark; integration tests live in `crates/peerwire-sim/tests/` |
+| `crates/peerwire-ffi` | C ABI (`pw_*` symbols, `PW_ERR_*`), the one surface for wasm and native bindings |
+| `crates/peerwire-game` | Deterministic fixed-point maths, Hilbert-curve islands, desync detection |
+| `packages/js` | `@peerwire/js`: `src/room.js` (`joinRoom`), `src/peerwire.js` (`loadPeerwire`, class `Peerwire`), WebRTC transport, Nostr signaling, types in `src/index.d.ts`, demos, tests |
 | `examples/` | Live examples (in progress) |
 | `docs/` | Architecture, performance model, comparison with other libraries |
 
@@ -48,9 +48,9 @@ Report what actually ran and its output. Never claim a test passed without runni
 
 ## Rules for code
 
-- Keep `nobaas-core` **sans-IO and deterministic**: no sockets, threads, clocks or randomness inside it; the host
+- Keep `peerwire-core` **sans-IO and deterministic**: no sockets, threads, clocks or randomness inside it; the host
   passes time and bytes in. This is what makes the simulator and wasm build possible.
-- Keep the wasm build **free of imports** (no wasm-bindgen, no std I/O in `nobaas-ffi`).
+- Keep the wasm build **free of imports** (no wasm-bindgen, no std I/O in `peerwire-ffi`).
 - Wire-format, crypto, relay or signaling changes need a security review (see `SECURITY.md`) and a test.
 - Every performance number in `docs/` must be reproducible from the repo, or labelled **theoretical** with its
   formula. This machine is small (4 cores, aarch64): no heavy load tests; use the simulator or estimates.
@@ -62,7 +62,7 @@ Report what actually ran and its output. Never claim a test passed without runni
 ## Git
 
 - Never commit to `main` directly. Work on a branch `<area>/NB-XXX-slug` in your own worktree:
-  `git -C ~/projects/personal/nobaas worktree add ../nobaas-wt/<role> -b <role>/NB-XXX-slug`.
+  `git -C ~/projects/personal/peerwire worktree add ../peerwire-wt/<role> -b <role>/NB-XXX-slug`.
 - Small, descriptive commits: `git -c core.hooksPath=/dev/null commit -q -m "<what changed>"`.
 - **No AI or tool attribution anywhere in git**: no `Co-Authored-By` trailer, no "Generated with" line, no emoji
   signatures. Commit messages describe the change only.
@@ -72,10 +72,10 @@ Report what actually ran and its output. Never claim a test passed without runni
 
 ## Tasks and the team (local only)
 
-- Task files, the roadmap and the team rules live in `~/projects/personal/nobaas/tasks/`.
+- Task files, the roadmap and the team rules live in `~/projects/personal/peerwire/tasks/`.
 - That folder is **git-ignored and must never be pushed or force-added**, so it is not in your worktree: read and
   update it at that absolute path. Start with `tasks/TEAM.md` and your task file `tasks/backlog/NB-XXX-*.md`.
-- Each task has a card on the Nobaas board.
+- Each task has a card on the Peerwire board.
   - Move it to Doing when you start, comment progress as you go, and move it to Needs review when done.
   - Name the branch and commits on the card, with the gate output.
 - Deliverables meant for the repo (test plans, threat model, design notes) go in `docs/`, not `tasks/`.

@@ -2,14 +2,14 @@
 // unchecked. The repro from the card (an over-long id to seal) must throw, the
 // module must keep working afterwards, and every signalling layer must drop a
 // `from` that isn't a PeerId.
-import { loadNobaas, isPeerId, peerBytes } from '../src/nobaas.js';
+import { loadPeerwire, isPeerId, peerBytes } from '../src/peerwire.js';
 import { BroadcastSignaling, WebRtcTransport } from '../src/webrtc.js';
 import { LocalTransport } from '../src/local.js';
 import { NostrSignaling } from '../src/nostr.js';
 import { Room } from '../src/room.js';
 
-const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
-const nb = await loadNobaas(wasm);
+const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
+const pw = await loadPeerwire(wasm);
 let failed = 0;
 const check = (ok, what) => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${what}`);
@@ -25,8 +25,8 @@ const throws = (fn, what) => {
 };
 const tick = () => new Promise((r) => setTimeout(r, 20));
 
-const ep = nb.endpoint();
-const other = nb.endpoint();
+const ep = pw.endpoint();
+const other = pw.endpoint();
 const BAD = {
   'the card repro (8192 hex chars)': 'ab'.repeat(4096),
   '66 hex chars': 'ab'.repeat(33),
@@ -43,7 +43,7 @@ const BAD = {
 
 // 1. The repro from the card, then the module still works.
 throws(() => ep.seal('ab'.repeat(4096), new Uint8Array([1, 2, 3])), 'seal with the card repro id');
-const fresh = nb.endpoint(); // trapped with RuntimeError: unreachable before the fix
+const fresh = pw.endpoint(); // trapped with RuntimeError: unreachable before the fix
 check(isPeerId(fresh.id), 'a new endpoint after the repro');
 const sealed = ep.seal(other.id, new Uint8Array([1, 2, 3]));
 const opened = other.open(sealed);
@@ -74,13 +74,13 @@ check(failed === 0, `9 entry points x ${Object.keys(BAD).length} bad ids all thr
 check(ep.isConnected(other.peerId) === false && ep.isConnected(other.id) === false, 'valid ids (bytes and hex) still accepted');
 
 // 3. Other fixed-size copies.
-throws(() => nb.endpoint({ secret: new Uint8Array(4096) }), 'endpoint with a 4096-byte secret');
-throws(() => nb.endpoint({ secret: new Uint8Array(16) }), 'endpoint with a 16-byte secret');
-throws(() => nb.nostrSign(new Uint8Array(4096), new Uint8Array(32)), 'nostrSign with a 4096-byte secret');
-throws(() => nb.nostrSign(new Uint8Array(32), new Uint8Array(64)), 'nostrSign with a 64-byte message');
-throws(() => nb.put('not bytes'), 'put with a string');
+throws(() => pw.endpoint({ secret: new Uint8Array(4096) }), 'endpoint with a 4096-byte secret');
+throws(() => pw.endpoint({ secret: new Uint8Array(16) }), 'endpoint with a 16-byte secret');
+throws(() => pw.nostrSign(new Uint8Array(4096), new Uint8Array(32)), 'nostrSign with a 4096-byte secret');
+throws(() => pw.nostrSign(new Uint8Array(32), new Uint8Array(64)), 'nostrSign with a 64-byte message');
+throws(() => pw.put('not bytes'), 'put with a string');
 throws(() => ep.open({ length: 5 }), 'open with a fake array-like');
-const same = nb.endpoint({ secret: ep.secret() });
+const same = pw.endpoint({ secret: ep.secret() });
 check(same.id === ep.id, 'a 32-byte secret restores the identity');
 
 // 4. Signalling: hostile `from` values are dropped before anything uses them.
@@ -118,20 +118,20 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
     close() {}
   }
   const sig = fakeSig();
-  const t = new WebRtcTransport(nb.endpoint(), sig, { RTCPeerConnection: Pc });
+  const t = new WebRtcTransport(pw.endpoint(), sig, { RTCPeerConnection: Pc });
   for (const from of hostile) for (const kind of ['offer', 'answer', 'ice']) await sig.handlers[0](from, { kind, sdp: {} });
   await sig.handlers[0](other.id, null);
   check(made === 0 && t.links.size === 0, 'WebRtcTransport makes no link for bad froms');
   let rejected = false;
   await t.dial('ab'.repeat(4096)).catch((e) => (rejected = e instanceof TypeError));
   check(rejected && made === 0, 'WebRtcTransport.dial rejects a bad id');
-  throws(() => new WebRtcTransport(nb.endpoint(), fakeSig(), { RTCPeerConnection: Pc, privacy: 'relay-only', relay: 'ab'.repeat(4096) }), 'relay-only with a bad relay id');
+  throws(() => new WebRtcTransport(pw.endpoint(), fakeSig(), { RTCPeerConnection: Pc, privacy: 'relay-only', relay: 'ab'.repeat(4096) }), 'relay-only with a bad relay id');
 }
 
 // LocalTransport: datagrams from a bad `from` never reach the endpoint.
 {
   const sig = fakeSig();
-  const e2 = nb.endpoint();
+  const e2 = pw.endpoint();
   const t = new LocalTransport(e2, sig);
   for (const from of hostile) sig.handlers[0](from, { kind: 'dg', bytes: new Uint8Array(40) });
   check(t.byPeer.size === 0 && e2.stats().rxPackets === 0, 'LocalTransport drops datagrams from bad froms');
@@ -140,7 +140,7 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
 
 // NostrSignaling: a hello with a bad `from` in a well-formed relay event is dropped.
 {
-  const sig = new NostrSignaling(nb, nb.endpoint(), { room: 'nb021/test', relays: [] });
+  const sig = new NostrSignaling(pw, pw.endpoint(), { room: 'nb021/test', relays: [] });
   await sig.ready;
   const seen = [];
   sig.onHello = (from) => seen.push(from);
@@ -159,7 +159,7 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
 {
   const sig = fakeSig();
   const dialled = [];
-  const room = new Room(nb.endpoint(), sig, () => ({ has: () => false, dial: (p) => dialled.push(p), drop() {}, close() {} }), {});
+  const room = new Room(pw.endpoint(), sig, () => ({ has: () => false, dial: (p) => dialled.push(p), drop() {}, close() {} }), {});
   for (const from of hostile) sig.onHello(from, {});
   check(dialled.length === 0, 'Room dials nothing for bad hello ids');
   await room.leave();
@@ -168,13 +168,13 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
 // 5. Datagram sizes (security N21-1): a DataChannel string message would turn into a length in
 // new Uint8Array("100000000"), and nothing over MAX_DATAGRAM may reach wasm memory.
 {
-  const bytes = () => nb.x.memory.buffer.byteLength;
+  const bytes = () => pw.x.memory.buffer.byteLength;
   const dc = {};
   class Pc {
     createDataChannel() { return dc; }
     close() {}
   }
-  const e3 = nb.endpoint();
+  const e3 = pw.endpoint();
   const fed = [];
   const receive = e3.receive.bind(e3);
   e3.receive = (h, b) => (fed.push(b.length), receive(h, b));
@@ -193,8 +193,8 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
 
 // 6. Nostr content size (security N21-2): oversized events are skipped before decoding.
 {
-  const e4 = nb.endpoint();
-  const sig = new NostrSignaling(nb, e4, { room: 'nb021/size', relays: [] });
+  const e4 = pw.endpoint();
+  const sig = new NostrSignaling(pw, e4, { room: 'nb021/size', relays: [] });
   await sig.ready;
   let opens = 0;
   const open = e4.open.bind(e4);
@@ -202,18 +202,18 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
   const hellos = [];
   sig.onHello = (from) => hellos.push(from);
   const big = btoa(JSON.stringify({ t: 'hello', from: other.id, meta: { pad: 'x'.repeat(70000) } }));
-  const before = nb.x.memory.buffer.byteLength;
+  const before = pw.x.memory.buffer.byteLength;
   sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'b1'.padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.roomTag]], content: big }]));
   sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'b2'.padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.myTag]], content: 'A'.repeat(1 << 20) }]));
-  check(hellos.length === 0 && opens === 0 && nb.x.memory.buffer.byteLength === before, 'NostrSignaling skips content over 64 KiB (hello and sealed)');
+  check(hellos.length === 0 && opens === 0 && pw.x.memory.buffer.byteLength === before, 'NostrSignaling skips content over 64 KiB (hello and sealed)');
   sig.onRelay('test', JSON.stringify(['EVENT', 's', { id: 'c1'.padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.myTag]], content: btoa('x'.repeat(200)) }]));
   check(opens === 1, 'NostrSignaling still opens small sealed content');
   sig.close();
 }
 
 // 7. The module is still healthy: two fresh endpoints still seal to each other.
-const x = nb.endpoint();
-const y = nb.endpoint();
+const x = pw.endpoint();
+const y = pw.endpoint();
 check(y.open(x.seal(y.id, new Uint8Array([9])))?.from === x.id, 'module still healthy at the end');
 
 console.log(failed ? `${failed} FAILED` : 'peer id checks: all passed');

@@ -6,7 +6,7 @@
 // (B) alternate bursts of --mib MiB in 128 KiB messages; the receiver is always B.
 // Not part of the gate: the numbers depend on the host.
 //
-//   node test/room_throttled.mjs --ab=/tmp/nb-main/packages/js --mib=12 --runs=5 --clamp=1000
+//   node test/room_throttled.mjs --ab=/tmp/pw-main/packages/js --mib=12 --runs=5 --clamp=1000
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';

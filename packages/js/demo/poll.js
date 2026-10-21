@@ -1,7 +1,7 @@
 import { joinRoom } from '../src/index.js';
 
 const params = new URLSearchParams(location.search);
-const room = await joinRoom({ appId: 'nobaas-demo', roomId: `poll/${params.get('room') ?? 'demo'}`, queue: true });
+const room = await joinRoom({ appId: 'peerwire-demo', roomId: `poll/${params.get('room') ?? 'demo'}`, queue: true });
 const hue = parseInt(room.self.slice(0, 4), 16) % 360;
 const me = { x: 200 + Math.random() * 880, y: 150 + Math.random() * 420, hue };
 const others = new Map(); // peer id -> { x, y, hue }

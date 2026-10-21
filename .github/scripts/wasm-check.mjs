@@ -1,10 +1,10 @@
 // Checks the browser wasm module: size budget and zero imports.
 //
-//   node .github/scripts/wasm-check.mjs [path=packages/js/pkg/nobaas_ffi.wasm] [max-bytes=$WASM_MAX_BYTES or 358400]
+//   node .github/scripts/wasm-check.mjs [path=packages/js/pkg/peerwire_ffi.wasm] [max-bytes=$WASM_MAX_BYTES or 358400]
 
 import { readFileSync } from 'node:fs';
 
-const file = process.argv[2] ?? 'packages/js/pkg/nobaas_ffi.wasm';
+const file = process.argv[2] ?? 'packages/js/pkg/peerwire_ffi.wasm';
 const max = Number(process.argv[3] ?? process.env.WASM_MAX_BYTES ?? 358400); // same default as scripts/gate.sh
 const bytes = readFileSync(file);
 const mod = new WebAssembly.Module(bytes);

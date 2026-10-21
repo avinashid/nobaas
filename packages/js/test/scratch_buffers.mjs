@@ -4,10 +4,10 @@
 // when the buffers are reused back to back, across the size boundaries and after wasm
 // memory grows (which detaches every view of the old memory), that the hot path makes
 // no allocation, and that the hex helpers agree with the code they replaced.
-import { loadNobaas, Lane, toHex, fromHex } from '../src/nobaas.js';
+import { loadPeerwire, Lane, toHex, fromHex } from '../src/peerwire.js';
 
-const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
-const nb = await loadNobaas(wasm);
+const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
+const pw = await loadPeerwire(wasm);
 let failed = 0;
 const check = (ok, what) => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${what}`);
@@ -17,20 +17,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const enc = new TextEncoder();
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
-// Counts nb_alloc calls an endpoint makes, and records its nb_free calls.
+// Counts pw_alloc calls an endpoint makes, and records its pw_free calls.
 const spy = (ep) => {
   ep.allocs = 0;
   ep.frees = [];
-  const wrap = { nb_alloc: (v) => (...args) => (ep.allocs++, v(...args)), nb_free: (v) => (...args) => (ep.frees.push(`${args[0]}:${args[1]}`), v(...args)) };
-  ep.nb = Object.assign(Object.create(nb), {
-    x: Object.fromEntries(Object.entries(nb.x).map(([k, v]) => [k, wrap[k] ? wrap[k](v) : v])),
+  const wrap = { pw_alloc: (v) => (...args) => (ep.allocs++, v(...args)), pw_free: (v) => (...args) => (ep.frees.push(`${args[0]}:${args[1]}`), v(...args)) };
+  ep.pw = Object.assign(Object.create(pw), {
+    x: Object.fromEntries(Object.entries(pw.x).map(([k, v]) => [k, wrap[k] ? wrap[k](v) : v])),
   });
   return ep;
 };
 const wire = (from, to, addr) => (from.onTransmit = (_, d) => setImmediate(() => to.receive(addr, d)));
 
-const a = spy(nb.endpoint());
-const b = spy(nb.endpoint());
+const a = spy(pw.endpoint());
+const b = spy(pw.endpoint());
 wire(a, b, 1);
 wire(b, a, 2);
 const got = [];
@@ -57,9 +57,9 @@ await roundTrip(['€'.repeat(5461), '€'.repeat(5462), 'a\uD800b', '', 'short'
 
 // A big send makes a buffer of its own; wasm memory may grow. Grow it by hand too: every
 // view taken before is detached now, and the scratch buffers must still be used right.
-const pagesBefore = nb.x.memory.buffer.byteLength;
-nb.x.memory.grow(4);
-check(nb.x.memory.buffer.byteLength === pagesBefore + 4 * 65536, 'wasm memory grew by 4 pages');
+const pagesBefore = pw.x.memory.buffer.byteLength;
+pw.x.memory.grow(4);
+check(pw.x.memory.buffer.byteLength === pagesBefore + 4 * 65536, 'wasm memory grew by 4 pages');
 await roundTrip([bytes(200, 7), 'after grow', bytes(16 * 1024, 8)], 'after grow');
 await roundTrip([bytes(300 * 1024, 9), 'after a big send', bytes(500, 10)], 'big send');
 
@@ -68,7 +68,7 @@ await sleep(100);
 const allocsA = a.allocs;
 const allocsB = b.allocs;
 await roundTrip(Array.from({ length: 50 }, (_, i) => (i % 2 ? `message ${i}` : bytes(100 + i * 300, i))), 'hot path');
-check(a.allocs === allocsA && b.allocs === allocsB, `no nb_alloc for sends up to 16 KiB or for received datagrams (${a.allocs - allocsA}, ${b.allocs - allocsB})`);
+check(a.allocs === allocsA && b.allocs === allocsB, `no pw_alloc for sends up to 16 KiB or for received datagrams (${a.allocs - allocsA}, ${b.allocs - allocsB})`);
 
 // Hex: every byte, both cases, and the old parseInt reading of anything else.
 const oldFromHex = (s) => Uint8Array.from(s.match(/../g), (h) => parseInt(h, 16));
@@ -82,7 +82,7 @@ check(odd.every((s) => same(fromHex(s), oldFromHex(s))), `fromHex reads non-hex 
 
 // setPeer remembers the last id given as text, and skips the copy when it comes again:
 // whatever came in between (another id, bytes, an invalid id), peerBuf must hold the id asked for.
-const held = () => toHex(nb.mem().slice(a.peerBuf, a.peerBuf + 32));
+const held = () => toHex(pw.mem().slice(a.peerBuf, a.peerBuf + 32));
 const idX = toHex(bytes(32, 21));
 const idY = toHex(bytes(32, 22));
 const seq = [[idX, idX], [idY, idY], [idY, idY], [fromHex(idX), idX], [idY, idY], ['bad', null], [idY, idY], [fromHex(idY), idY], [idX, idX]];

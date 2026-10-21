@@ -3,10 +3,10 @@
 // DataChannel would otherwise run on freed memory shared with every other endpoint.
 // send and connect* throw, receive and setRelayOnly do nothing, queries return
 // null or false, and stats() returns the counters as they were at close.
-import { loadNobaas, Lane, MAX_DATAGRAM } from '../src/nobaas.js';
+import { loadPeerwire, Lane, MAX_DATAGRAM } from '../src/peerwire.js';
 
-const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
-const nb = await loadNobaas(wasm);
+const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
+const pw = await loadPeerwire(wasm);
 let failed = 0;
 const check = (ok, what) => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${what}`);
@@ -17,13 +17,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Counts wasm calls an endpoint makes after its close(), by name: any is a use of its freed handle.
 const spy = (ep) => {
   ep.afterClose = [];
-  ep.freed = []; // [pointer, length] of each nb_free after close
-  ep.nb = Object.assign(Object.create(nb), {
-    x: Object.fromEntries(Object.entries(nb.x).map(([k, v]) => [k,
+  ep.freed = []; // [pointer, length] of each pw_free after close
+  ep.pw = Object.assign(Object.create(pw), {
+    x: Object.fromEntries(Object.entries(pw.x).map(([k, v]) => [k,
       typeof v === 'function' ? (...args) => {
         if (ep.closed) {
           ep.afterClose.push(k);
-          if (k === 'nb_free') ep.freed.push(`${args[0]}:${args[1]}`);
+          if (k === 'pw_free') ep.freed.push(`${args[0]}:${args[1]}`);
         }
         return v(...args);
       } : v])),
@@ -33,8 +33,8 @@ const spy = (ep) => {
 // Datagrams sent in one task arrive together in a later one.
 const wire = (from, to, addr) => (from.onTransmit = (_, d) => setImmediate(() => to.receive(addr, d)));
 
-const a = spy(nb.endpoint());
-const b = spy(nb.endpoint());
+const a = spy(pw.endpoint());
+const b = spy(pw.endpoint());
 wire(a, b, 1);
 wire(b, a, 2);
 a.connect(2, b.peerId);
@@ -50,7 +50,7 @@ check(before.txPackets > 0 && secret?.length === 32 && sealed !== null, 'stats, 
 b.close();
 const bufs = [[b.peerBuf, 32], [b.txBuf, MAX_DATAGRAM], [b.rxBuf, MAX_DATAGRAM], [b.sendBuf, 16 * 1024],
   [b.addrBuf, 4], [b.evBuf, b.evCap]].map(([p, n]) => `${p}:${n}`);
-check(b.closed === true && b.afterClose.join() === `nb_endpoint_free,${bufs.map(() => 'nb_free').join()}`
+check(b.closed === true && b.afterClose.join() === `pw_endpoint_free,${bufs.map(() => 'pw_free').join()}`
   && b.freed.slice().sort().join() === bufs.slice().sort().join() && new Set(bufs).size === bufs.length,
   `close() frees the handle and its ${bufs.length} buffers, nothing else (${b.afterClose.join(', ')})`);
 b.afterClose = [];
@@ -92,7 +92,7 @@ await sleep(50);
 check(b.afterClose.length === 0, `no wasm call after close() from any method (${b.afterClose.length}: ${[...new Set(b.afterClose)].join(', ')})`);
 
 // The other endpoint, sharing the module, is unharmed and sees b go.
-const c = nb.endpoint();
+const c = pw.endpoint();
 wire(a, c, 3);
 wire(c, a, 2);
 const got = new Promise((r) => (c.onEvent = (e) => e.type === 'message' && r(new TextDecoder().decode(e.data))));

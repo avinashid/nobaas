@@ -1,15 +1,15 @@
-import { loadNobaas, Lane } from '../src/nobaas.js';
+import { loadPeerwire, Lane } from '../src/peerwire.js';
 import { WebRtcTransport, BroadcastSignaling } from '../src/webrtc.js';
 import { NostrSignaling } from '../src/nostr.js';
 
 const params = new URLSearchParams(location.search);
 const room = params.get('room') ?? 'demo';
-const nb = await loadNobaas(new URL('../pkg/nobaas_ffi.wasm', import.meta.url));
-const ep = nb.endpoint();
+const pw = await loadPeerwire(new URL('../pkg/peerwire_ffi.wasm', import.meta.url));
+const ep = pw.endpoint();
 // ?signal=nostr: public Nostr relays + public STUN, so tabs on different
 // machines can meet. Default: BroadcastChannel (same browser only).
 const nostr = params.get('signal') === 'nostr';
-const sig = nostr ? new NostrSignaling(nb, ep, { room: `demo/${room}` }) : new BroadcastSignaling(ep.id, `nobaas-${room}`);
+const sig = nostr ? new NostrSignaling(pw, ep, { room: `demo/${room}` }) : new BroadcastSignaling(ep.id, `peerwire-${room}`);
 const ice = nostr ? { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], trickle: false } : {};
 const peers = new Map(); // id -> { path, connectedAt }
 const received = new Map(); // id -> count of bench messages
@@ -33,10 +33,10 @@ const dec = new TextDecoder();
 ep.onEvent = (e) => {
   if (e.type === 'connected') {
     peers.set(e.peer, { path: e.path.direct !== undefined ? `datachannel #${e.path.direct}` : `via ${short(e.path.via)}`, connectedAt: performance.now() });
-    log(`Nobaas link up with ${short(e.peer)} (${e.initiator ? 'dialled' : 'answered'})`);
+    log(`Peerwire link up with ${short(e.peer)} (${e.initiator ? 'dialled' : 'answered'})`);
   } else if (e.type === 'disconnected') {
     peers.delete(e.peer);
-    log(`Nobaas link to ${short(e.peer)} closed: ${e.reason}`);
+    log(`Peerwire link to ${short(e.peer)} closed: ${e.reason}`);
   } else if (e.type === 'message') {
     const tag = e.data[0];
     if (tag === 0x42) {
@@ -88,7 +88,7 @@ window.demo = {
       while (ep.send(id, m, lane) === -3) await new Promise((r) => setTimeout(r, 1));
     }
   },
-  // App-level round trips over the Nobaas link.
+  // App-level round trips over the Peerwire link.
   async ping(id, n, lane = Lane.Reliable) {
     pongs.length = 0;
     for (let i = 0; i < n; i++) {

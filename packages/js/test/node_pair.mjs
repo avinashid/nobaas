@@ -1,10 +1,10 @@
 // Two endpoints in one Node process over an in-memory "wire": checks the JS glue.
-import { loadNobaas, Lane } from '../src/nobaas.js';
+import { loadPeerwire, Lane } from '../src/peerwire.js';
 
-const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
-const nb = await loadNobaas(wasm);
-const a = nb.endpoint();
-const b = nb.endpoint();
+const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
+const pw = await loadPeerwire(wasm);
+const a = pw.endpoint();
+const b = pw.endpoint();
 // Handles: a sees b as 2, b sees a as 1.
 a.onTransmit = (addr, bytes) => setImmediate(() => b.receive(1, bytes));
 b.onTransmit = (addr, bytes) => setImmediate(() => a.receive(2, bytes));

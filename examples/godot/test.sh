@@ -8,8 +8,8 @@
 set -e
 cd "$(dirname "$0")"
 GODOT=${GODOT:-godot}
-cargo build --release -p nobaas-godot
-cargo build --release -p nobaas --features nostr --example nostr_relay
+cargo build --release -p peerwire-godot
+cargo build --release -p peerwire --features nostr --example nostr_relay
 "$GODOT" --headless --path . --import >/dev/null 2>&1 || true
 tmp=$(mktemp -d)
 host= relay=

@@ -1,8 +1,8 @@
 # Godot 4
 
-`bindings/godot` is a GDExtension that adds one class, `NobaasMultiplayerPeer`. It is a `MultiplayerPeer`, so
-Godot's own high-level multiplayer (`@rpc`, `MultiplayerSynchronizer`, `MultiplayerSpawner`) runs over Nobaas
-without changes and without a server. One instance hosts; the others join with its `nb:` invite, or find it by
+`bindings/godot` is a GDExtension that adds one class, `PeerwireMultiplayerPeer`. It is a `MultiplayerPeer`, so
+Godot's own high-level multiplayer (`@rpc`, `MultiplayerSynchronizer`, `MultiplayerSpawner`) runs over Peerwire
+without changes and without a server. One instance hosts; the others join with its `pw:` invite, or find it by
 room name. Peers learn their public address from STUN, swap addresses over Nostr relays and punch through NATs.
 Every link is encrypted with Noise IK.
 
@@ -15,19 +15,19 @@ Every link is encrypted with Noise IK.
 ## Install
 
 ```sh
-cargo build --release -p nobaas-godot     # -> target/release/libnobaas_godot.so (.dll, .dylib)
+cargo build --release -p peerwire-godot     # -> target/release/libpeerwire_godot.so (.dll, .dylib)
 ```
 
-Copy the library and [`bindings/godot/nobaas.gdextension`](../bindings/godot/nobaas.gdextension) into your
-project as `res://addons/nobaas/`, and put the library in `res://addons/nobaas/bin/` under the name the
-`.gdextension` file lists for your platform. Godot loads it at the next start, and `NobaasMultiplayerPeer`
-appears like a built-in class. The demo's own [`nobaas.gdextension`](../examples/godot/nobaas.gdextension)
+Copy the library and [`bindings/godot/peerwire.gdextension`](../bindings/godot/peerwire.gdextension) into your
+project as `res://addons/peerwire/`, and put the library in `res://addons/peerwire/bin/` under the name the
+`.gdextension` file lists for your platform. Godot loads it at the next start, and `PeerwireMultiplayerPeer`
+appears like a built-in class. The demo's own [`peerwire.gdextension`](../examples/godot/peerwire.gdextension)
 points straight at `target/release/` instead.
 
 ## Use
 
 ```gdscript
-var peer := NobaasMultiplayerPeer.new()
+var peer := PeerwireMultiplayerPeer.new()
 
 func host() -> void:
 	var invite := peer.host()             # optional UDP port; 0 (the default) picks a free one
@@ -81,7 +81,7 @@ The rest of the `MultiplayerPeer` API works as documented: `refuse_new_connectio
 
 ## Through NATs
 
-Most players sit behind a NAT, so neither side can simply dial the other. `nobaas` does the traversal (see
+Most players sit behind a NAT, so neither side can simply dial the other. `peerwire` does the traversal (see
 [`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md)), and the binding drives it from `_poll()`; no threads are exposed to
 GDScript.
 
@@ -100,7 +100,7 @@ GDScript.
    `get_nat_type() == "cone"` doesn't promise a punch. Godot's star has no third peer both sides are linked to, so
    `join*()` fails with `get_connect_error() == "symmetric"`, and `get_connect_error_message()` says which side
    is symmetric, e.g. "the peer's NAT is symmetric (a new public port per destination) and this side's router
-   only lets in packets from ports it has sent to, ...". Nobaas runs no TURN relay, by design. The Rust `Node`
+   only lets in packets from ports it has sent to, ...". Peerwire runs no TURN relay, by design. The Rust `Node`
    relays such pairs through any peer connected to both.
 
 ```gdscript
@@ -147,15 +147,15 @@ peer.host_room("my-game", room)
 - **`close()` waits for the delete.** That normally takes milliseconds; against a router that stalls, it can take
   up to 7 s.
 
-The simulator covers the whole NAT matrix (`crates/nobaas-sim/tests/traversal.rs`). Real carrier-grade NATs across
+The simulator covers the whole NAT matrix (`crates/peerwire-sim/tests/traversal.rs`). Real carrier-grade NATs across
 two networks still need testing on real devices.
 
-## How it maps onto Nobaas
+## How it maps onto Peerwire
 
 - **Topology: a star, like Godot's ENet peer.** The host is peer 1, and every joiner holds one encrypted link,
   to the host. `is_server_relay_supported()` is true, so SceneMultiplayer relays joiner-to-joiner RPCs and
   replication through the host.
-- **Peer ids.** A joiner's id comes from its Nobaas `PeerId` (an Ed25519 public key), so it stays the same for a
+- **Peer ids.** A joiner's id comes from its Peerwire `PeerId` (an Ed25519 public key), so it stays the same for a
   persistent identity. The id is always in `2..=2147483647`. The host assigns it and sends it in a control frame
   right after the handshake; until it arrives the joiner stays `CONNECTING`. If two keys map to the same id, the
   host gives the newcomer the next derived id.
@@ -166,14 +166,14 @@ two networks still need testing on real devices.
     receiver drops anything older than the newest packet it has delivered. Payload up to 1093 B.
 - **Channels** travel with each packet and are reported by `get_packet_channel()`. All reliable channels share
   one ordered stream, so a large reliable message on channel 2 delays channel 1 behind it.
-- **Frame format** (inside the encrypted Nobaas message), from `bindings/godot/src/session.rs`:
+- **Frame format** (inside the encrypted Peerwire message), from `bindings/godot/src/session.rs`:
   - data: `0x01 mode channel [seq u32 LE, unreliable-ordered only] payload`
     A frame whose mode doesn't match the lane it arrived on is dropped.
   - control: `0x00 0x01 id(i32 LE)`, the host's id assignment. Other control frames are ignored.
 
 ## Security
 
-Nobaas guarantees that every byte reaching the `MultiplayerPeer` came from the authenticated peer and was not
+Peerwire guarantees that every byte reaching the `MultiplayerPeer` came from the authenticated peer and was not
 read or changed on the way. Everything Godot does with those bytes is outside that guarantee, and in a P2P game
 **every connected peer is a potential attacker**. (Threat model: SEC-9 to SEC-11 in `docs/THREAT-MODEL.md`.)
 
@@ -189,7 +189,7 @@ read or changed on the way. Everything Godot does with those bytes is outside th
   can be taken over while its owner is away.
 - **Godot's authority model is only as trustworthy as the peer you make the authority.** In this star the host is
   the natural authority: let it own spawning and validate what joiners send. A malicious host can still push any
-  state. If no single peer can be trusted, run the game as deterministic lockstep on `nobaas-game`, where every
+  state. If no single peer can be trusted, run the game as deterministic lockstep on `peerwire-game`, where every
   peer recomputes the state and desyncs are detected.
 - **Relaying between joiners is Godot's server relay** (`multiplayer.server_relay`, on by default): the host's
   SceneMultiplayer forwards joiner packets, and the binding only reports that it can.
@@ -217,14 +217,14 @@ read or changed on the way. Everything Godot does with those bytes is outside th
   - **Close the door.** Set `refuse_new_connections` once everyone is in (a refusing host also stops announcing
     its room), or kick with `disconnect_peer()`.
 - **Third parties by default.** With the defaults, `host*()` and `join*()` contact Google's and Cloudflare's STUN
-  servers (they learn your public IP and that you run Nobaas) and the Nostr relays `relay.damus.io` and `nos.lol`.
-  Relays see the room topic (a SHA-256 of `nobaas/room/<app id>/<room>`, so anyone who knows or guesses the name
+  servers (they learn your public IP and that you run Peerwire) and the Nostr relays `relay.damus.io` and `nos.lol`.
+  Relays see the room topic (a SHA-256 of `peerwire/room/<app id>/<room>`, so anyone who knows or guesses the name
   can watch who announces in it, and when), each peer's topic (a hash of its public key), your IP and the timing
   of messages. They never see addresses or anything else in an offer: offers are sealed to the recipient's key
   (Noise X), carry a timestamp and nonce, and are dropped when stale or replayed. A fresh Nostr key signs each
-  session's events, so they are not linked to your Nobaas identity. `set_stun_servers([])` and
+  session's events, so they are not linked to your Peerwire identity. `set_stun_servers([])` and
   `set_signaling_relays([])` turn both off (LAN and open-port play still work), or point them at servers you run:
-  `cargo run -p nobaas --features nostr --example nostr_relay` is a minimal relay for a LAN. On a `ws://` relay,
+  `cargo run -p peerwire --features nostr --example nostr_relay` is a minimal relay for a LAN. On a `ws://` relay,
   anyone on the network path can drop or inject events. Offers stay sealed and hellos stay proven, so that can stop
   a game from connecting but not let anyone into it.
 - **Your key alone gets nothing.** A peer answers an offer, and so reveals its addresses and up to 8 keys it is
@@ -249,7 +249,7 @@ the room name can claim that and so learn the player's IP. Use `join_room_host()
 player's own invite names the host as its relay, with the host's address.
 
 ```gdscript
-peer.set_privacy_mode(NobaasMultiplayerPeer.PRIVACY_PUBLIC_ONLY)   # before host*() / join*(), or any time
+peer.set_privacy_mode(PeerwireMultiplayerPeer.PRIVACY_PUBLIC_ONLY)   # before host*() / join*(), or any time
 ```
 
 ## Demo
@@ -260,7 +260,7 @@ player moves a square with the arrow keys, synced by `MultiplayerSynchronizer` a
 `MultiplayerSpawner`. A text box sends an `@rpc` chat line.
 
 ```sh
-cargo build --release -p nobaas-godot
+cargo build --release -p peerwire-godot
 godot --path examples/godot              # twice: Host in one window, paste the invite + Join in the other
 GODOT=godot ./examples/godot/test.sh     # headless check on loopback: invite run + room run, exits 0 on success
 ```
@@ -273,11 +273,11 @@ service. The instances move by themselves and chat. Each passes once it has seen
 received its chat line:
 
 ```
-NOBAAS_DEMO_OK peer=1 rtt_ms=6.9
-NOBAAS_DEMO_OK peer=1813978524 rtt_ms=16.0
+PEERWIRE_DEMO_OK peer=1 rtt_ms=6.9
+PEERWIRE_DEMO_OK peer=1813978524 rtt_ms=16.0
 invite: PASS
-NOBAAS_DEMO_OK peer=1 rtt_ms=10.9
-NOBAAS_DEMO_OK peer=985991120 rtt_ms=-1.0
+PEERWIRE_DEMO_OK peer=1 rtt_ms=10.9
+PEERWIRE_DEMO_OK peer=985991120 rtt_ms=-1.0
 room: PASS
 PASS
 ```
@@ -286,7 +286,7 @@ PASS
 
 ## Tests
 
-The protocol logic (`Session`) has no Godot types, so `cargo test -p nobaas-godot` covers it without a Godot
+The protocol logic (`Session`) has no Godot types, so `cargo test -p peerwire-godot` covers it without a Godot
 binary:
 
 - id derivation and collisions;
@@ -309,11 +309,11 @@ binary:
   Nostr's websockets altogether.
 - **Rooms have no host election**, and a host takes `max_peers` joiners (default 32). One host per room: a second
   `host_room` with the same name is found by some joiners and not others.
-- **The host's uplink carries everyone**, as with any star. Use `nobaas-game` islands and super-peers for big
+- **The host's uplink carries everyone**, as with any star. Use `peerwire-game` islands and super-peers for big
   sessions.
-- **Lockstep and rollback games** must run their game logic on `nobaas-game` fixed-point maths, not Godot
+- **Lockstep and rollback games** must run their game logic on `peerwire-game` fixed-point maths, not Godot
   physics or floats. Godot physics is not deterministic across machines.
-- **Web export** has no UDP. It needs a transport through `nobaas.js` (WebRTC) bridged with `JavaScriptBridge`.
+- **Web export** has no UDP. It needs a transport through `peerwire.js` (WebRTC) bridged with `JavaScriptBridge`.
   That is follow-up work.
 - **Android / iOS** need per-target builds (`aarch64-linux-android`, `aarch64-apple-ios`) and `.gdextension`
   entries. Not built or tested yet.

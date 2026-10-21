@@ -1,11 +1,11 @@
-//! Echo over Nobaas with tokio: one process hosts, another joins with its invite.
+//! Echo over Peerwire with tokio: one process hosts, another joins with its invite.
 //!
 //! ```sh
-//! cargo run -p nobaas --features tokio --example echo_async           # prints an nb: invite
-//! cargo run -p nobaas --features tokio --example echo_async -- nb:…   # joins and says hello
+//! cargo run -p peerwire --features tokio --example echo_async           # prints an pw: invite
+//! cargo run -p peerwire --features tokio --example echo_async -- pw:…   # joins and says hello
 //! ```
 
-use nobaas::{AsyncNode, Event, Lane};
+use peerwire::{AsyncNode, Event, Lane};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

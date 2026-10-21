@@ -1,0 +1,18 @@
+[package]
+name = "peerwire-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic network simulator for Peerwire: real endpoints over simulated latency, loss, uplinks and NATs, in virtual time"
+
+[dependencies]
+peerwire-core = { path = "../peerwire-core" }
+rand_core = "0.6"
+rand_chacha = "0.3"
+
+
+[dev-dependencies]
+peerwire-game = { path = "../peerwire-game" }
+# The NAT traversal layer, driven over simulated NATs.
+peerwire = { path = "../peerwire" }

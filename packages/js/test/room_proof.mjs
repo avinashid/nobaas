@@ -3,7 +3,7 @@
 // without the room name gets no link and no presence:
 // - its hellos (none, forged, Rust UDP ones, another room's) make no one dial it;
 // - its WebRTC offers without a room proof get no answer and no RTCPeerConnection;
-// - a Nobaas link it dials itself gets only the room's link proof, never
+// - a Peerwire link it dials itself gets only the room's link proof, never
 //   presence or messages; frames before a proof are ignored, a wrong proof drops
 //   the link at once and no proof drops it after Room.proofMs.
 // Also checks the hello proof against an independent HMAC built the way
@@ -11,7 +11,7 @@
 //
 //   node packages/js/test/room_proof.mjs
 import { createHash, createHmac } from 'node:crypto';
-import { joinRoom, Room, loadNobaas, BroadcastSignaling, LocalTransport, toHex } from '../src/index.js';
+import { joinRoom, Room, loadPeerwire, BroadcastSignaling, LocalTransport, toHex } from '../src/index.js';
 import { RoomProof, randomRoomId } from '../src/proof.js';
 
 const fail = (m) => {
@@ -28,20 +28,20 @@ const until = async (what, cond, ms = 10000) => {
   }
 };
 
-// 1. The hello proof is Rust's: HMAC-SHA256 under sha256("nobaas/room-key/<app>/<room>")
-//    over "nb-hello", the 32-byte id, the role byte and ts as a little-endian u64.
-const name = 'nobaas-test/proof';
+// 1. The hello proof is Rust's: HMAC-SHA256 under sha256("peerwire/room-key/<app>/<room>")
+//    over "pw-hello", the 32-byte id, the role byte and ts as a little-endian u64.
+const name = 'peerwire-test/proof';
 const proof = await RoomProof.create(name);
 const id = 'ab'.repeat(32);
 const ts = 1760000000123;
-const key = createHash('sha256').update(`nobaas/room-key/${name}`).digest();
+const key = createHash('sha256').update(`peerwire/room-key/${name}`).digest();
 const ts8 = Buffer.alloc(8);
 ts8.writeBigUInt64LE(BigInt(ts));
-const want = createHmac('sha256', key).update(Buffer.concat([Buffer.from('nb-hello'), Buffer.from(id, 'hex'), Buffer.of(0), ts8])).digest('hex');
+const want = createHmac('sha256', key).update(Buffer.concat([Buffer.from('pw-hello'), Buffer.from(id, 'hex'), Buffer.of(0), ts8])).digest('hex');
 const meta = await proof.hello(id, 'peer', ts);
 if (meta.p !== want || meta.ts !== ts || meta.role !== 'peer') fail(`hello proof ${JSON.stringify(meta)} != ${want}`);
 if (!(await proof.checkHello(id, meta, ts + 1000))) fail('a fresh hello did not verify');
-const other = await RoomProof.create('nobaas-test/proof-other');
+const other = await RoomProof.create('peerwire-test/proof-other');
 const bad = [
   ['stale', id, meta, ts + 61000],
   ['from the future', id, meta, ts - 61000],
@@ -58,18 +58,18 @@ if (randomRoomId().length !== 22 || randomRoomId() === randomRoomId()) fail('ran
 console.log('hello proof matches the Rust construction; stale, foreign and forged hellos fail');
 
 // 2. Two members and an attacker that knows only the topic: in Node, 'local'
-//    rooms use BroadcastChannel `nobaas/<app>/<room>` for hellos and datagrams.
+//    rooms use BroadcastChannel `peerwire/<app>/<room>` for hellos and datagrams.
 Room.proofMs = 500;
-const opts = { appId: 'nobaas-test', roomId: `proof-${process.pid}` };
-const nb = await loadNobaas(new URL('../pkg/nobaas_ffi.wasm', import.meta.url));
+const opts = { appId: 'peerwire-test', roomId: `proof-${process.pid}` };
+const pw = await loadPeerwire(new URL('../pkg/peerwire_ffi.wasm', import.meta.url));
 // The larger id never dials ('smaller id dials'), so make the members dial: if a
 // forged hello were believed, they would dial the attacker.
-let ep = nb.endpoint();
+let ep = pw.endpoint();
 while (!ep.id.startsWith('ff')) {
   ep.close();
-  ep = nb.endpoint();
+  ep = pw.endpoint();
 }
-const sig = new BroadcastSignaling(ep.id, `nobaas/${opts.appId}/${opts.roomId}`);
+const sig = new BroadcastSignaling(ep.id, `peerwire/${opts.appId}/${opts.roomId}`);
 const seen = new Set(); // member ids, from their hellos
 sig.onHello = (from) => seen.add(from);
 const got = []; // what members sent the attacker
@@ -82,7 +82,7 @@ const lt = new LocalTransport(ep, sig);
 // Hellos that don't prove the room key: none, forged, a Rust UDP peer's, another room's.
 sig.hello();
 sig.hello({ role: 'peer', ts: Date.now(), p: '00'.repeat(32) });
-sig.hello({ nb: 1, role: 'peer', ts: Date.now(), p: '00'.repeat(32) });
+sig.hello({ pw: 1, role: 'peer', ts: Date.now(), p: '00'.repeat(32) });
 sig.hello(await other.hello(ep.id));
 
 const [a, b] = await Promise.all(['ana', 'bo'].map((n) => joinRoom({ ...opts, presence: { name: n } })));
@@ -130,15 +130,15 @@ class CountingPc {
     throw new Error('no RTCPeerConnection should be made for an unproven offer');
   }
 }
-const rtcOpts = { appId: 'nobaas-test', roomId: `proof-rtc-${process.pid}` };
+const rtcOpts = { appId: 'peerwire-test', roomId: `proof-rtc-${process.pid}` };
 const victim = await joinRoom({ ...rtcOpts, RTCPeerConnection: CountingPc });
-const sig2 = new BroadcastSignaling(ep.id, `nobaas/${rtcOpts.appId}/${rtcOpts.roomId}`);
+const sig2 = new BroadcastSignaling(ep.id, `peerwire/${rtcOpts.appId}/${rtcOpts.roomId}`);
 const answers = [];
 sig2.onMessage((from, msg) => answers.push(msg.kind));
 const sdp = { type: 'offer', sdp: 'v=0\r\n' };
 sig2.send(victim.self, { kind: 'offer', sdp });
 sig2.send(victim.self, { kind: 'offer', sdp, p: '00'.repeat(32) });
-sig2.send(victim.self, { kind: 'offer', sdp, p: await other.pair('nb-rtc-offer', ep.id, victim.self) });
+sig2.send(victim.self, { kind: 'offer', sdp, p: await other.pair('pw-rtc-offer', ep.id, victim.self) });
 sig2.send(victim.self, { kind: 'ice', candidate: {} });
 await sleep(300);
 if (pcs || answers.length) fail(`unproven offers: ${pcs} RTCPeerConnections, answers ${answers}`);

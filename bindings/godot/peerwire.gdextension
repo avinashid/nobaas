@@ -1,0 +1,14 @@
+; Ship this with the built library in a Godot project, for example under
+; res://addons/peerwire/ next to a bin/ folder holding the libraries named below.
+; Build: cargo build --release -p peerwire-godot (per target; see docs/GODOT.md).
+
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.3
+reloadable = true
+
+[libraries]
+linux.x86_64 = "res://addons/peerwire/bin/libpeerwire_godot.x86_64.so"
+linux.arm64 = "res://addons/peerwire/bin/libpeerwire_godot.arm64.so"
+windows.x86_64 = "res://addons/peerwire/bin/peerwire_godot.x86_64.dll"
+macos = "res://addons/peerwire/bin/libpeerwire_godot.dylib"

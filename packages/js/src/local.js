@@ -1,10 +1,10 @@
 // Datagrams over the signalling channel itself (BroadcastSignaling), for hosts
 // without WebRTC (Node, workers) and for tests. Same interface as
-// WebRtcTransport: dial, has, drop, close. The Nobaas handshake and lanes run on
+// WebRtcTransport: dial, has, drop, close. The Peerwire handshake and lanes run on
 // top as usual. Every datagram is posted to the whole channel, so this suits a
 // few peers in one process or one browser, not a network.
 
-import { isPeerId } from './nobaas.js';
+import { isPeerId } from './peerwire.js';
 
 export class LocalTransport {
   constructor(endpoint, signaling) {

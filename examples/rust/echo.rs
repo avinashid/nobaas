@@ -1,11 +1,11 @@
-//! Echo over Nobaas: one process hosts, another joins with its invite.
+//! Echo over Peerwire: one process hosts, another joins with its invite.
 //!
 //! ```sh
-//! cargo run -p nobaas --example echo                 # prints an nb: invite and echoes back
-//! cargo run -p nobaas --example echo -- nb:…          # joins, sends "hello", prints the echo
+//! cargo run -p peerwire --example echo                 # prints an pw: invite and echoes back
+//! cargo run -p peerwire --example echo -- pw:…          # joins, sends "hello", prints the echo
 //! ```
 
-use nobaas::{Event, Lane, Node};
+use peerwire::{Event, Lane, Node};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

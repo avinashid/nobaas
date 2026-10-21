@@ -1,6 +1,6 @@
-// Types for @nobaas/js.
+// Types for @peerwire/js.
 
-/** A peer's id: its 32-byte Nobaas PeerId as 64 hex characters. */
+/** A peer's id: its 32-byte Peerwire PeerId as 64 hex characters. */
 export type PeerId = string;
 
 /** Free-form data a peer shares with the room (a nickname, a colour); must survive JSON. */
@@ -29,7 +29,7 @@ export interface SignalingAdapter {
 
 export interface SignalingContext {
   endpoint: Endpoint;
-  nobaas: Nobaas;
+  peerwire: Peerwire;
   /** `${appId}/${roomId}` */
   room: string;
 }
@@ -56,7 +56,7 @@ export interface JoinRoomOptions {
   queue?: boolean;
   /** 32 bytes restoring an identity from `room.endpoint.secret()`; a fresh one by default. */
   secret?: Uint8Array;
-  /** Where to load `nobaas_ffi.wasm` from: a URL, a file path (Node) or the bytes. Default: next to this package. */
+  /** Where to load `peerwire_ffi.wasm` from: a URL, a file path (Node) or the bytes. Default: next to this package. */
   wasm?: string | URL | BufferSource;
   /** Nostr relays, for `signaling: 'nostr'`. */
   relays?: string[];
@@ -108,7 +108,7 @@ export declare class Room {
   readonly self: PeerId;
   /** Joined peers, not counting us. */
   readonly peers: PeerId[];
-  /** The Nobaas endpoint underneath, for stats, sealing and identity. */
+  /** The Peerwire endpoint underneath, for stats, sealing and identity. */
   readonly endpoint: Endpoint;
   readonly signaling: SignalingAdapter;
   /** Subscribes; returns a function that unsubscribes. */
@@ -186,13 +186,13 @@ export interface EndpointStats {
   directFallbacks: number;
 }
 
-export interface Nobaas {
+export interface Peerwire {
   nostrKeypair(): { secret: Uint8Array; pubkey: Uint8Array };
   nostrSign(secret: Uint8Array, msg32: Uint8Array): Uint8Array;
   endpoint(options?: { secret?: Uint8Array | null; shareAddresses?: boolean; relayOnly?: boolean }): Endpoint;
 }
 
-export declare function loadNobaas(source: string | URL | BufferSource): Promise<Nobaas>;
+export declare function loadPeerwire(source: string | URL | BufferSource): Promise<Peerwire>;
 
 /** Every method that takes a peer throws a TypeError unless it is 32 bytes or 64 lowercase hex
  * characters: ids from signalling are untrusted and never reach wasm memory unchecked. */
@@ -226,7 +226,7 @@ export declare class Endpoint {
   open(bytes: Uint8Array): { from: PeerId; data: Uint8Array } | null;
   isConnected(peer: PeerId | Uint8Array): boolean;
   rttMs(peer: PeerId | Uint8Array): number | null;
-  /** 0, or a negative NB_ERR code (-1 not connected, -2 too large: over 1100 B unreliable, 64 KiB urgent,
+  /** 0, or a negative PW_ERR code (-1 not connected, -2 too large: over 1100 B unreliable, 64 KiB urgent,
    * 1 MiB reliable; -3 would block).
    * Throws `Error('send: endpoint closed')` after `close()`: that is a bug in the app, not a lost packet. */
   send(peer: PeerId | Uint8Array, data: string | Uint8Array, lane?: number): number;
@@ -313,7 +313,7 @@ export declare class BroadcastSignaling implements SignalingAdapter {
 }
 
 export declare class NostrSignaling implements SignalingAdapter {
-  constructor(nb: Nobaas, endpoint: Endpoint, options: { room: string; relays?: string[] });
+  constructor(pw: Peerwire, endpoint: Endpoint, options: { room: string; relays?: string[] });
   readonly id: string;
   readonly ready: Promise<void>;
   readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; lastRejection?: string };

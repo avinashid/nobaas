@@ -3,7 +3,7 @@
 //! tag. It stores nothing, checks no signatures and serves plain `ws://` only.
 //!
 //! ```sh
-//! cargo run -p nobaas --features nostr --example nostr_relay -- 127.0.0.1:7447
+//! cargo run -p peerwire --features nostr --example nostr_relay -- 127.0.0.1:7447
 //! ```
 //! then give nodes `NostrSignaling::new(["ws://127.0.0.1:7447"])`.
 

@@ -1,14 +1,14 @@
 # The optional always-on peer and the browser demos, on this machine only (see docs/DOCKER.md).
 #
 #   docker compose up -d --build
-#   docker compose exec peer nobaas-peer check     # or: docker compose logs peer  (prints the invite)
+#   docker compose exec peer peerwire-peer check     # or: docker compose logs peer  (prints the invite)
 #
 # Logs are capped at three 10 MB files per service; the peer's hold the IP:port of every linked peer.
 #
 # Nothing listens beyond localhost by default:
 #   peer      UDP 127.0.0.1:7700 (host network, so its invite and the addresses it sees are the real ones);
-#             set NOBAAS_BIND=0.0.0.0:7700 to make it reachable from other hosts.
-#   examples  http://127.0.0.1:7780 (set NOBAAS_EXAMPLES_PORT to change the port).
+#             set PEERWIRE_BIND=0.0.0.0:7700 to make it reachable from other hosts.
+#   examples  http://127.0.0.1:7780 (set PEERWIRE_EXAMPLES_PORT to change the port).
 
 x-logging: &logging
   driver: json-file
@@ -21,14 +21,14 @@ services:
     build:
       context: .
       target: peer
-    image: nobaas-peer
+    image: peerwire-peer
     network_mode: host
     environment:
-      NOBAAS_BIND: ${NOBAAS_BIND:-127.0.0.1:7700}
-      NOBAAS_STUN: ${NOBAAS_STUN:-}
-      NOBAAS_MAX_PEERS: ${NOBAAS_MAX_PEERS:-256}
-      NOBAAS_RELAY_RATE: ${NOBAAS_RELAY_RATE:-262144}
-      NOBAAS_RELAY_TOTAL: ${NOBAAS_RELAY_TOTAL:-8388608}
+      PEERWIRE_BIND: ${PEERWIRE_BIND:-127.0.0.1:7700}
+      PEERWIRE_STUN: ${PEERWIRE_STUN:-}
+      PEERWIRE_MAX_PEERS: ${PEERWIRE_MAX_PEERS:-256}
+      PEERWIRE_RELAY_RATE: ${PEERWIRE_RELAY_RATE:-262144}
+      PEERWIRE_RELAY_TOTAL: ${PEERWIRE_RELAY_TOTAL:-8388608}
     volumes:
       - peer-data:/data
     init: true
@@ -44,9 +44,9 @@ services:
     build:
       context: .
       target: examples
-    image: nobaas-examples
+    image: peerwire-examples
     ports:
-      - "127.0.0.1:${NOBAAS_EXAMPLES_PORT:-7780}:8080"
+      - "127.0.0.1:${PEERWIRE_EXAMPLES_PORT:-7780}:8080"
     tmpfs:
       - /tmp
     read_only: true

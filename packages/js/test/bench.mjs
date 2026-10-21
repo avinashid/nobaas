@@ -27,9 +27,9 @@
 // at load 6 on this host gave CPU medians of 0.986..1.013 in every case, while
 // throughput medians ranged 0.92..1.08 with single pairs from 0.48 to 1.88.
 //
-//   git -C ~/projects/personal/nobaas worktree add --detach /tmp/nb-main origin/main
-//   /tmp/nb-main/packages/js/build.sh && ./packages/js/build.sh    # from the branch root
-//   cd packages/js && node test/bench.mjs --ab=/tmp/nb-main/packages/js
+//   git -C ~/projects/personal/peerwire worktree add --detach /tmp/pw-main origin/main
+//   /tmp/pw-main/packages/js/build.sh && ./packages/js/build.sh    # from the branch root
+//   cd packages/js && node test/bench.mjs --ab=/tmp/pw-main/packages/js
 import os from 'node:os';
 import { execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -58,14 +58,14 @@ const log = (s) => { if (!JSON_OUT) console.log(s); };
 // One packages/js: its glue module, a loaded wasm, and where it came from.
 async function side(label, dir) {
   dir = resolve(dir);
-  const mod = await import(pathToFileURL(`${dir}/src/nobaas.js`));
-  const wasm = `${dir}/pkg/nobaas_ffi.wasm`;
+  const mod = await import(pathToFileURL(`${dir}/src/peerwire.js`));
+  const wasm = `${dir}/pkg/peerwire_ffi.wasm`;
   let commit = 'unknown';
   try {
     commit = execSync('git rev-parse --short HEAD', { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
   } catch {}
   const room = await import(pathToFileURL(`${dir}/src/room.js`));
-  return { label, lib: dir, commit, wasm, wasmBytes: readFileSync(wasm).length, mod, room, nb: await mod.loadNobaas(wasm) };
+  return { label, lib: dir, commit, wasm, wasmBytes: readFileSync(wasm).length, mod, room, pw: await mod.loadPeerwire(wasm) };
 }
 // Run order: A (baseline) first, then B; without --ab there is only B.
 const sides = AB ? [await side('A', AB), await side('B', LIB)] : [await side('B', LIB)];
@@ -76,9 +76,9 @@ const { Lane, EventKind } = sides[0].mod;
 const gcs = [];
 new PerformanceObserver((l) => gcs.push(...l.getEntries())).observe({ entryTypes: ['gc'] });
 
-async function pair(nb) {
-  const a = nb.endpoint();
-  const b = nb.endpoint();
+async function pair(pw) {
+  const a = pw.endpoint();
+  const b = pw.endpoint();
   // Handles: a sees b as 2, b sees a as 1.
   a.onTransmit = (addr, bytes) => b.receive(1, bytes);
   b.onTransmit = (addr, bytes) => a.receive(2, bytes);
@@ -176,7 +176,7 @@ for (const [name, lane, size, count] of [
     name,
     unit: 'msg/s',
     info: { lane: lane === Lane.Reliable ? 'reliable' : 'unreliable', size, count },
-    setup: (s) => pair(s.nb),
+    setup: (s) => pair(s.pw),
     run: async (p) => {
       const r = await stream(p, lane, size, count);
       if (lane !== Lane.Unreliable && r.got !== count) throw new Error(`${name}: ${r.got} of ${count} delivered`);
@@ -204,7 +204,7 @@ CASES.push({
   unit: 'msg/s',
   info: { lane: 'reliable', size: ROOM_SIZE, count: ROOM_COUNT },
   setup: async (s) => {
-    const opts = { appId: 'nobaas-bench', roomId: `room-${s.label}-${process.pid}`, wasm: s.wasm };
+    const opts = { appId: 'peerwire-bench', roomId: `room-${s.label}-${process.pid}`, wasm: s.wasm };
     const [a, b] = await Promise.all([s.room.joinRoom(opts), s.room.joinRoom(opts)]);
     while (a.peers.length !== 1 || b.peers.length !== 1) await new Promise((r) => setTimeout(r, 10));
     return { a, b, msg: new Uint8Array(ROOM_SIZE).fill(7) };
@@ -273,7 +273,7 @@ const meta = {
   exposeGc: !!globalThis.gc,
 };
 const desc = sides.map((s) => `${AB ? `${s.label} ` : ''}commit ${s.commit} wasm ${s.wasmBytes} B`).join(', ');
-log(`nobaas JS bench: ${desc}; load ${meta.loadavg[0]}, node ${meta.node}, ${meta.platform}, ${meta.cpu}`);
+log(`peerwire JS bench: ${desc}; load ${meta.loadavg[0]}, node ${meta.node}, ${meta.platform}, ${meta.cpu}`);
 if (meta.loadavg[0] > os.cpus().length / 2) log(`warning: load average ${meta.loadavg[0]} on ${os.cpus().length} cores; absolute numbers will be noisy (use --ab to compare)`);
 log(`median of ${RUNS} rounds after ${WARMUP} warm-up; [min..max]; gc = collections / pause per round${AB ? '; A and B alternate rounds' : ''}`);
 

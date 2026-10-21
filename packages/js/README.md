@@ -1,12 +1,12 @@
-# @nobaas/js
+# @peerwire/js
 
 Peer-to-peer rooms for the browser and Node, with no server of our own:
-nobaas-core compiled to a WebAssembly module with no imports
-(`crates/nobaas-ffi`), a small JS host, WebRTC DataChannels as the datagram
+peerwire-core compiled to a WebAssembly module with no imports
+(`crates/peerwire-ffi`), a small JS host, WebRTC DataChannels as the datagram
 transport and Nostr relays (or a BroadcastChannel) to find peers. No wasm-bindgen.
 
 ```
-./packages/js/build.sh                         # -> packages/js/pkg/nobaas_ffi.wasm (~300 KB)
+./packages/js/build.sh                         # -> packages/js/pkg/peerwire_ffi.wasm (~300 KB)
 python3 -m http.server -d packages/js 8000     # any static server
 ```
 
@@ -17,7 +17,7 @@ python3 -m http.server -d packages/js 8000     # any static server
 <ul id="log"></ul>
 <form id="chat"><input id="text" autocomplete="off"><button>Send</button></form>
 <script type="module">
-  import { joinRoom } from '@nobaas/js';
+  import { joinRoom } from '@peerwire/js';
   const room = await joinRoom({ appId: 'readme-chat', roomId: 'lobby' }); // signaling: 'nostr' to reach other machines
   const show = (who, text) => log.append(Object.assign(document.createElement('li'), { textContent: `${who}: ${text}` }));
   room.on('peer-join', (peer) => show(peer.slice(0, 6), 'joined'));
@@ -29,9 +29,9 @@ python3 -m http.server -d packages/js 8000     # any static server
 </script>
 ```
 
-Open it in two tabs. With a bundler (Vite, webpack, esbuild) `@nobaas/js` resolves
+Open it in two tabs. With a bundler (Vite, webpack, esbuild) `@peerwire/js` resolves
 from npm and the wasm is found next to the package. Without one, map it in the
-page: `<script type="importmap">{"imports":{"@nobaas/js":"/path/to/packages/js/src/index.js"}}</script>`.
+page: `<script type="importmap">{"imports":{"@peerwire/js":"/path/to/packages/js/src/index.js"}}</script>`.
 
 ## joinRoom
 
@@ -68,7 +68,7 @@ await room.leave();                             // peers see 'peer-leave' at onc
   counts as joined once its presence has arrived, so `peer-join` always has it.
 - **Closed rooms:** the roomId is the room's secret. Relays see only a hash of it
   (the topic); every hello, WebRTC offer and link carries an HMAC under a key
-  derived from it (`sha256("nobaas/room-key/<appId>/<roomId>")`, as in Rust). A peer
+  derived from it (`sha256("peerwire/room-key/<appId>/<roomId>")`, as in Rust). A peer
   is dialled only on a hello that proves the key, offers that don't prove it get no
   answer (and so none of your addresses), and a link that doesn't prove it within
   10 s is dropped without seeing presence or messages. A name anyone can guess
@@ -115,7 +115,7 @@ Types are in `src/index.d.ts`.
 | `src/index.js` | The package entry: `joinRoom` and everything below. |
 | `src/room.js` | `joinRoom` and `Room`: mesh, presence, message framing, backpressure. |
 | `src/proof.js` | Room key and HMAC proofs (hello, offer, link), compatible with Rust's; `randomRoomId()`. |
-| `src/nobaas.js` | Loads the module; `Endpoint` (connect, send, events, stats, seal/open) and Nostr key helpers. Browser and Node. |
+| `src/peerwire.js` | Loads the module; `Endpoint` (connect, send, events, stats, seal/open) and Nostr key helpers. Browser and Node. |
 | `src/webrtc.js` | `WebRtcTransport`: one negotiated, unordered, no-retransmit DataChannel per peer. `BroadcastSignaling` for tabs of one browser. |
 | `src/nostr.js` | `NostrSignaling` over public relays: ephemeral events, a throwaway key per session, payloads sealed to the recipient's PeerId. |
 | `src/local.js` | `LocalTransport`: datagrams over the BroadcastChannel, for Node and tests. |
@@ -124,7 +124,7 @@ Types are in `src/index.d.ts`.
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
 
-Signalling is untrusted by design: whatever carries the offers, the Nobaas Noise
+Signalling is untrusted by design: whatever carries the offers, the Peerwire Noise
 handshake over the DataChannel proves each side holds its PeerId.
 
 ## Privacy
@@ -150,7 +150,7 @@ it is given:
 - Different machines: add `?signal=nostr&room=<something only you know>` to every
   page. Peers meet through `wss://relay.damus.io` and `wss://nos.lol` and use
   Google's public STUN. There is no TURN, so two peers behind symmetric NATs won't
-  connect directly; the Nobaas peer relay (`connect_via`) is the planned fallback.
+  connect directly; the Peerwire peer relay (`connect_via`) is the planned fallback.
 
 ## Tests
 

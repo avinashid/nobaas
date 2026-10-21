@@ -1,9 +1,9 @@
-# nobaas-godot
+# peerwire-godot
 
 A Godot 4 GDExtension that runs Godot's own high-level multiplayer (`@rpc`,
-`MultiplayerSynchronizer`, `MultiplayerSpawner`) over Nobaas, with no server. It adds one
-class, `NobaasMultiplayerPeer`, a `MultiplayerPeer`: one instance hosts, and the others join
-with its `nb:` invite or find it by room name. Peers learn their public address from STUN,
+`MultiplayerSynchronizer`, `MultiplayerSpawner`) over Peerwire, with no server. It adds one
+class, `PeerwireMultiplayerPeer`, a `MultiplayerPeer`: one instance hosts, and the others join
+with its `pw:` invite or find it by room name. Peers learn their public address from STUN,
 swap addresses over Nostr relays and punch through NATs. Every link is encrypted with Noise IK.
 
 The full guide is [docs/GODOT.md](../../docs/GODOT.md): install, API, NAT traversal, router
@@ -18,17 +18,17 @@ port mapping, security, privacy and limits.
 ## Build and install
 
 ```sh
-cargo build --release -p nobaas-godot     # -> target/release/libnobaas_godot.so (.dll, .dylib)
+cargo build --release -p peerwire-godot     # -> target/release/libpeerwire_godot.so (.dll, .dylib)
 ```
 
-Copy the library and [`nobaas.gdextension`](nobaas.gdextension) into your project as
-`res://addons/nobaas/`, with the library in `res://addons/nobaas/bin/` under the name the
+Copy the library and [`peerwire.gdextension`](peerwire.gdextension) into your project as
+`res://addons/peerwire/`, with the library in `res://addons/peerwire/bin/` under the name the
 `.gdextension` file lists for your platform.
 
 ## Example
 
 ```gdscript
-var peer := NobaasMultiplayerPeer.new()
+var peer := PeerwireMultiplayerPeer.new()
 
 func host() -> void:
 	var invite := peer.host()             # optional UDP port; 0 picks a free one
@@ -53,9 +53,9 @@ func join_room() -> void:
 
 ## Layout and tests
 
-- `src/peer.rs`: the `NobaasMultiplayerPeer` class.
+- `src/peer.rs`: the `PeerwireMultiplayerPeer` class.
 - `src/session.rs`: the protocol (peer ids, frames, lanes, targeting, rooms), with no Godot
-  types, so `cargo test -p nobaas-godot` covers it without a Godot binary, over loopback.
+  types, so `cargo test -p peerwire-godot` covers it without a Godot binary, over loopback.
 - `examples/godot/test.sh` runs the demo headless on loopback, twice: one instance hosts
   and a second joins, first with its invite, then by room name through a local Nostr relay.
   It uses no public STUN or relays, and needs Godot 4.3+ (`GODOT=/path/to/godot`, default
