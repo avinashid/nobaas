@@ -2,11 +2,11 @@
 // full SCTP buffer) or refuses to send must not stop retransmits: a reliable message
 // sent during the outage arrives after it, driven by the timer alone, long before the
 // 10 s keepalive would have woken the endpoint up.
-import { loadNobaas, Lane } from '../src/nobaas.js';
+import { loadPeerwire, Lane } from '../src/peerwire.js';
 import { WebRtcTransport, MAX_BUFFERED } from '../src/webrtc.js';
 
-const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
-const nb = await loadNobaas(wasm);
+const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
+const pw = await loadPeerwire(wasm);
 let failed = 0;
 const check = (ok, what) => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${what}`);
@@ -48,8 +48,8 @@ async function connected(a, b) {
 
 // 1. Endpoint pair on an in-memory wire whose a->b side throws, then refuses.
 {
-  const a = nb.endpoint();
-  const b = nb.endpoint();
+  const a = pw.endpoint();
+  const b = pw.endpoint();
   let mode = 'ok';
   a.onTransmit = (addr, bytes) => {
     if (mode === 'throw') throw new DOMException('send queue is full', 'OperationError');
@@ -83,8 +83,8 @@ async function connected(a, b) {
 
 // 2. The same through WebRtcTransport, on fake DataChannels wired to each other.
 {
-  const a = nb.endpoint();
-  const b = nb.endpoint();
+  const a = pw.endpoint();
+  const b = pw.endpoint();
   const fakeSig = () => ({ onHello: () => {}, onMessage() {}, send() {}, hello() {}, close() {} });
   class Pc {
     createDataChannel() {
@@ -149,16 +149,16 @@ async function connected(a, b) {
   // Counts wasm calls an endpoint makes after its close(): any is a read of its freed handle.
   const spy = (ep) => {
     ep.callsAfterClose = 0;
-    const x = Object.fromEntries(Object.entries(nb.x).map(([k, v]) => [k,
-      typeof v === 'function' && k !== 'nb_endpoint_free' && k !== 'nb_free'
+    const x = Object.fromEntries(Object.entries(pw.x).map(([k, v]) => [k,
+      typeof v === 'function' && k !== 'pw_endpoint_free' && k !== 'pw_free'
         ? (...args) => (ep.closed && ep.callsAfterClose++, v(...args))
         : v]));
-    ep.nb = Object.assign(Object.create(nb), { x });
+    ep.pw = Object.assign(Object.create(pw), { x });
     return ep;
   };
   const wire = () => {
-    const a = spy(nb.endpoint());
-    const b = spy(nb.endpoint());
+    const a = spy(pw.endpoint());
+    const b = spy(pw.endpoint());
     a.onTransmit = link(b, 1);
     b.onTransmit = link(a, 2);
     return [a, b];

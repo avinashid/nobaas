@@ -1,6 +1,6 @@
 // Two isolated browser contexts (no shared BroadcastChannel) find each other
 // through public Nostr relays, exchange sealed WebRTC offers, connect over a
-// DataChannel with public STUN, and run the Nobaas handshake. Scope: public Nostr
+// DataChannel with public STUN, and run the Peerwire handshake. Scope: public Nostr
 // relays and public STUN only; the peers are both on this machine.
 //
 //   node packages/js/test/nostr.mjs

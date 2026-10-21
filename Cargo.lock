@@ -489,14 +489,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a846cbc04412cf509efcd8f3694b114fc700a035fb5a37f21517f9fb019f1ebc"
 
 [[package]]
-name = "nobaas"
+name = "once_cell"
+version = "1.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "opaque-debug"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "peerwire"
 version = "0.1.0"
 dependencies = [
  "hmac",
  "k256",
- "nobaas",
- "nobaas-core",
- "nobaas-sim",
+ "peerwire",
+ "peerwire-core",
+ "peerwire-sim",
  "rand_chacha",
  "rand_core",
  "rustls",
@@ -508,29 +520,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "nobaas-core"
+name = "peerwire-core"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
- "nobaas-sim",
+ "peerwire-sim",
  "rand_chacha",
  "rand_core",
  "snow",
 ]
 
 [[package]]
-name = "nobaas-ffi"
+name = "peerwire-ffi"
 version = "0.1.0"
 dependencies = [
  "k256",
- "nobaas-core",
- "nobaas-sim",
+ "peerwire-core",
+ "peerwire-sim",
  "rand_chacha",
  "rand_core",
 ]
 
 [[package]]
-name = "nobaas-game"
+name = "peerwire-game"
 version = "0.1.0"
 dependencies = [
  "rand_chacha",
@@ -539,44 +551,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "nobaas-godot"
+name = "peerwire-godot"
 version = "0.1.0"
 dependencies = [
  "godot",
- "nobaas",
- "nobaas-sim",
+ "peerwire",
+ "peerwire-sim",
 ]
 
 [[package]]
-name = "nobaas-peer"
+name = "peerwire-peer"
 version = "0.1.0"
 dependencies = [
- "nobaas",
+ "peerwire",
  "rand_core",
 ]
 
 [[package]]
-name = "nobaas-sim"
+name = "peerwire-sim"
 version = "0.1.0"
 dependencies = [
- "nobaas",
- "nobaas-core",
- "nobaas-game",
+ "peerwire",
+ "peerwire-core",
+ "peerwire-game",
  "rand_chacha",
  "rand_core",
 ]
-
-[[package]]
-name = "once_cell"
-version = "1.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "opaque-debug"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "pin-project-lite"

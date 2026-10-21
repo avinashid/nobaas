@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nobaas-core",
-    "crates/nobaas-sim",
-    "crates/nobaas-ffi",
-    "crates/nobaas-game",
-    "crates/nobaas",
-    "crates/nobaas-peer",
+    "crates/peerwire-core",
+    "crates/peerwire-sim",
+    "crates/peerwire-ffi",
+    "crates/peerwire-game",
+    "crates/peerwire",
+    "crates/peerwire-peer",
     "bindings/godot",
 ]
 
@@ -14,4 +14,4 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/avinashid/nobaas"
+repository = "https://github.com/avinashid/peerwire"

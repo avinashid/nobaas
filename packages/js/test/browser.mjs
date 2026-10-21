@@ -1,5 +1,5 @@
 // Opens N tabs of the demo in headless Chromium (local only: loopback server,
-// no STUN/TURN), waits for a full mesh of Nobaas links over WebRTC DataChannels,
+// no STUN/TURN), waits for a full mesh of Peerwire links over WebRTC DataChannels,
 // then measures app-level round trips and throughput between tab 0 and tab 1.
 //
 //   node packages/js/test/browser.mjs [tabs=2] [screenshot.png]
@@ -32,7 +32,7 @@ try {
   }
   await Promise.all(pages.map((p) => p.waitForFunction((n) => window.demo && window.demo.peers().length === n, tabs - 1, { timeout: 30000 })));
   const tMesh = Date.now() - t0;
-  console.log(`${tabs} tabs: full mesh of ${(tabs * (tabs - 1)) / 2} Nobaas links over DataChannels in ${tMesh} ms (including page loads)`);
+  console.log(`${tabs} tabs: full mesh of ${(tabs * (tabs - 1)) / 2} Peerwire links over DataChannels in ${tMesh} ms (including page loads)`);
 
   const [a, b] = pages;
   const idB = await b.evaluate(() => window.demo.id);
@@ -51,7 +51,7 @@ try {
     const sb = await b.evaluate(() => window.demo.stats());
     console.log(`reliable ${n} x ${size} B: ${(n / s).toFixed(0)} msg/s, ${((n * size * 8) / s / 1e6).toFixed(1)} Mbit/s; sender tx ${st.txPackets} retransmits ${st.retransmits}; receiver rx ${sb.rxPackets}`);
   }
-  console.log(`Nobaas smoothed RTT tab0->tab1: ${(await a.evaluate((id) => window.demo.rtt(id), idB)).toFixed(2)} ms`);
+  console.log(`Peerwire smoothed RTT tab0->tab1: ${(await a.evaluate((id) => window.demo.rtt(id), idB)).toFixed(2)} ms`);
   if (shot) {
     await a.evaluate(() => {
       document.getElementById('text').value = 'hello from tab 0';

@@ -21,7 +21,7 @@ const until = async (cond, ms) => {
 const FAST_MS = 2000; // far below the 30 s idle_timeout
 
 async function rooms(n, name) {
-  const opts = { appId: 'nobaas-test', roomId: `leave-${name}-${process.pid}` };
+  const opts = { appId: 'peerwire-test', roomId: `leave-${name}-${process.pid}` };
   const rs = await Promise.all(Array.from({ length: n }, () => joinRoom(opts)));
   check(await until(() => rs.every((r) => r.peers.length === n - 1), 10000), `${n} rooms joined`);
   return rs;

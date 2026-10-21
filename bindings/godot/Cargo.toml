@@ -1,10 +1,10 @@
 [package]
-name = "nobaas-godot"
+name = "peerwire-godot"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Godot 4 GDExtension: NobaasMultiplayerPeer, Godot's high-level multiplayer over Nobaas with no server"
+description = "Godot 4 GDExtension: PeerwireMultiplayerPeer, Godot's high-level multiplayer over Peerwire with no server"
 publish = false
 
 [lib]
@@ -12,12 +12,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Nostr signaling for rooms and NAT-punching invites.
-nobaas = { path = "../../crates/nobaas", features = ["nostr"] }
+peerwire = { path = "../../crates/peerwire", features = ["nostr"] }
 # 0.5.5 with the Godot 4.3 API: the extension loads in Godot 4.3 and later.
 godot = { version = "=0.5.5", features = ["api-4-3"] }
 
 [dev-dependencies]
 # Tests map a port through a fake gateway on loopback.
-nobaas = { path = "../../crates/nobaas", features = ["nostr", "testing"] }
-# The fuzz harness (nobaas_sim::fuzz).
-nobaas-sim = { path = "../../crates/nobaas-sim" }
+peerwire = { path = "../../crates/peerwire", features = ["nostr", "testing"] }
+# The fuzz harness (peerwire_sim::fuzz).
+peerwire-sim = { path = "../../crates/peerwire-sim" }

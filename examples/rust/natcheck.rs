@@ -3,9 +3,9 @@
 //! Nostr room and says whether the link came up direct, relayed or not at all.
 //!
 //! ```sh
-//! cargo run -p nobaas --features nostr --example natcheck                     # NAT report only
-//! cargo run -p nobaas --features nostr --example natcheck -- room <name>      # report, then meet a peer
-//! cargo run -p nobaas --features nostr --example natcheck -- room <name> v6   # the same, over IPv6
+//! cargo run -p peerwire --features nostr --example natcheck                     # NAT report only
+//! cargo run -p peerwire --features nostr --example natcheck -- room <name>      # report, then meet a peer
+//! cargo run -p peerwire --features nostr --example natcheck -- room <name> v6   # the same, over IPv6
 //! ```
 //!
 //! `NATCHECK_PORT=<port>` binds the room node to that UDP port instead of a random one,
@@ -15,8 +15,8 @@
 //! router check only asks the LAN gateway what it supports (SSDP search, NAT-PMP
 //! external-address query); it never creates a mapping.
 
-use nobaas::{Event, Lane, NatType, Node, NostrSignaling, Path, DEFAULT_STUN_SERVERS};
-use nobaas_core::stun;
+use peerwire::{Event, Lane, NatType, Node, NostrSignaling, Path, DEFAULT_STUN_SERVERS};
+use peerwire_core::stun;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 

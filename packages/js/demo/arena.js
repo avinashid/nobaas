@@ -1,5 +1,5 @@
-// Browser arena over Nobaas: one super-peer tab (?role=super) and any number of
-// player tabs. The same protocol as nobaas-sim/examples/arena.rs:
+// Browser arena over Peerwire: one super-peer tab (?role=super) and any number of
+// player tabs. The same protocol as peerwire-sim/examples/arena.rs:
 //   player -> super  INPUT: this tick's input plus the 7 before (unreliable)
 //   super -> player  BUNDLE: the island's latest inputs, every tick (unreliable)
 //   super -> player  WELCOME / ROSTER (reliable): id, island members, join ticks
@@ -9,7 +9,7 @@
 // Players run input-only lockstep with integer physics, so every member of an
 // island computes the same state; checkpoint hashes let a test compare them.
 
-import { loadNobaas, Lane } from '../src/nobaas.js';
+import { loadPeerwire, Lane } from '../src/peerwire.js';
 import { WebRtcTransport, BroadcastSignaling } from '../src/webrtc.js';
 import { NostrSignaling } from '../src/nostr.js';
 
@@ -27,11 +27,11 @@ const room = params.get('room') ?? 'arena';
 const bot = params.get('bot') !== '0';
 const drawing = params.get('draw') !== '0';
 
-const nb = await loadNobaas(new URL('../pkg/nobaas_ffi.wasm', import.meta.url));
-const ep = nb.endpoint();
+const pw = await loadPeerwire(new URL('../pkg/peerwire_ffi.wasm', import.meta.url));
+const ep = pw.endpoint();
 // ?signal=nostr lets players on other machines join (public relays + STUN).
 const nostr = params.get('signal') === 'nostr';
-const sig = nostr ? new NostrSignaling(nb, ep, { room: `arena/${room}` }) : new BroadcastSignaling(ep.id, `nobaas-arena-${room}`);
+const sig = nostr ? new NostrSignaling(pw, ep, { room: `arena/${room}` }) : new BroadcastSignaling(ep.id, `peerwire-arena-${room}`);
 const transport = new WebRtcTransport(ep, sig, {
   loss: Number(params.get('loss') ?? 0),
   ...(nostr ? { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], trickle: false } : {}),

@@ -1,5 +1,5 @@
 extends Node2D
-## Nobaas in Godot, no server: one instance hosts, the others join with its invite
+## Peerwire in Godot, no server: one instance hosts, the others join with its invite
 ## or find it by room name, through NATs. Arrow keys move your square
 ## (MultiplayerSynchronizer); the text box chats (@rpc).
 ##
@@ -15,9 +15,9 @@ extends Node2D
 const Player := preload("res://player.gd")
 const TIMEOUT := 20.0
 ## Rooms are scoped to an application: pick a name of your own.
-const APP_ID := "nobaas-godot-demo"
+const APP_ID := "peerwire-godot-demo"
 
-var peer := NobaasMultiplayerPeer.new()
+var peer := PeerwireMultiplayerPeer.new()
 var players := Node2D.new()
 var spawner := MultiplayerSpawner.new()
 var invite_edit := LineEdit.new()
@@ -55,9 +55,9 @@ func _ready() -> void:
 	if args.has("relay"):
 		peer.set_signaling_relays(_list(args["relay"]))
 	if args.has("privacy"):
-		var modes := {"direct": NobaasMultiplayerPeer.PRIVACY_DIRECT,
-			"public-only": NobaasMultiplayerPeer.PRIVACY_PUBLIC_ONLY,
-			"relay-only": NobaasMultiplayerPeer.PRIVACY_RELAY_ONLY}
+		var modes := {"direct": PeerwireMultiplayerPeer.PRIVACY_DIRECT,
+			"public-only": PeerwireMultiplayerPeer.PRIVACY_PUBLIC_ONLY,
+			"relay-only": PeerwireMultiplayerPeer.PRIVACY_RELAY_ONLY}
 		peer.set_privacy_mode(modes[args["privacy"]])
 		assert(peer.get_privacy_mode() == modes[args["privacy"]])
 		_log("privacy: %s" % args["privacy"])
@@ -132,7 +132,7 @@ func _mapping_line(info: Dictionary) -> String:
 
 func _join() -> void:
 	if peer.join(invite_edit.text.strip_edges()) != OK:
-		_log("that is not an nb: invite")
+		_log("that is not an pw: invite")
 		return
 	multiplayer.multiplayer_peer = peer
 	_log("joining…")
@@ -187,14 +187,14 @@ func _process(delta: float) -> void:
 		return
 	elapsed += delta
 	if done_at < 0.0 and got_chat and _other_square_moved():
-		print("NOBAAS_DEMO_OK peer=%d rtt_ms=%.1f" % [multiplayer.get_unique_id(), _rtt()])
+		print("PEERWIRE_DEMO_OK peer=%d rtt_ms=%.1f" % [multiplayer.get_unique_id(), _rtt()])
 		done_at = elapsed
 	# The host lingers a moment so the joiner can finish too (`--linger=SECONDS` to stay longer).
 	var linger := float(args.get("linger", 2.0 if multiplayer.is_server() else 0.2))
 	if done_at >= 0.0 and elapsed - done_at > linger:
 		get_tree().quit(0)
 	elif done_at < 0.0 and elapsed > TIMEOUT:
-		print("NOBAAS_DEMO_TIMEOUT chat=%s moved=%s" % [got_chat, _other_square_moved()])
+		print("PEERWIRE_DEMO_TIMEOUT chat=%s moved=%s" % [got_chat, _other_square_moved()])
 		get_tree().quit(1)
 
 
@@ -230,7 +230,7 @@ func _build_ui() -> void:
 	join_button.text = "Join"
 	join_button.pressed.connect(_join)
 	row.add_child(join_button)
-	invite_edit.placeholder_text = "paste an nb: invite, then Join"
+	invite_edit.placeholder_text = "paste an pw: invite, then Join"
 	invite_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(invite_edit)
 	var room_row := HBoxContainer.new()

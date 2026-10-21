@@ -1,4 +1,4 @@
-// joinRoom: the high-level API. A room is a full mesh of Nobaas links between
+// joinRoom: the high-level API. A room is a full mesh of Peerwire links between
 // everyone who joined the same appId and roomId, found through a signalling
 // adapter and carried over WebRTC DataChannels.
 //
@@ -21,7 +21,7 @@
 // room.poll() / room.receive() return queued events as plain objects (strings,
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
 
-import { loadNobaas, Lane, toHex, fromHex, isPeerId } from './nobaas.js';
+import { loadPeerwire, Lane, toHex, fromHex, isPeerId } from './peerwire.js';
 import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
 import { NostrSignaling } from './nostr.js';
 import { LocalTransport } from './local.js';
@@ -46,7 +46,7 @@ const WOULD_BLOCK = -3;
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-const modules = new Map(); // wasm source -> Promise<Nobaas>, shared by rooms
+const modules = new Map(); // wasm source -> Promise<Peerwire>, shared by rooms
 
 function frame(tag, body) {
   const b = new Uint8Array(body.length + 1);
@@ -96,17 +96,17 @@ export async function joinRoom({
   if (!appId || !roomId) throw new TypeError('joinRoom needs an appId and a roomId');
   // A room dials every member, so relay-only (one WebRTC link, to the relay) can't apply.
   if (privacy !== 'direct' && privacy !== 'public-only') throw new TypeError(`joinRoom privacy must be 'direct' or 'public-only', not ${privacy}`);
-  const src = wasm ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url);
+  const src = wasm ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url);
   const key = String(src);
-  if (!modules.has(key)) modules.set(key, loadNobaas(src).catch((e) => (modules.delete(key), Promise.reject(e))));
-  const nb = await modules.get(key);
-  const endpoint = nb.endpoint({ secret });
+  if (!modules.has(key)) modules.set(key, loadPeerwire(src).catch((e) => (modules.delete(key), Promise.reject(e))));
+  const pw = await modules.get(key);
+  const endpoint = pw.endpoint({ secret });
   const name = `${appId}/${roomId}`;
   const proof = await RoomProof.create(name);
   let sig;
-  if (signaling === 'local') sig = new BroadcastSignaling(endpoint.id, `nobaas/${name}`);
-  else if (signaling === 'nostr') sig = new NostrSignaling(nb, endpoint, { room: name, relays });
-  else if (typeof signaling === 'function') sig = signaling({ endpoint, nobaas: nb, room: name });
+  if (signaling === 'local') sig = new BroadcastSignaling(endpoint.id, `peerwire/${name}`);
+  else if (signaling === 'nostr') sig = new NostrSignaling(pw, endpoint, { room: name, relays });
+  else if (typeof signaling === 'function') sig = signaling({ endpoint, peerwire: pw, room: name });
   else throw new TypeError(`unknown signaling ${signaling}: use 'local', 'nostr' or a factory`);
   let transport;
   if (RTCPeerConnection) {
@@ -114,8 +114,8 @@ export async function joinRoom({
     const ice = iceServers ?? (signaling === 'local' ? [] : DEFAULT_ICE_SERVERS);
     // Relays charge per event: one offer and one answer, each with every candidate.
     const offerProof = {
-      sign: (to) => proof.pair('nb-rtc-offer', endpoint.id, to),
-      check: (from, p) => proof.checkPair('nb-rtc-offer', from, endpoint.id, p),
+      sign: (to) => proof.pair('pw-rtc-offer', endpoint.id, to),
+      check: (from, p) => proof.checkPair('pw-rtc-offer', from, endpoint.id, p),
     };
     transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy, offerProof, RTCPeerConnection });
   } else if (signaling === 'local') {
@@ -139,7 +139,7 @@ export class Room {
     this.signaling = signaling;
     this.self = endpoint.id;
     this.me = presence;
-    this.linked = new Set(); // peers with a Nobaas session
+    this.linked = new Set(); // peers with a Peerwire session
     this.members = new Map(); // joined peers -> presence
     this.handlers = new Map(); // event -> Set of fns
     this.outbox = new Map(); // peer -> [frame, lane] waiting for send window
@@ -277,8 +277,8 @@ export class Room {
 
   async onHello(peer, meta) {
     // A custom signalling adapter may pass anything along: only PeerIds are dialled.
-    // `meta.nb` marks a Rust UDP peer, which WebRTC can't dial.
-    if (this.left || !isPeerId(peer) || peer === this.self || this.transport.has(peer) || meta?.nb) return;
+    // `meta.pw` marks a Rust UDP peer, which WebRTC can't dial.
+    if (this.left || !isPeerId(peer) || peer === this.self || this.transport.has(peer) || meta?.pw) return;
     // Knowing the topic isn't enough: only hellos that prove the room key count.
     if (!(await this.proof.checkHello(peer, meta))) return;
     if (this.left || this.transport.has(peer)) return;
@@ -297,7 +297,7 @@ export class Room {
       const peer = e.peer;
       this.linked.add(peer);
       // Prove the room key first; presence follows once the peer has proved it too.
-      this.proof.pair('nb-link', this.self, peer).then((p) => {
+      this.proof.pair('pw-link', this.self, peer).then((p) => {
         if (this.linked.has(peer)) this.write(peer, frame(T.Proof, fromHex(p)), Lane.Reliable);
       });
       clearTimeout(this.deadlines.get(peer));
@@ -358,7 +358,7 @@ export class Room {
     if (tag !== T.Proof || !this.linked.has(peer)) return;
     const rest = [];
     this.proving.set(peer, rest);
-    this.proof.checkPair('nb-link', peer, this.self, toHex(body)).then((ok) => {
+    this.proof.checkPair('pw-link', peer, this.self, toHex(body)).then((ok) => {
       // Lost (and maybe linked again) meanwhile: this check is stale.
       if (this.left || this.proving.get(peer) !== rest) return;
       this.proving.delete(peer);

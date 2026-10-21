@@ -27,7 +27,7 @@ done
 if ! command -v node >/dev/null && [ -s "$HOME/.nvm/nvm.sh" ]; then . "$HOME/.nvm/nvm.sh" >/dev/null; fi
 
 WASM_MAX_BYTES=${WASM_MAX_BYTES:-358400}
-WASM=packages/js/pkg/nobaas_ffi.wasm
+WASM=packages/js/pkg/peerwire_ffi.wasm
 results=()
 failed=0
 
@@ -65,7 +65,7 @@ step "cargo test" cargo test --workspace --release
 if [ $strict = 1 ]; then
   step "cargo clippy" cargo clippy --workspace --all-targets -- -D warnings
   # Release builds wrap on integer overflow; the parser fuzzers must also run where it panics.
-  step "fuzz (debug)" cargo test --lib -p nobaas-core -p nobaas -p nobaas-ffi -p nobaas-sim fuzz
+  step "fuzz (debug)" cargo test --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz
 else
   step "cargo clippy" cargo clippy --workspace --all-targets
 fi
@@ -106,7 +106,7 @@ else
 fi
 if [ $nostr = 1 ]; then
   step "nostr" node packages/js/test/nostr.mjs
-  step "nostr (rust)" cargo test -p nobaas --release --test nostr -- --ignored --nocapture
+  step "nostr (rust)" cargo test -p peerwire --release --test nostr -- --ignored --nocapture
 else
   skip "nostr" "public relays; pass --nostr"
   skip "nostr (rust)" "public relays; pass --nostr"

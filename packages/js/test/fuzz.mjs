@@ -10,14 +10,14 @@
 // Nothing may throw out of a handler of untrusted input, and no promise may be
 // left rejected.
 //
-//   node packages/js/test/fuzz.mjs        NB_FUZZ_SEED=7 NB_FUZZ_SCALE=20 for a soak
-import { joinRoom, loadNobaas, decodeEvent, toHex, fromHex, isPeerId, peerBytes, EventKind } from '../src/index.js';
+//   node packages/js/test/fuzz.mjs        PW_FUZZ_SEED=7 PW_FUZZ_SCALE=20 for a soak
+import { joinRoom, loadPeerwire, decodeEvent, toHex, fromHex, isPeerId, peerBytes, EventKind } from '../src/index.js';
 import { NostrSignaling, b64, unb64 } from '../src/nostr.js';
 import { RoomProof } from '../src/proof.js';
 
-const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
-const SEED = Number(process.env.NB_FUZZ_SEED ?? 0x6e62);
-const SCALE = Math.max(1, Number(process.env.NB_FUZZ_SCALE ?? 1));
+const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
+const SEED = Number(process.env.PW_FUZZ_SEED ?? 0x6e62);
+const SCALE = Math.max(1, Number(process.env.PW_FUZZ_SCALE ?? 1));
 const cases = (n) => n * SCALE;
 
 let failed = 0;
@@ -72,7 +72,7 @@ function rng(name) {
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-const nb = await loadNobaas(wasm);
+const pw = await loadPeerwire(wasm);
 
 // 1. decodeEvent: every documented event decodes to its fields; any other bytes
 // decode to something or throw a RangeError (only the wasm produces events, and
@@ -151,8 +151,8 @@ const nb = await loadNobaas(wasm);
 // 3. Nostr relay messages, fed straight to onRelay (no relays).
 {
   const r = rng('relay');
-  const other = nb.endpoint();
-  const sig = new NostrSignaling(nb, nb.endpoint(), { room: 'fuzz/relay', relays: [] });
+  const other = pw.endpoint();
+  const sig = new NostrSignaling(pw, pw.endpoint(), { room: 'fuzz/relay', relays: [] });
   await sig.ready;
   const hellos = [], bodies = [];
   sig.onHello = (from, meta) => hellos.push([from, meta]);
@@ -216,7 +216,7 @@ const nb = await loadNobaas(wasm);
 // 5. Room frames from a proven member and from strangers.
 {
   const r = rng('room');
-  const opts = { appId: 'nobaas-fuzz', roomId: `fuzz-${process.pid}` };
+  const opts = { appId: 'peerwire-fuzz', roomId: `fuzz-${process.pid}` };
   const [a, b] = await Promise.all([joinRoom(opts), joinRoom(opts)]);
   const t = Date.now();
   while (a.peers.length !== 1 || b.peers.length !== 1) {

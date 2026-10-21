@@ -3,21 +3,21 @@ use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
 use godot::prelude::*;
-use nobaas::{Failure, NatType, Node, PeerId, PortMapping, Privacy};
+use peerwire::{Failure, NatType, Node, PeerId, PortMapping, Privacy};
 
-/// A `MultiplayerPeer` over Nobaas: Godot's `@rpc`, `MultiplayerSynchronizer` and
+/// A `MultiplayerPeer` over Peerwire: Godot's `@rpc`, `MultiplayerSynchronizer` and
 /// `MultiplayerSpawner` with no server. One instance hosts (peer 1); the others
-/// join with its `nb:` invite, or find it by room name. Peers swap addresses over
+/// join with its `pw:` invite, or find it by room name. Peers swap addresses over
 /// Nostr relays and punch through NATs.
 ///
 /// ```gdscript
-/// var peer := NobaasMultiplayerPeer.new()
+/// var peer := PeerwireMultiplayerPeer.new()
 /// peer.host_room("my-game", "lobby-42")   # or: peer.join_room("my-game", "lobby-42")
 /// multiplayer.multiplayer_peer = peer
 /// ```
 #[derive(GodotClass)]
 #[class(base = MultiplayerPeerExtension, tool)]
-pub struct NobaasMultiplayerPeer {
+pub struct PeerwireMultiplayerPeer {
     base: Base<MultiplayerPeerExtension>,
     session: Option<Session>,
     target: i32,
@@ -31,7 +31,7 @@ pub struct NobaasMultiplayerPeer {
 }
 
 #[godot_api]
-impl NobaasMultiplayerPeer {
+impl PeerwireMultiplayerPeer {
     /// The most joiners a host keeps (default 32). Past it, a newcomer is
     /// disconnected before `peer_connected`, as with `refuse_new_connections`.
     /// Applies at once; links already up stay.
@@ -86,7 +86,7 @@ impl NobaasMultiplayerPeer {
             Self::PRIVACY_RELAY_ONLY => Privacy::RelayOnly { via: None },
             Self::PRIVACY_DIRECT => Privacy::Direct,
             _ => {
-                godot_error!("NobaasMultiplayerPeer.set_privacy_mode: unknown mode {mode}");
+                godot_error!("PeerwireMultiplayerPeer.set_privacy_mode: unknown mode {mode}");
                 return;
             }
         };
@@ -158,7 +158,7 @@ impl NobaasMultiplayerPeer {
     #[func]
     fn join_room_host(&mut self, app_id: GString, room: GString, host_key: PackedByteArray) -> Error {
         let Ok(key) = <[u8; 32]>::try_from(host_key.as_slice()) else {
-            godot_error!("NobaasMultiplayerPeer.join_room_host: host_key must be 32 bytes");
+            godot_error!("PeerwireMultiplayerPeer.join_room_host: host_key must be 32 bytes");
             return Error::ERR_INVALID_PARAMETER;
         };
         self.join_room_of(app_id, room, Some(PeerId(key)))
@@ -172,7 +172,7 @@ impl NobaasMultiplayerPeer {
                 Error::OK
             }
             Err(e) => {
-                godot_error!("NobaasMultiplayerPeer.join_room: {e}");
+                godot_error!("PeerwireMultiplayerPeer.join_room: {e}");
                 Error::ERR_CANT_CREATE
             }
         }
@@ -242,7 +242,7 @@ impl NobaasMultiplayerPeer {
         let node = match self.net.bind("0.0.0.0:0") {
             Ok(n) => n,
             Err(e) => {
-                godot_error!("NobaasMultiplayerPeer.join: {e}");
+                godot_error!("PeerwireMultiplayerPeer.join: {e}");
                 return Error::ERR_CANT_CREATE;
             }
         };
@@ -252,7 +252,7 @@ impl NobaasMultiplayerPeer {
                 Error::OK
             }
             Err(e) => {
-                godot_error!("NobaasMultiplayerPeer.join: {e:?}");
+                godot_error!("PeerwireMultiplayerPeer.join: {e:?}");
                 Error::ERR_INVALID_PARAMETER
             }
         }
@@ -297,7 +297,7 @@ impl NobaasMultiplayerPeer {
     }
 }
 
-impl NobaasMultiplayerPeer {
+impl PeerwireMultiplayerPeer {
     fn start_host(&mut self, port: i32, make: impl FnOnce(Node) -> Session) -> GString {
         self.close();
         match self.net.bind(&format!("0.0.0.0:{}", port.clamp(0, 65535))) {
@@ -308,7 +308,7 @@ impl NobaasMultiplayerPeer {
                 GString::from(invite.as_str())
             }
             Err(e) => {
-                godot_error!("NobaasMultiplayerPeer.host: {e}");
+                godot_error!("PeerwireMultiplayerPeer.host: {e}");
                 GString::new()
             }
         }
@@ -324,7 +324,7 @@ impl NobaasMultiplayerPeer {
         self.session = Some(s);
     }
 
-    fn stats(&self, id: i32) -> Option<nobaas::PeerStats> {
+    fn stats(&self, id: i32) -> Option<peerwire::PeerStats> {
         self.session.as_ref()?.peer_stats(id)
     }
 }
@@ -357,9 +357,9 @@ fn from_godot(mode: TransferMode) -> Mode {
 }
 
 #[godot_api]
-impl IMultiplayerPeerExtension for NobaasMultiplayerPeer {
+impl IMultiplayerPeerExtension for PeerwireMultiplayerPeer {
     fn init(base: Base<MultiplayerPeerExtension>) -> Self {
-        NobaasMultiplayerPeer {
+        PeerwireMultiplayerPeer {
             base,
             session: None,
             target: 0,

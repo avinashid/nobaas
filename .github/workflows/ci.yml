@@ -34,7 +34,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --release
       - name: Fuzz tests in a debug build (integer overflow panics there, wraps in release)
-        run: cargo test --lib -p nobaas-core -p nobaas -p nobaas-ffi -p nobaas-sim fuzz
+        run: cargo test --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz
 
   wasm:
     name: wasm + node
@@ -53,7 +53,7 @@ jobs:
           node-version: 22
       - run: ./packages/js/build.sh
       - name: Size (<= WASM_MAX_BYTES) and zero imports
-        run: node .github/scripts/wasm-check.mjs packages/js/pkg/nobaas_ffi.wasm "$WASM_MAX_BYTES"
+        run: node .github/scripts/wasm-check.mjs packages/js/pkg/peerwire_ffi.wasm "$WASM_MAX_BYTES"
       - run: node packages/js/test/node_pair.mjs
       - run: node packages/js/test/privacy.mjs
       - run: node packages/js/test/room_node.mjs
@@ -75,7 +75,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet
       # Build only, never pushed. The second build reuses the shared build stage from the first.
-      - run: docker build --target peer -t nobaas-peer:ci .
-      - run: docker build --target examples -t nobaas-examples:ci .
+      - run: docker build --target peer -t peerwire-peer:ci .
+      - run: docker build --target examples -t peerwire-examples:ci .
 
   # Next: a `godot` job building the GDExtension (NB-020) goes here, Linux only to start.

@@ -1,6 +1,6 @@
 # Security policy
 
-Nobaas is pre-1.0 research-grade software and has **not** had an external audit. Don't rely on it yet to protect
+Peerwire is pre-1.0 research-grade software and has **not** had an external audit. Don't rely on it yet to protect
 high-value data.
 
 ## Reporting a vulnerability
@@ -10,16 +10,16 @@ repository. Don't open a public issue. We aim to acknowledge within 7 days.
 
 ## Scope
 
-- the `nobaas-core` handshake, wire format, relaying and NAT traversal;
-- the C ABI (`nobaas-ffi`) and the JavaScript glue;
+- the `peerwire-core` handshake, wire format, relaying and NAT traversal;
+- the C ABI (`peerwire-ffi`) and the JavaScript glue;
 - the signaling adapters.
 
 ## Threat model
 
-See [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for what Nobaas defends against,
+See [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for what Peerwire defends against,
 its trust boundaries, and the standing findings.
 
-## What Nobaas gives you today
+## What Peerwire gives you today
 
 - **Authenticated, encrypted links.** A `PeerId` is an Ed25519 public key; links
   run Noise IK keyed by that identity, so no signaling relay, peer relay or NAT

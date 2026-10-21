@@ -1,11 +1,11 @@
 <div align="center">
 
-# Nobaas
+# Peerwire
 
-**No backend as a service.** Peer-to-peer networking for games, whiteboards, meetings and chat:<br>
+**A direct wire between peers.** Peer-to-peer networking for games, whiteboards, meetings and chat:<br>
 encrypted, NAT-traversing and real-time, with no server to run and no relay to pay for.
 
-[![CI](https://github.com/avinashid/nobaas/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/avinashid/nobaas/actions/workflows/ci.yml)
+[![CI](https://github.com/avinashid/peerwire/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/avinashid/peerwire/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 2021](https://img.shields.io/badge/rust-2021-orange.svg)](Cargo.toml)
 [![WebAssembly: 300 KB, 0 imports](https://img.shields.io/badge/wasm-300%20KB%2C%200%20imports-654ff0.svg)](docs/PERFORMANCE.md)
@@ -23,7 +23,7 @@ encrypted, NAT-traversing and real-time, with no server to run and no relay to p
 
 ---
 
-Nobaas is a networking toolkit written in Rust. Two apps that share a room name or an invite string find each
+Peerwire is a networking toolkit written in Rust. Two apps that share a room name or an invite string find each
 other, punch through their NATs and open an end-to-end encrypted link. There's no signaling server, TURN server or
 backend in between. The same sans-IO core runs natively, in the browser as a 300 KB WebAssembly module, behind a
 C ABI and inside Godot 4.
@@ -39,24 +39,24 @@ node.join_room("my-game", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4"); // the room name 
 - **Zero backend.** Peers find each other over pluggable, untrusted signaling: an invite link or QR code, public Nostr relays, or in-process and LAN carriers. STUN learns the public address, and both sides dial at once to punch through. When two NATs can't be punched, any peer connected to both relays the traffic, so no TURN server is needed.
 - **Encrypted, key-addressed.** A `PeerId` *is* an Ed25519 public key. Every link is a `Noise_IK_25519_ChaChaPoly_BLAKE2s` session, so dialling an ID authenticates whoever answers. Signaling relays, peer relays and NATs in the path can't read or forge traffic.
 - **Real-time lanes.** Each link has three lanes. *Unreliable* is for state. *Reliable* is ordered and carries up to 1 MiB, for events. *Urgent* is reliable, goes ahead of queued reliable data and sends every fragment twice, 4 ms apart, for inputs and hits. Selective ACKs, tail-loss probes and delay-based congestion control keep p99 latency low under loss.
-- **One core, every platform.** `nobaas-core` never touches sockets, threads or clocks. The same deterministic state machine is driven by a native UDP socket, tokio, a browser WebRTC DataChannel, a C caller or Godot, and replayed exactly by the network simulator.
+- **One core, every platform.** `peerwire-core` never touches sockets, threads or clocks. The same deterministic state machine is driven by a native UDP socket, tokio, a browser WebRTC DataChannel, a C caller or Godot, and replayed exactly by the network simulator.
 - **Scales past the mesh.** The game layer splits players into islands of up to 12 along a Hilbert curve. Super-peers bundle each island's traffic, with failover and overload control. 512 players were simulated at a p99 lag of 79 ms.
 
 ## Project status
 
-Nobaas is **v0.1 and in early development**. The APIs will change, and nothing is on crates.io or npm yet.
+Peerwire is **v0.1 and in early development**. The APIs will change, and nothing is on crates.io or npm yet.
 
 | Component | Status |
 |---|---|
 | Session core: identity, Noise IK, lanes, congestion control, peer relay, hole punching, invites | ✅ Working, tested |
 | `Node` / `AsyncNode`: UDP host, STUN, rooms, `MemoryHub` and Nostr signaling, NAT traversal | ✅ Working, tested |
-| Godot 4 `NobaasMultiplayerPeer` (desktop) | ✅ Working, tested |
+| Godot 4 `PeerwireMultiplayerPeer` (desktop) | ✅ Working, tested |
 | WebAssembly module and JS package (WebRTC transport, Nostr signaling) | ✅ Working, tested in headless browsers |
 | Deterministic network simulator and multiplayer arena benchmark | ✅ Working |
 | Game layer: fixed-point maths, Hilbert islands, desync detection, lockstep | ✅ Working |
 | Mesh size limit and super-peers in the `Node` facade | 🚧 Planned |
 | mDNS and DHT signaling | 🚧 Planned |
-| `nobaas-sync` (CRDTs), `nobaas-media` (audio and video), `nobaas-store` (offline store-and-forward) | 🚧 Planned |
+| `peerwire-sync` (CRDTs), `peerwire-media` (audio and video), `peerwire-store` (offline store-and-forward) | 🚧 Planned |
 | Godot on Android, iOS and web; mobile bindings | 🚧 Planned |
 
 NAT behaviour is verified in a simulator that models RFC 4787 NAT types, and over public Nostr relays and STUN on
@@ -70,13 +70,13 @@ Add the crate from git:
 
 ```toml
 [dependencies]
-nobaas = { git = "https://github.com/avinashid/nobaas", features = ["nostr"] } # add "tokio" for AsyncNode
+peerwire = { git = "https://github.com/avinashid/peerwire", features = ["nostr"] } # add "tokio" for AsyncNode
 ```
 
-**Connect by invite.** One side prints an `nb:` string, and the other dials it:
+**Connect by invite.** One side prints an `pw:` string, and the other dials it:
 
 ```rust
-use nobaas::{Event, Lane, Node};
+use peerwire::{Event, Lane, Node};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 **Meet by room name, across NATs.** No invite to pass around. Give the node a signaling carrier and a room:
 
 ```rust
-use nobaas::{Node, NostrSignaling, Role};
+use peerwire::{Node, NostrSignaling, Role};
 
 let mut node = Node::builder()
     .signaling(NostrSignaling::default())        // wss://relay.damus.io, wss://nos.lol
@@ -122,37 +122,37 @@ println!("public address {:?}, NAT {:?}", node.public_addr(), node.nat_type());
 Run the bundled examples:
 
 ```sh
-cargo run --release -p nobaas --example echo                 # prints an nb: invite
-cargo run --release -p nobaas --example echo -- nb:...       # second terminal: join, echo
-cargo run --release -p nobaas --example echo_async --features tokio
-cargo run --release -p nobaas-core --example udp_pair        # core alone, UDP loopback
-cargo run --release -p nobaas-sim --example arena -- --players 512 --supers 8
+cargo run --release -p peerwire --example echo                 # prints an pw: invite
+cargo run --release -p peerwire --example echo -- pw:...       # second terminal: join, echo
+cargo run --release -p peerwire --example echo_async --features tokio
+cargo run --release -p peerwire-core --example udp_pair        # core alone, UDP loopback
+cargo run --release -p peerwire-sim --example arena -- --players 512 --supers 8
 ```
 
 ### Godot 4
 
-`NobaasMultiplayerPeer` is a drop-in `MultiplayerPeer`. `@rpc`, `MultiplayerSynchronizer` and
+`PeerwireMultiplayerPeer` is a drop-in `MultiplayerPeer`. `@rpc`, `MultiplayerSynchronizer` and
 `MultiplayerSpawner` work unchanged:
 
 ```gdscript
-var peer := NobaasMultiplayerPeer.new()
+var peer := PeerwireMultiplayerPeer.new()
 peer.host_room("my-game", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4")   # on the host
 # peer.join_room("my-game", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4") # on each player
 multiplayer.multiplayer_peer = peer
 ```
 
-Build it with `cargo build --release -p nobaas-godot`. See [docs/GODOT.md](docs/GODOT.md) for installation, the
+Build it with `cargo build --release -p peerwire-godot`. See [docs/GODOT.md](docs/GODOT.md) for installation, the
 full API and the demo project in [`examples/godot`](examples/godot).
 
 ### Browser and JavaScript
 
 ```sh
-./packages/js/build.sh                       # -> packages/js/pkg/nobaas_ffi.wasm
+./packages/js/build.sh                       # -> packages/js/pkg/peerwire_ffi.wasm
 python3 -m http.server -d packages/js 8000   # open http://localhost:8000/demo/ in two tabs
 ```
 
 ```js
-import { joinRoom } from '@nobaas/js';   // packages/js/src/index.js
+import { joinRoom } from '@peerwire/js';   // packages/js/src/index.js
 
 const room = await joinRoom({ appId: 'my-app', roomId: 'lobby', signaling: 'nostr' });
 room.on('message', (data, peer) => console.log(peer.slice(0, 6), data));
@@ -160,7 +160,7 @@ room.send('hello');                     // every joined peer; room.poll() for ga
 ```
 
 [`packages/js/README.md`](packages/js/README.md) has the full API, the privacy modes and the lower layers
-(`loadNobaas`, `WebRtcTransport`, `NostrSignaling`).
+(`loadPeerwire`, `WebRtcTransport`, `NostrSignaling`).
 
 ## How it works
 
@@ -210,14 +210,14 @@ sequenceDiagram
  ┌───────────────────────────────── your app ─────────────────────────────────┐
  │ game · whiteboard · meeting · chat                                         │
  ├───────────────────────────── building blocks ──────────────────────────────┤
- │ nobaas-game     fixed-point maths, Hilbert islands, desync detection       │
- │ nobaas-sync · nobaas-media · nobaas-store                    (planned)     │
+ │ peerwire-game     fixed-point maths, Hilbert islands, desync detection       │
+ │ peerwire-sync · peerwire-media · peerwire-store                    (planned)     │
  ├───────────────────────────── hosts / facades ──────────────────────────────┤
- │ nobaas::Node    UDP socket, STUN, rooms, traversal (+ AsyncNode, tokio)    │
- │ nobaas-godot    NobaasMultiplayerPeer (GDExtension)                        │
- │ nobaas-ffi      C ABI → wasm (browsers, Node) and native libraries         │
- │ nobaas-sim      deterministic network and NAT simulator                    │
- ├────────────────────────── nobaas-core (sans-IO) ───────────────────────────┤
+ │ peerwire::Node    UDP socket, STUN, rooms, traversal (+ AsyncNode, tokio)    │
+ │ peerwire-godot    PeerwireMultiplayerPeer (GDExtension)                        │
+ │ peerwire-ffi      C ABI → wasm (browsers, Node) and native libraries         │
+ │ peerwire-sim      deterministic network and NAT simulator                    │
+ ├────────────────────────── peerwire-core (sans-IO) ───────────────────────────┤
  │ Endpoint: sessions · Noise IK · lanes · ACK + congestion control ·         │
  │ tail-loss probe · keepalive · roaming · peer relay · hole punch · invites  │
  ├────────────────────────── signaling (untrusted) ───────────────────────────┤
@@ -228,7 +228,7 @@ sequenceDiagram
 
 ### The sans-IO core
 
-`nobaas_core::Endpoint<A>` is a pure state machine, generic over the address type `A`. It owns no socket, thread,
+`peerwire_core::Endpoint<A>` is a pure state machine, generic over the address type `A`. It owns no socket, thread,
 clock or RNG of its own (the RNG is seeded once at construction). A host drives it with five calls:
 
 ```text
@@ -245,7 +245,7 @@ clock or RNG of its own (the RNG is seeded once at construction). A host drives 
 
 Because time and I/O come from outside:
 
-- `nobaas-sim` replays any scenario bit for bit, covering latency, jitter, loss, router buffers, uplink caps and
+- `peerwire-sim` replays any scenario bit for bit, covering latency, jitter, loss, router buffers, uplink caps and
   eight NAT behaviours.
 - The wasm build needs **zero imports**, and the same binary runs in browsers and in Node.
 - Every platform gets identical protocol behaviour, because there is only one implementation.
@@ -258,7 +258,7 @@ Events: `Connected { peer, path, initiator }`, `Message { peer, lane, data }`, `
 
 - **Identity.** An Ed25519 key pair. A `PeerId` is the 32-byte public key. Its X25519 (Montgomery) form is the
   Noise static key, so one key both signs and handshakes.
-- **Handshake.** `Noise_IK_25519_ChaChaPoly_BLAKE2s` with the prologue `nobaas-core/1`. The initiator already knows
+- **Handshake.** `Noise_IK_25519_ChaChaPoly_BLAKE2s` with the prologue `peerwire-core/1`. The initiator already knows
   the responder's static key, which is the PeerId it dialled, so the handshake takes **one round trip** and nobody
   can answer in the target's place. The handshake retries every 500 ms and gives up after 10 s.
 - **Simultaneous dials.** When both sides dial at once, as hole punching requires, the dial from the smaller
@@ -329,8 +329,8 @@ Details are in [docs/NAT-TRAVERSAL.md](docs/NAT-TRAVERSAL.md).
 |---|---|
 | **STUN** | Binding requests go out on the session socket, every 25 s, which also keeps the mapping alive. The defaults are `stun.l.google.com:19302` and `stun.cloudflare.com:3478`. An answer counts only if it comes from the queried server and echoes the random 96-bit transaction id. The first byte (RFC 7983) separates STUN from session traffic. |
 | **Signaling** | `trait Signaling { subscribe, unsubscribe, publish, poll }` over 32-byte topics. `MemoryHub` runs in-process. `NostrSignaling` (feature `nostr`) sends ephemeral events of kind 25059 over websocket relays: `wss://` uses rustls with the webpki roots. The NIP-01 event id is checked before deduplication. Frames above 128 KiB are rejected, and the queue is capped at 1024 events. |
-| **Topics** | Room topic: `sha256("nobaas/room/" + app + "/" + room)`. Inbox: `sha256("nobaas/peer/" + hex(PeerId))`. These are the same derivations as the JS package, so Rust and browser peers can share relays. |
-| **Room key** | `sha256("nobaas/room-key/" + app + "/" + room)` is a different label over the same name, so it can't be derived from the topic. Hellos (with the sender's clock, ±60 s) and offers carry HMAC-SHA256 proofs under it. Forged or stale ones are dropped before they cost anything. |
+| **Topics** | Room topic: `sha256("peerwire/room/" + app + "/" + room)`. Inbox: `sha256("peerwire/peer/" + hex(PeerId))`. These are the same derivations as the JS package, so Rust and browser peers can share relays. |
+| **Room key** | `sha256("peerwire/room-key/" + app + "/" + room)` is a different label over the same name, so it can't be derived from the topic. Hellos (with the sender's clock, ±60 s) and offers carry HMAC-SHA256 proofs under it. Forged or stale ones are dropped before they cost anything. |
 | **Offers** | `Noise_X` sealed boxes to one recipient, with the sender authenticated. Each carries up to 8 candidate addresses (as the [privacy mode](#privacy-modes) allows; one slot may hold a port prediction instead), the NAT type, up to 8 connected peers (possible relays), a timestamp (±60 s), a random nonce (replays are dropped) and an HMAC proof: under the room key in a room, or under the recipient's invite key. A node acts on an offer only with a valid proof, or from a peer it dialled itself. |
 | **Punching** | Both sides call `connect_with` on every *dialable* candidate at the same moment. Loopback, unspecified, multicast and broadcast addresses are refused, so an offer can't aim a node at its own host's services. PUNCH probes go every 100 ms for 5 s. A path counts as direct only after an echoed `PUNCH_ACK`. |
 | **Port prediction** | A symmetric NAT whose two STUN mappings are 1–8 ports apart looks sequential: its offer predicts the next port, and a cone peer also probes 32 ports around it, three times (first handshake sends while dialling, punch rounds while relayed). Old decoders skip the entry. |
@@ -347,7 +347,7 @@ third peer they connect relayed through it.
 ### Invites
 
 ```text
-"nb:" base64url( version(1)=2  peer(32)  key(32)  n(u8) [alen(u8) addr]*  m(u8) [relay_peer(32) alen(u8) addr]* )
+"pw:" base64url( version(1)=2  peer(32)  key(32)  n(u8) [alen(u8) addr]*  m(u8) [relay_peer(32) alen(u8) addr]* )
 ```
 
 An invite is a public key, some places to try it, and an *invite key*. Whoever answers must prove they hold the
@@ -422,24 +422,24 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 
 | Platform | How |
 |---|---|
-| Linux, macOS, Windows (Rust) | `nobaas::Node` (sync) or `AsyncNode` (tokio) |
-| Browsers | `nobaas-ffi` → wasm, with WebRTC DataChannels as transport (`packages/js`) |
+| Linux, macOS, Windows (Rust) | `peerwire::Node` (sync) or `AsyncNode` (tokio) |
+| Browsers | `peerwire-ffi` → wasm, with WebRTC DataChannels as transport (`packages/js`) |
 | Node.js | the same wasm module |
-| Godot 4.3+ desktop | `nobaas-godot` GDExtension |
-| Swift, Kotlin, Dart, C | `nobaas-ffi` native library (C ABI). Higher-level bindings are planned |
+| Godot 4.3+ desktop | `peerwire-godot` GDExtension |
+| Swift, Kotlin, Dart, C | `peerwire-ffi` native library (C ABI). Higher-level bindings are planned |
 | Docker | an always-on peer is just a node that stays online: `docker compose up` runs one on localhost, with the demos ([docs/DOCKER.md](docs/DOCKER.md)) |
 
 ## Repository layout
 
 | Path | What it is |
 |---|---|
-| [`crates/nobaas-core`](crates/nobaas-core) | Sans-IO session core: identity, Noise IK, lanes, ACK and congestion control, peer relay, hole punching, STUN codec, sealed boxes, invites |
-| [`crates/nobaas`](crates/nobaas) | The Rust facade: `Node` and `AsyncNode` on a UDP socket, STUN, rooms, `Signaling` (`MemoryHub`, `NostrSignaling`), NAT traversal |
-| [`bindings/godot`](bindings/godot) | Godot 4 GDExtension: `NobaasMultiplayerPeer` |
-| [`crates/nobaas-ffi`](crates/nobaas-ffi) | C ABI: one surface for WebAssembly and native FFI |
-| [`crates/nobaas-sim`](crates/nobaas-sim) | Deterministic network simulator (latency, jitter, loss, NAT types, uplink limits) and the arena benchmark |
-| [`crates/nobaas-game`](crates/nobaas-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep timing constants |
-| [`crates/nobaas-peer`](crates/nobaas-peer) | Optional always-on peer (binary): one identity across restarts, relays for linked peers; see [docs/DOCKER.md](docs/DOCKER.md) |
+| [`crates/peerwire-core`](crates/peerwire-core) | Sans-IO session core: identity, Noise IK, lanes, ACK and congestion control, peer relay, hole punching, STUN codec, sealed boxes, invites |
+| [`crates/peerwire`](crates/peerwire) | The Rust facade: `Node` and `AsyncNode` on a UDP socket, STUN, rooms, `Signaling` (`MemoryHub`, `NostrSignaling`), NAT traversal |
+| [`bindings/godot`](bindings/godot) | Godot 4 GDExtension: `PeerwireMultiplayerPeer` |
+| [`crates/peerwire-ffi`](crates/peerwire-ffi) | C ABI: one surface for WebAssembly and native FFI |
+| [`crates/peerwire-sim`](crates/peerwire-sim) | Deterministic network simulator (latency, jitter, loss, NAT types, uplink limits) and the arena benchmark |
+| [`crates/peerwire-game`](crates/peerwire-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep timing constants |
+| [`crates/peerwire-peer`](crates/peerwire-peer) | Optional always-on peer (binary): one identity across restarts, relays for linked peers; see [docs/DOCKER.md](docs/DOCKER.md) |
 | [`packages/js`](packages/js) | JavaScript package: wasm glue, WebRTC transport, Nostr signaling, browser demos |
 | [`examples`](examples) | Rust examples (echo, async echo, a local Nostr relay) and the Godot demo |
 | [`docs`](docs) | Architecture, NAT traversal, Godot, Docker, performance, test plan, comparison |
@@ -460,7 +460,7 @@ scripts/gate.sh --nostr      # also the opt-in tests against public Nostr relays
 ```
 
 Tests run on loopback, in the simulator or against an in-process Nostr relay
-(`cargo run -p nobaas --example nostr_relay --features nostr`). Only `--nostr` reaches the public internet. See
+(`cargo run -p peerwire --example nostr_relay --features nostr`). Only `--nostr` reaches the public internet. See
 [docs/TEST-PLAN.md](docs/TEST-PLAN.md).
 
 ## Documentation

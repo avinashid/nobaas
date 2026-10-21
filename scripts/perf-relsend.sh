@@ -5,10 +5,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PERF=${PERF:-perf}
-target=${TMPDIR:-/tmp}/nobaas-perf-target
-data=${TMPDIR:-/tmp}/nobaas-relsend.perf
+target=${TMPDIR:-/tmp}/peerwire-perf-target
+data=${TMPDIR:-/tmp}/peerwire-relsend.perf
 RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=true CARGO_TARGET_DIR="$target" \
-  cargo build -q --release -p nobaas-sim --example bulk
+  cargo build -q --release -p peerwire-sim --example bulk
 args=("$@")
 [ ${#args[@]} -gt 0 ] || args=(--up 100)
 $PERF record -q -F 2999 --call-graph fp -o "$data" "$target/release/examples/bulk" --cpu 1 "${args[@]}"

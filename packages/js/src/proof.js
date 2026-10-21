@@ -2,19 +2,19 @@
 //
 // The room topic (a hash of the name) is what signalling relays see, so it proves
 // nothing. The room key is the same name hashed under another label, as in Rust
-// (traversal.rs `room_key`): sha256("nobaas/room-key/<app>/<room>"). Peers prove
+// (traversal.rs `room_key`): sha256("peerwire/room-key/<app>/<room>"). Peers prove
 // they hold it with an HMAC-SHA256 under it, over a label and both ends' ids:
 //
-// - 'nb-hello' in a hello's meta.p, over sender id, role byte and meta.ts (the
+// - 'pw-hello' in a hello's meta.p, over sender id, role byte and meta.ts (the
 //   sender's Unix time in ms, little-endian u64), exactly as Rust builds it;
-// - 'nb-rtc-offer' in a sealed WebRTC offer, over sender and recipient ids;
-// - 'nb-link' as the first room message on a Nobaas link, over sender and
+// - 'pw-rtc-offer' in a sealed WebRTC offer, over sender and recipient ids;
+// - 'pw-link' as the first room message on a Peerwire link, over sender and
 //   recipient ids, so a link made any other way still has to prove the key.
 //
 // A room whose name can be guessed is a public lobby: use roomIds with at least
 // 128 random bits (randomRoomId()).
 
-import { toHex, fromHex } from './nobaas.js';
+import { toHex, fromHex } from './peerwire.js';
 
 const enc = new TextEncoder();
 const ROLES = { peer: 0, host: 1, client: 2 };
@@ -48,7 +48,7 @@ function u64le(n) {
 export class RoomProof {
   // `name` is '<appId>/<roomId>'.
   static async create(name) {
-    const raw = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(`nobaas/room-key/${name}`)));
+    const raw = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(`peerwire/room-key/${name}`)));
     const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
     return new RoomProof(key);
   }
@@ -69,7 +69,7 @@ export class RoomProof {
 
   // The hello meta for `self`: { role, ts, p }.
   async hello(self, role = 'peer', ts = Date.now()) {
-    return { role, ts, p: toHex(await this.mac('nb-hello', [id(self), [ROLES[role]], u64le(ts)])) };
+    return { role, ts, p: toHex(await this.mac('pw-hello', [id(self), [ROLES[role]], u64le(ts)])) };
   }
 
   async checkHello(from, meta, now = Date.now()) {
@@ -77,10 +77,10 @@ export class RoomProof {
     const role = ROLES[meta?.role];
     const ts = meta?.ts;
     if (role === undefined || !Number.isSafeInteger(ts) || ts < 0 || Math.abs(now - ts) > FRESH_MS) return false;
-    return this.check('nb-hello', [id(from), [role], u64le(ts)], meta.p);
+    return this.check('pw-hello', [id(from), [role], u64le(ts)], meta.p);
   }
 
-  // A proof from `from` to `to` under `label` ('nb-rtc-offer' or 'nb-link').
+  // A proof from `from` to `to` under `label` ('pw-rtc-offer' or 'pw-link').
   async pair(label, from, to) {
     return toHex(await this.mac(label, [id(from), id(to)]));
   }

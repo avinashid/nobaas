@@ -1,6 +1,6 @@
 // NB-034, in Node over an in-memory wire: SDP host-candidate filtering, and a
 // relay-only endpoint linking only through a relay and refusing direct dials.
-import { loadNobaas, Lane } from '../src/nobaas.js';
+import { loadPeerwire, Lane } from '../src/peerwire.js';
 import { withoutHostCandidates } from '../src/webrtc.js';
 
 const fail = (m) => {
@@ -14,10 +14,10 @@ const sdp = ['v=0', 'a=candidate:1 1 udp 2122260223 192.168.1.5 50000 typ host g
 const kept = withoutHostCandidates(sdp);
 if (/typ host/.test(kept) || !/typ srflx/.test(kept) || !kept.includes('a=mid:0')) fail(`filtered SDP: ${kept}`);
 
-const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
-const nb = await loadNobaas(wasm);
+const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
+const pw = await loadPeerwire(wasm);
 // Three endpoints, every pair wired: handle n reaches endpoint n.
-const eps = [nb.endpoint({ relayOnly: true }), nb.endpoint(), nb.endpoint()];
+const eps = [pw.endpoint({ relayOnly: true }), pw.endpoint(), pw.endpoint()];
 const [a, r, b] = eps;
 eps.forEach((ep, i) => {
   ep.onTransmit = (to, bytes) => setImmediate(() => eps[to].receive(i, bytes));

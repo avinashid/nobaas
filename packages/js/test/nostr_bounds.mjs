@@ -2,19 +2,19 @@
 // name can publish events, so the de-duplication set must not grow without limit,
 // and base64 must handle bodies far larger than a signalling message. No relays:
 // events are fed straight into onRelay.
-import { loadNobaas } from '../src/nobaas.js';
+import { loadPeerwire } from '../src/peerwire.js';
 import { NostrSignaling, MAX_SEEN, b64, unb64 } from '../src/nostr.js';
 
-const wasm = process.argv[2] ?? new URL('../pkg/nobaas_ffi.wasm', import.meta.url).pathname;
-const nb = await loadNobaas(wasm);
+const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
+const pw = await loadPeerwire(wasm);
 let failed = 0;
 const check = (ok, what) => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${what}`);
   if (!ok) failed++;
 };
 
-const other = nb.endpoint();
-const sig = new NostrSignaling(nb, nb.endpoint(), { room: 'perf2/flood', relays: [] });
+const other = pw.endpoint();
+const sig = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/flood', relays: [] });
 await sig.ready;
 const hellos = [];
 sig.onHello = (from) => hellos.push(from);

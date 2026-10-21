@@ -17,7 +17,7 @@ const until = async (what, cond, ms = 10000) => {
     await new Promise((r) => setTimeout(r, 10));
   }
 };
-const opts = { appId: 'nobaas-test', roomId: `node-${process.pid}` };
+const opts = { appId: 'peerwire-test', roomId: `node-${process.pid}` };
 const t0 = performance.now();
 const [a, b, c] = await Promise.all(['ana', 'bo', 'cy'].map((name) => joinRoom({ ...opts, presence: { name } })));
 const got = new Map([a, b, c].map((r) => [r, []]));

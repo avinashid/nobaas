@@ -11,6 +11,6 @@
    ./packages/js/build.sh && node packages/js/test/node_pair.mjs
    ```
 
-4. Keep `nobaas-core` sans-IO and deterministic, and keep the wasm build free of imports.
+4. Keep `peerwire-core` sans-IO and deterministic, and keep the wasm build free of imports.
 5. Every performance number in the docs must be reproducible from the repo, or labelled theoretical with its
    formula.

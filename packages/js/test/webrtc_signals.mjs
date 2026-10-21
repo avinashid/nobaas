@@ -123,7 +123,7 @@ try {
     await settle();
     ok(answered(R), "a new peer's real offer is still answered");
     return out;
-  }, { cases, seed: Number(process.env.NB_FUZZ_SEED ?? 0x6e62) });
+  }, { cases, seed: Number(process.env.PW_FUZZ_SEED ?? 0x6e62) });
   for (const [ok, what] of results) {
     console.log(`${ok ? 'ok  ' : 'FAIL'} ${what}`);
     if (!ok) failed++;

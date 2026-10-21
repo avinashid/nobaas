@@ -1,15 +1,15 @@
-// WebRTC DataChannel transport for a Nobaas Endpoint.
+// WebRTC DataChannel transport for a Peerwire Endpoint.
 //
 // Each remote peer gets an RTCPeerConnection with one negotiated DataChannel
 // (unordered, no retransmits): a datagram pipe. Its local handle number is the
 // endpoint's address for that peer. Reliability, ordering and authentication
-// come from Nobaas on top; the signalling channel is untrusted, because the Noise
+// come from Peerwire on top; the signalling channel is untrusted, because the Noise
 // handshake over the DataChannel proves the remote holds the PeerId it claims.
 //
 // Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
 // messages are JSON-able objects. See BroadcastSignaling below.
 
-import { isPeerId, MAX_DATAGRAM } from './nobaas.js';
+import { isPeerId, MAX_DATAGRAM } from './peerwire.js';
 
 // Above this many bytes queued on a DataChannel, new datagrams are dropped (PERF-1).
 export const MAX_BUFFERED = 1024 * 1024;
@@ -81,7 +81,7 @@ export class WebRtcTransport {
     if (h !== undefined) return this.links.get(h);
     h = this.nextHandle++;
     const pc = new this.Pc({ iceServers: this.iceServers });
-    const dc = pc.createDataChannel('nobaas', { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 });
+    const dc = pc.createDataChannel('peerwire', { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 });
     dc.binaryType = 'arraybuffer';
     const l = { pc, dc, peer, handle: h, dialer: false };
     dc.onopen = () => {
@@ -114,7 +114,7 @@ export class WebRtcTransport {
     return this.privacy === 'direct' ? d : { type: d.type, sdp: withoutHostCandidates(d.sdp) };
   }
 
-  // Opens a DataChannel to `peer` and, once open, runs the Nobaas handshake.
+  // Opens a DataChannel to `peer` and, once open, runs the Peerwire handshake.
   async dial(peer) {
     if (!isPeerId(peer)) throw new TypeError('dial: not a peer id (64 lowercase hex characters)');
     if (!this.allowed(peer)) throw new Error('relay-only: reach this peer with endpoint.connectVia(relay, peer)');
@@ -223,7 +223,7 @@ export class WebRtcTransport {
 // local tests and demos. Presence is announced with 'hello'; the peer with the
 // smaller id dials, so only one offer is made per pair.
 export class BroadcastSignaling {
-  constructor(id, room = 'nobaas-signal') {
+  constructor(id, room = 'peerwire-signal') {
     this.id = id;
     this.ch = new BroadcastChannel(room);
     this.handlers = [];

@@ -1,6 +1,6 @@
 # Test plan
 
-How Nobaas is tested, what each layer covers, and the gate every change passes before merge.
+How Peerwire is tested, what each layer covers, and the gate every change passes before merge.
 
 ## The gate
 
@@ -17,9 +17,9 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 |---|---|---|
 | Rust tests | `cargo test --workspace --release` | every test passes (ignored tests are known gaps, below) |
 | Lints | `cargo clippy --workspace --all-targets` (`-- -D warnings` with `--strict`) | no errors; `--strict` is clean today |
-| Fuzz, debug build (`--strict`) | `cargo test --lib -p nobaas-core -p nobaas -p nobaas-ffi -p nobaas-sim fuzz` | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
+| Fuzz, debug build (`--strict`) | `cargo test --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz` | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
 | Format | `cargo fmt --all -- --check` | no diff (skipped if rustfmt is not installed) |
-| wasm build | `packages/js/build.sh` | builds `packages/js/pkg/nobaas_ffi.wasm` |
+| wasm build | `packages/js/build.sh` | builds `packages/js/pkg/peerwire_ffi.wasm` |
 | wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
 | Node glue | `node packages/js/test/node_pair.mjs` | two endpoints connect; 1000 × 64 B and one 64 KiB reliable message arrive, the large one intact |
 | Node privacy | `node packages/js/test/privacy.mjs` | host candidates are filtered; a relay-only endpoint links through its relay and refuses a direct dial |
@@ -29,7 +29,7 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 | Node nostr bounds | `node packages/js/test/nostr_bounds.mjs` | PERF-2: 12,000 distinct relay events keep `NostrSignaling.seen` at `MAX_SEEN` (4096), oldest evicted first, recent duplicates still dropped; ids that are not 64 lowercase hex (including 4096 events with 64 KiB ids) never enter the set, and non-array tags are ignored without throwing; base64 round-trips 100 KB and 1 MB |
 | Node endpoint closed | `node packages/js/test/endpoint_closed.mjs` | PERF1-2: after `Endpoint.close()` no public method calls into wasm (counted per export): late `receive` datagrams are dropped, `send`/`connect`/`connectVia` throw `endpoint closed`, `secret`/`seal`/`open`/`rttMs` return null, `isConnected` false, `stats` the counters at close; a second `close()` frees nothing; other endpoints on the module keep working |
 | Node fuzz | `node packages/js/test/fuzz.mjs` | NB-014: the JS parsers (below) never throw or leave a rejection unhandled on random and mutated input |
-| Node scratch buffers | `node packages/js/test/scratch_buffers.mjs` | PERF-3: `send`/`receive` reuse the endpoint's `sendBuf` (16 KiB) and `rxBuf`: messages arrive intact back to back across the 0 B, 1232 B and 16 KiB boundaries, 3-byte strings that just fit or just miss, and after wasm memory grows (detached views); no `nb_alloc` on the hot path; `toHex`/`fromHex` tables agree with the old code, non-hex input included |
+| Node scratch buffers | `node packages/js/test/scratch_buffers.mjs` | PERF-3: `send`/`receive` reuse the endpoint's `sendBuf` (16 KiB) and `rxBuf`: messages arrive intact back to back across the 0 B, 1232 B and 16 KiB boundaries, 3-byte strings that just fit or just miss, and after wasm memory grows (detached views); no `pw_alloc` on the hot path; `toHex`/`fromHex` tables agree with the old code, non-hex input included |
 | Node room drain | `node packages/js/test/room_drain.mjs` | PERF-4: 6 MiB sent at once between two rooms (over the 4 MiB reliable send window) arrives intact and in order; the frames that waited in the outbox were moved by the endpoint's `onDrain` hook (incoming datagrams, ACKs among them), not the 2 ms timer, which stops once the outbox is empty; with no hook the timer alone still delivers. `scratch_buffers.mjs` covers `sendRetry` (no copy on retry, freed at `close()`) |
 | Node room leave | `node packages/js/test/room_leave.mjs` | a room that leaves while 6 MiB wait behind its full send window has said goodbye and closed before `leave()` returns (nothing waits on a timer or await, which a closing page never runs); both peers see `peer-leave` 'left' at once. With the Bye dropped, the core's sealed close (`Endpoint.disconnect`) alone still gives 'closed' at once. The `pagehide` handler leaves, then holds the page 20 ms (only if it had peers) |
 | Browser | `node packages/js/test/browser.mjs 2` | two Chromium tabs form a WebRTC mesh on loopback and exchange data |
@@ -53,8 +53,8 @@ browser + arena ~30 s).
 |---|---|---|
 | Unit | `#[cfg(test)]` in `crates/*/src` | parsers, codecs, crypto vectors, reliability state machine |
 | Crate integration | `crates/<crate>/tests/` | public API of one crate, including seeded property tests |
-| Simulation | `crates/nobaas-sim/tests/` | whole endpoints over a deterministic network: loss, jitter, NATs, roaming, relays, arena |
-| JS glue | `packages/js/test/node_pair.mjs` | the wasm C ABI and `nobaas.js` in Node |
+| Simulation | `crates/peerwire-sim/tests/` | whole endpoints over a deterministic network: loss, jitter, NATs, roaming, relays, arena |
+| JS glue | `packages/js/test/node_pair.mjs` | the wasm C ABI and `peerwire.js` in Node |
 | Browser | `packages/js/test/{browser,arena}.mjs` | WebRTC transport and the demo pages in headless Chromium, loopback only |
 | Public network | `packages/js/test/nostr.mjs` | Nostr signaling and public STUN; small, opt-in |
 
@@ -71,7 +71,7 @@ browser + arena ~30 s).
 
 ## Coverage by component
 
-### nobaas-core (unit, `src/`)
+### peerwire-core (unit, `src/`)
 
 - `wire`: frame round trips, truncated frames fail once, frame parser survives garbage, packet bounds.
 - `reliable`: out-of-order reassembly, ACK and retransmit, tail-loss probe beats the RTO, urgent fragments are
@@ -79,11 +79,11 @@ browser + arena ~30 s).
   each stream stays within the receiver's window and has its own buffer, urgent fragments in flight span at
   most the 64-fragment urgent window, the urgent receiver buffers at most that and refuses a message over 64 KiB,
   the window grows by the slots acknowledged, buffer limit.
-- `stun`: RFC 5769 IPv4/IPv6 vectors; Nobaas packets are not mistaken for STUN.
+- `stun`: RFC 5769 IPv4/IPv6 vectors; Peerwire packets are not mistaken for STUN.
 - `crypto`, `identity`, `sealed`, `invite`, `addr`: Noise static key derivation, sign/verify, replay window,
   sealed-box open/reject, RFC 4648 vectors, invite round trip and garbage rejection, socket address round trip.
 
-### nobaas-core over the simulator (`crates/nobaas-sim/tests/endpoint.rs`, `nat.rs`)
+### peerwire-core over the simulator (`crates/peerwire-sim/tests/endpoint.rs`, `nat.rs`)
 
 - Handshake in one RTT; wrong identity fails; simultaneous open converges to one link; replayed handshake does
   not displace a live link; peer restart replaces the stale link.
@@ -95,7 +95,7 @@ browser + arena ~30 s).
   relayed, direct-path failure falls back to the relay, LAN candidates behind one NAT, and the full NAT matrix
   (public, full-cone, restricted, port-restricted, symmetric sequential/random, two CGNAT stacks).
 
-### nobaas-game (`crates/nobaas-game/tests/`)
+### peerwire-game (`crates/peerwire-game/tests/`)
 
 | File | Covers |
 |---|---|
@@ -105,13 +105,13 @@ browser + arena ~30 s).
 | `restored.rs` | the checks from the original `p0-hilbert-rollback` tests that still apply (Hilbert neighbours, ten-tick step, the wall-at-x∈[4,6] sight line, 4-peer quorum eviction); the rollback-simulator and witness parts return with NB-018 |
 | `lockstep.rs` | 30 players × 600 ticks replayed by peers that registered players in different orders: identical island hashes on every tick; a golden digest of the whole run (a change is a protocol break); one wrong input diverges exactly one island and the quorum names the cheater |
 
-### nobaas-sim arena (`crates/nobaas-sim/tests/arena.rs`)
+### peerwire-sim arena (`crates/peerwire-sim/tests/arena.rs`)
 
 Lockstep islands agree over super-peers; bundles survive 5 % loss with jitter; islands survive a super-peer
-dying; an overloaded super-peer degrades without stalling. `cargo run -p nobaas-sim --release --example arena`
+dying; an overloaded super-peer degrades without stalling. `cargo run -p peerwire-sim --release --example arena`
 is the full harness for `docs/PERFORMANCE.md`.
 
-### nobaas-ffi and packages/js
+### peerwire-ffi and packages/js
 
 `two_endpoints_through_the_c_abi` (Rust), `node_pair.mjs` (wasm in Node), `browser.mjs` and `arena.mjs`
 (Chromium, WebRTC over loopback), `nostr.mjs` (opt-in).
@@ -120,12 +120,12 @@ is the full harness for `docs/PERFORMANCE.md`.
 
 The binding must be testable with plain `cargo test`, with no Godot binary. The design rule that makes this
 possible: keep the MultiplayerPeer logic in a Godot-free Rust module (no `godot` types in its API), and make
-`NobaasMultiplayerPeer` a thin GDExtension shell that only converts types and forwards calls. The same logic module
-runs on a test double, on `nobaas-sim` and inside Godot.
+`PeerwireMultiplayerPeer` a thin GDExtension shell that only converts types and forwards calls. The same logic module
+runs on a test double, on `peerwire-sim` and inside Godot.
 
 **Unit tests (logic module, `cargo test`):**
 
-- *Peer IDs:* the host is 1; a joiner's ID comes from its Nobaas PeerId, is in `2..=i32::MAX`, and stays the same
+- *Peer IDs:* the host is 1; a joiner's ID comes from its Peerwire PeerId, is in `2..=i32::MAX`, and stays the same
   across reconnects. Collisions are forced with an injected hash, and every peer must resolve them to the same IDs
   whatever order the joins arrive in (a property test over shuffled join orders).
 - *Packet queue:* FIFO; `_get_available_packet_count` matches the queue length; `_get_packet_peer` belongs to the
@@ -139,12 +139,12 @@ runs on a test double, on `nobaas-sim` and inside Godot.
   that parses; a bad invite or a failed join returns to disconnected; `_close` and `_disconnect_peer` raise
   `peer_disconnected` once per peer.
 
-**Simulator tests (`crates/nobaas-sim/tests/godot_peer.rs`):** a host and three joiners on `nobaas-sim` through
+**Simulator tests (`crates/peerwire-sim/tests/godot_peer.rs`):** a host and three joiners on `peerwire-sim` through
 the logic module, at 0 % and 5 % loss with jitter and behind the NAT matrix. Every `@rpc`-style reliable packet
 arrives exactly once and in order, unreliable-ordered packets never go backwards, a joiner dropping out raises
 `peer_disconnected` on the others, and the same seed replays the run exactly.
 
-**Determinism:** lockstep game logic uses `nobaas-game` fixed-point maths, not Godot physics. `lockstep.rs` is
+**Determinism:** lockstep game logic uses `peerwire-game` fixed-point maths, not Godot physics. `lockstep.rs` is
 the reference: the binding's demo state hash must match a Rust replay of the same input log.
 
 **Headless Godot smoke test (opt-in, not in the default gate):** Godot 4.7.2 is installed at `~/.local/bin/godot`.
@@ -158,35 +158,35 @@ synchronizer updates, then both exit 0 within a timeout. It runs on loopback onl
 Every parser of untrusted input is fuzzed on the stable toolchain, without cargo-fuzz (which needs nightly):
 seeded random and structure-aware inputs (real messages, then mutated: bit flips, boundary bytes, boundary
 u16 lengths, inserts, deletes, duplicated chunks, truncation), with properties checked on whatever a parser
-accepts, not only "no panic". The harness is `nobaas_sim::fuzz` (Rust) and the top of `fuzz.mjs` (JS).
+accepts, not only "no panic". The harness is `peerwire_sim::fuzz` (Rust) and the top of `fuzz.mjs` (JS).
 
 ```sh
 cargo test --workspace --release fuzz                     # in the gate: ~400 k cases, a few seconds per target
-cargo test --lib -p nobaas-core -p nobaas -p nobaas-ffi -p nobaas-sim fuzz   # debug: overflow panics
-NB_FUZZ_SCALE=20 NB_FUZZ_SEED=7 cargo test --workspace --release fuzz -- --nocapture   # a soak
-NB_FUZZ_SCALE=5 NB_FUZZ_SEED=7 node packages/js/test/fuzz.mjs
+cargo test --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz   # debug: overflow panics
+PW_FUZZ_SCALE=20 PW_FUZZ_SEED=7 cargo test --workspace --release fuzz -- --nocapture   # a soak
+PW_FUZZ_SCALE=5 PW_FUZZ_SEED=7 node packages/js/test/fuzz.mjs
 ```
 
-The default seed is fixed, so the gate is deterministic; `NB_FUZZ_SEED` explores others and `NB_FUZZ_SCALE`
+The default seed is fixed, so the gate is deterministic; `PW_FUZZ_SEED` explores others and `PW_FUZZ_SCALE`
 multiplies the case counts. A failing Rust case prints its target, index and input as hex, to paste into a
 regression test.
 
 | Target | Test | Properties |
 |---|---|---|
-| Packets, frames | `nobaas-core` `fuzz::fuzz_packet_parse`, `fuzz_frames` | an accepted packet re-encodes to the same bytes and a well-formed one is never rejected; frames yielded re-encode to exactly the bytes consumed, a malformed tail yields one `Err` |
-| Addresses | `fuzz_addresses`, `nobaas-sim` `fuzz_sim_addresses` | `SocketAddr`/`u32`/`u64`/`SimAddr` decoding accepts canonical encodings only |
-| STUN | `fuzz_stun` | requests and responses (extra attributes too); STUN never parses as a Nobaas packet |
-| Invites | `fuzz_invites` | bytes and `nb:` links: whatever parses survives its own round trip, ≤ 16 entries, and is the one encoding of what it decodes to (`to_link(parse(s)) == s`) |
+| Packets, frames | `peerwire-core` `fuzz::fuzz_packet_parse`, `fuzz_frames` | an accepted packet re-encodes to the same bytes and a well-formed one is never rejected; frames yielded re-encode to exactly the bytes consumed, a malformed tail yields one `Err` |
+| Addresses | `fuzz_addresses`, `peerwire-sim` `fuzz_sim_addresses` | `SocketAddr`/`u32`/`u64`/`SimAddr` decoding accepts canonical encodings only |
+| STUN | `fuzz_stun` | requests and responses (extra attributes too); STUN never parses as a Peerwire packet |
+| Invites | `fuzz_invites` | bytes and `pw:` links: whatever parses survives its own round trip, ≤ 16 entries, and is the one encoding of what it decodes to (`to_link(parse(s)) == s`) |
 | Sealed | `fuzz_sealed` | only an untouched message sealed to us opens, naming its real sender |
 | Hostile peer | `fuzz_hostile_peer` | an authenticated peer sends sealed random frames, garbage, FWD to a bystander and RELAYED nested 12 deep, roaming and jumping time: no panic, a violation drops it and it may reconnect, half-open sessions stay bounded, and the bystander and the peer still exchange messages after |
 | Receive memory | `hostile_peer_pins_bounded_receive_memory` | an authenticated peer fills each stream's partial message and out-of-order buffer: a link holds at most 2,308,712 B (urgent 134,836 B), one urgent fragment past 64 KiB of message drops the peer, and an honest 64 KiB urgent message still arrives |
-| Hellos, offers | `nobaas` `traversal::fuzz_hello_and_offer_parsers` | round trips; candidates, relays and the prediction window stay within their limits |
+| Hellos, offers | `peerwire` `traversal::fuzz_hello_and_offer_parsers` | round trips; candidates, relays and the prediction window stay within their limits |
 | Authenticated signals | `traversal::fuzz_authenticated_signals` | a room-key or invite-key holder's proved hellos and offers, random and mutated: the endpoint never dials loopback, multicast, broadcast, link-local, unspecified or port 0 |
 | Gateway answers | `portmap::fuzz_gateway_answers` | PCP, NAT-PMP, SSDP, URLs, IGD XML, HTTP (chunked, lengths at the integer limits): mappings have a port and lifetime, URLs and control paths are printable, SSDP points only at the private host that answered |
 | Port mapper | `portmap::fuzz_mapper` | a hostile gateway and LAN hosts: datagrams only to the gateway or the SSDP group, HTTP only to private hosts, request heads printable with a 3-part request line |
 | Nostr (Rust) | `nostr::fuzz_relay_messages` | mutated events and JSON nested 100,000 deep: what is passed on has a topic and payload that round-trip |
-| C ABI | `nobaas-ffi` `fuzz_the_c_abi` | random call sequences and arguments: documented return codes only, a short event buffer keeps the event for a retry, every event has the documented encoding |
-| Godot frames | `nobaas-godot` `fuzz_frames_from_peers` | frames round-trip; a joiner takes its id only from its host's first ASSIGN, queues packets only from known peers, keeps its inbox caps |
+| C ABI | `peerwire-ffi` `fuzz_the_c_abi` | random call sequences and arguments: documented return codes only, a short event buffer keeps the event for a retry, every event has the documented encoding |
+| Godot frames | `peerwire-godot` `fuzz_frames_from_peers` | frames round-trip; a joiner takes its id only from its host's first ASSIGN, queues packets only from known peers, keeps its inbox caps |
 | JS | `packages/js/test/fuzz.mjs` | `decodeEvent` matches a reference encoder; hex, peer ids, base64 round-trip; `NostrSignaling.onRelay`, `RoomProof.checkHello`, `Room.onMessage` never throw and leave no rejection unhandled; only real proofs and real senders get through |
 | WebRTC signals | `packages/js/test/webrtc_signals.mjs` | see the gate table |
 

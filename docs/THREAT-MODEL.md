@@ -1,14 +1,14 @@
 # Threat model
 
-Scope of this document: `nobaas-core` (handshake, wire format, lanes, relay, NAT
-traversal, STUN, invites, sealed messages), the C ABI (`nobaas-ffi`), the
+Scope of this document: `peerwire-core` (handshake, wire format, lanes, relay, NAT
+traversal, STUN, invites, sealed messages), the C ABI (`peerwire-ffi`), the
 JavaScript glue and transport (`packages/js`), and the Nostr / BroadcastChannel
-signaling adapters. It records what Nobaas defends against, what it does not, and
+signaling adapters. It records what Peerwire defends against, what it does not, and
 the findings of the first security review (M5, NB-013).
 
 Status: pre-1.0, no external audit. See [SECURITY.md](../SECURITY.md).
 
-## What Nobaas protects
+## What Peerwire protects
 
 1. **Peer authentication.** A `PeerId` is an Ed25519 public key. A link is
    `Noise_IK_25519_ChaChaPoly_BLAKE2s`, whose static key is the X25519 form of
@@ -80,7 +80,7 @@ reproduction below now throws a `TypeError` and the module stays healthy
 (`packages/js/test/peer_id.mjs`, in the gate). The C ABI peer-length argument is
 a separate defence-in-depth card.
 
-`packages/js/nobaas.js` `Endpoint.setPeer(id)` copies `id` into the fixed 32-byte
+`packages/js/peerwire.js` `Endpoint.setPeer(id)` copies `id` into the fixed 32-byte
 `peerBuf` with `mem().set(..., this.peerBuf)` and performs no length check;
 `seal()` and `open()`/`put()` have the same shape. An over-long id writes past the
 buffer into adjacent wasm linear memory, corrupting other endpoint state and the
@@ -110,7 +110,7 @@ merge:
   `new Uint8Array(e.data)`. `binaryType = 'arraybuffer'` covers binary messages
   only, so a peer could send a *string* such as `"2147483648"`, which became a
   length: one 10-byte message made the tab allocate 2 GB and aborted the module
-  in `nb_alloc` (`"100000000"` grew wasm memory to ~101 MB, never returned). It
+  in `pw_alloc` (`"100000000"` grew wasm memory to ~101 MB, never returned). It
   needed only an open DataChannel, before the Noise handshake. Now `onmessage`
   accepts only an `ArrayBuffer` of at most `MAX_DATAGRAM` (1232) bytes, and
   `Endpoint.receive` drops anything larger before allocating, which also covers
@@ -124,7 +124,7 @@ merge:
 
 `nostr.js` `hello()` publishes `{ t:'hello', from:<full PeerId>, meta }` as plain
 base64 under a tag derived only from the room name. Anyone who knows the room name
-(the room tag is `sha256("nobaas/room/<room>")`, computable by anyone with the
+(the room tag is `sha256("peerwire/room/<room>")`, computable by anyone with the
 name) can read every member's long-term Ed25519 PeerId, correlate it with the
 ephemeral Nostr pubkey, the `created_at` timestamp and the relay set, and track
 that identity across rooms and time. This defeats the "fresh key per session"
@@ -189,7 +189,7 @@ their exposure.
 
 ### SEC-5 — Deterministic, unsalted Nostr peer tag enables presence correlation (Low–Medium) — NB-025
 
-The per-peer tag is `sha256("nobaas/peer/<PeerId>")`, a fixed function of the
+The per-peer tag is `sha256("peerwire/peer/<PeerId>")`, a fixed function of the
 public PeerId. Anyone who knows a target's PeerId can compute the tag and
 subscribe to it on the public relays to learn whenever that identity is addressed,
 and to correlate activity across sessions and rooms. (SEC-2 hands out the PeerIds;
@@ -226,8 +226,8 @@ threshold for long-lived sessions. Document the current property meanwhile.
 
 ### SEC-8 — C ABI trusts caller pointers and lengths (Low, by contract) — NB-028
 
-Several `nb_*` functions dereference the endpoint handle and in/out buffers
-without null or length checks (e.g. `nb_secret`, `nb_send`, `nb_stats`), and
+Several `pw_*` functions dereference the endpoint handle and in/out buffers
+without null or length checks (e.g. `pw_secret`, `pw_send`, `pw_stats`), and
 `bytes(ptr, len)` with a null `ptr` and non-zero `len` is undefined behaviour.
 This is the documented C-ABI contract and the JS glue always upholds it, but a
 native (Dart/Swift/C) caller that violates it gets memory unsafety rather than an
@@ -301,9 +301,9 @@ Findings:
 
 ---
 
-## Invite strings (`nb:`)
+## Invite strings (`pw:`)
 
-An invite (`crates/nobaas-core/src/invite.rs`) is `nb:` + unpadded base64url of
+An invite (`crates/peerwire-core/src/invite.rs`) is `pw:` + unpadded base64url of
 `version | peer(32) | addrs | relays`. It carries **no secret**: the PeerId is a
 public key and the addresses are routing hints. Security properties:
 
@@ -334,20 +334,20 @@ invite may be posted.
 
 ## Godot binding (NB-020, planned — security requirements)
 
-The coming `bindings/godot` crate exposes `NobaasMultiplayerPeer`
+The coming `bindings/godot` crate exposes `PeerwireMultiplayerPeer`
 (`MultiplayerPeerExtension`) so Godot's high-level multiplayer — `@rpc`,
-`MultiplayerSynchronizer`, `MultiplayerSpawner` — runs over Nobaas. Nobaas
+`MultiplayerSynchronizer`, `MultiplayerSpawner` — runs over Peerwire. Peerwire
 delivers *authenticated, confidential bytes* to that layer, but everything Godot
-does *above* the `MultiplayerPeer` is outside Nobaas's guarantees. This section
+does *above* the `MultiplayerPeer` is outside Peerwire's guarantees. This section
 sets the requirements the binding must meet; they are tracked as SEC-9…SEC-11
-(proposed follow-ups on NB-020, owner @nobaas-backend).
+(proposed follow-ups on NB-020, owner @peerwire-backend).
 
 ### SEC-9 — Untrusted packets crossing into GDScript (High, design) — NB-029
 
 Godot's high-level multiplayer deserializes incoming packets into Variants and
 dispatches `@rpc` methods by name. Variant decoding of `Object`/`Callable`/
 `RID` from the network is a known remote-code-execution surface (object
-instantiation, resource loading). Because Nobaas is pure P2P, **every connected
+instantiation, resource loading). Because Peerwire is pure P2P, **every connected
 peer is a remote attacker** at this layer.
 
 **Requirements.**
@@ -356,14 +356,14 @@ peer is a remote attacker** at this layer.
   cannot ship encoded `Object`s.
 - Document loudly that `@rpc("any_peer")` methods receive attacker-controlled
   arguments and must validate them and check `multiplayer.get_remote_sender_id()`.
-- Surface Nobaas's per-lane size caps to the `MultiplayerPeer` so an oversized or
+- Surface Peerwire's per-lane size caps to the `MultiplayerPeer` so an oversized or
   malformed Godot packet is rejected at the boundary, not deep in a decoder.
 - A Rust panic in the cdylib must not unwind into Godot: catch/abort at the FFI
   edge (godot-rust convention), so a malformed packet can't turn a panic into UB.
 
 ### SEC-10 — Godot peer-ID spoofing and mapping collisions (High, design) — NB-029
 
-Godot peer IDs are 32-bit ints; Nobaas PeerIds are 256-bit Ed25519 keys. The
+Godot peer IDs are 32-bit ints; Peerwire PeerIds are 256-bit Ed25519 keys. The
 binding derives a stable non-zero Godot ID from each PeerId. A 32-bit space makes
 collisions reachable (birthday bound ~2^16 peers, but an attacker can *grind*
 PeerIds offline to target a specific victim's Godot ID).
@@ -372,7 +372,7 @@ PeerIds offline to target a specific victim's Godot ID).
 - The PeerId → Godot-ID map is authoritative per session and **collisions must be
   rejected**, not silently merged: a joiner whose derived ID clashes with a live
   peer is renumbered or refused, never allowed to inherit another peer's ID.
-- `_get_packet_peer()` must return the Godot ID of the *authenticated Nobaas
+- `_get_packet_peer()` must return the Godot ID of the *authenticated Peerwire
   source* of that packet only; it must never be derivable from packet contents an
   attacker controls.
 - Host is Godot ID 1: the binding must bind ID 1 to the actual host identity and
@@ -384,7 +384,7 @@ PeerIds offline to target a specific victim's Godot ID).
 
 ### SEC-11 — Host authority over RPCs in a serverless mesh (Medium, design) — NB-029
 
-Godot's model assumes peer 1 is a trusted server/authority. Nobaas has no
+Godot's model assumes peer 1 is a trusted server/authority. Peerwire has no
 inherent authority: a peer can send any packet to any peer, and
 `MultiplayerSpawner`/`MultiplayerSynchronizer` let an "authority" spawn/despawn
 nodes and set properties on others' scene trees. A malicious peer that the app
@@ -395,11 +395,11 @@ treats as an authority corrupts every client.
   as the app's topology; in an open mesh, `@rpc("authority")` is not a security
   control.
 - Recommend a pattern: designate the host as the only synchronizer/spawner
-  authority and have it validate inputs, or use `nobaas-game`'s deterministic
+  authority and have it validate inputs, or use `peerwire-game`'s deterministic
   lockstep (where every peer recomputes state and desync is detected) instead of
   trusting an authority's state pushes.
 - The binding should not auto-relay packets between peers on behalf of the Godot
-  layer unless the app opts in (Nobaas relay is already gated and rate-limited;
+  layer unless the app opts in (Peerwire relay is already gated and rate-limited;
   don't bypass it).
 
 **Status of SEC-9…SEC-11 as of `ccc3b79`.** The binding shipped (NB-020) and was
@@ -408,7 +408,7 @@ hardened (NB-030). `docs/GODOT.md` (Security) now states each requirement: keep
 arguments as attacker-controlled, ids are labels (the host renumbers collisions,
 only the dialled host is 1, authorize by `get_peer_key`), and Godot's authority
 is only as trustworthy as the peer made authority (use the host, or lockstep on
-`nobaas-game`). SEC-11 is a design property: it stays a documented residual, not
+`peerwire-game`). SEC-11 is a design property: it stays a documented residual, not
 a bug. NB-037's room-key proof does not change it. It only limits who can join a
 room to holders of the room key, and any of them can still be malicious. Godot's
 `server_relay` is on by default; `docs/GODOT.md` names its cost, how to turn it
@@ -427,7 +427,7 @@ requirement against the code:
   `session.rs`.
 - SEC-10: `derive_id` never yields 0 or 1, and `IdMap::assign` moves a colliding
   key to the next derived id (`colliding_ids_are_moved`). A packet's peer is
-  looked up from the authenticated Nobaas sender; a frame from a peer with no id
+  looked up from the authenticated Peerwire sender; a frame from a peer with no id
   is dropped. A joiner takes ASSIGN only from the host it dialled, only once,
   and never 1; a host ignores ASSIGN (`spoofed_frames_are_dropped`).
 - SEC-11: documented, as above; nothing in the binding forwards packets itself.
@@ -445,23 +445,23 @@ requirement against the code:
 
 ## Relation to the Protocol Zero red-team notes
 
-Nobaas was bootstrapped from the Protocol Zero SDK, whose adversarial notes
+Peerwire was bootstrapped from the Protocol Zero SDK, whose adversarial notes
 (`p0/protocol-zero/REDTEAM.md`) cover a related dead-drop/signaling stack. The
-mappings that carry over and are already handled in Nobaas:
+mappings that carry over and are already handled in Peerwire:
 
-- **A1 sender forgery → handled.** Nobaas signaling uses the authenticated sealed
+- **A1 sender forgery → handled.** Peerwire signaling uses the authenticated sealed
   form (`Noise_X`, sender PeerId bound), the equivalent of P0's
   `sealAuthenticated`. A forged/anonymous seal fails to open under a claimed
   identity (`sealed.rs` test).
 - **A8 packet injection/replay → handled.** AEAD per data packet + the 2048 nonce
   window; nonce recorded only after authentication (SEC/THREAT items above).
-- **A7 stale/replayed signaling → partially: SEC-6.** Nobaas has no in-band
+- **A7 stale/replayed signaling → partially: SEC-6.** Peerwire has no in-band
   signaling-replay guard; carry P0's lesson (bind a fresh session id) into the fix.
 - **A11 metadata / A12 forward secrecy → OPEN here too: SEC-2/3/5 and SEC-7.** The
-  same open problems (relay-visible timing/IP, static-key exposure) apply; Nobaas's
+  same open problems (relay-visible timing/IP, static-key exposure) apply; Peerwire's
   per-session Nostr key and rotating-tag ideas mirror P0's mitigations.
 - **A5 spam / A13 Sybil → relevant to the signaling layer**; the half-open cap
-  (SEC-4) and relay rate limiting are the Nobaas analogues. A PoW-gated first
+  (SEC-4) and relay rate limiting are the Peerwire analogues. A PoW-gated first
   contact (as in P0 A5) is a candidate hardening if public rooms are abused.
 
 ## Residual risks accepted for v0.1

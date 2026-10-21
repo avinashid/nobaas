@@ -20,7 +20,7 @@ const until = async (cond, ms) => {
   return cond();
 };
 
-const opts = { appId: 'nobaas-test', roomId: `drain-${process.pid}` };
+const opts = { appId: 'peerwire-test', roomId: `drain-${process.pid}` };
 const [a, b] = await Promise.all([joinRoom(opts), joinRoom(opts)]);
 check(await until(() => a.peers.length === 1 && b.peers.length === 1, 10000), 'two rooms joined');
 
