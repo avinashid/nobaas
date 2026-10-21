@@ -8,11 +8,31 @@
 //
 // Signalling adapters implement { id, send(to, msg), onMessage(fn), close() };
 // messages are JSON-able objects. See BroadcastSignaling below.
+//
+// When WebRTC can't link two peers (symmetric NAT on both sides, no TURN), the
+// transport can carry Peerwire datagrams over the signalling channel itself: a
+// *pipe*, one more handle the endpoint dials like any address. Datagrams are
+// already Noise-encrypted; Nostr signalling seals each batch to the peer again.
+// Pipes are slow (a relay round trip per batch) and rate-capped, a last resort.
 
 import { isPeerId, MAX_DATAGRAM } from './peerwire.js';
+import { b64, unb64 } from './nostr.js';
 
 // Above this many bytes queued on a DataChannel, new datagrams are dropped (PERF-1).
 export const MAX_BUFFERED = 1024 * 1024;
+// A DataChannel not open this long after the offer or answer counts as failed.
+export const RTC_FALLBACK_MS = 8000;
+// Pipes: datagrams are batched for PIPE_FLUSH_MS into one signalling message of at
+// most PIPE_BATCH bytes. All pipes together send PIPE_RATE messages a second (burst
+// PIPE_BURST), within what public relays allow one client, and batch more while they
+// wait; past PIPE_QUEUE bytes waiting on a pipe, the oldest is dropped.
+export const PIPE_FLUSH_MS = 40;
+export const PIPE_BATCH = 16 * 1024;
+export const PIPE_RATE = 3;
+export const PIPE_BURST = 6;
+export const PIPE_QUEUE = 64 * 1024;
+const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
+const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
 
 // Removes `host` candidates (LAN, loopback, mDNS .local names) from an SDP, keeping
 // server-reflexive (public, from STUN) and relay ones.
@@ -35,7 +55,10 @@ export class WebRtcTransport {
   // `offerProof`: { sign(to), check(from, p) }, both async. Offers carry
   //   `p: await sign(to)`, and an offer is answered (with our addresses) only if
   //   check(from, p) holds. joinRoom passes a room-key proof (see proof.js).
-  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
+  // `onPeer(peer, state)`: 'open' and 'closed' for a DataChannel, and 'failed' once
+  //   when one isn't open `fallbackMs` after its offer or answer (or ICE failed).
+  // `pipes`: carry datagrams over signalling for peers allowed with allowPipe().
+  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, pipes = false, fallbackMs = RTC_FALLBACK_MS, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
     if (privacy === 'relay-only' && !isPeerId(relay)) throw new TypeError("privacy 'relay-only' needs a relay peer id");
     this.ep = endpoint;
@@ -55,12 +78,22 @@ export class WebRtcTransport {
     this.links = new Map(); // handle -> { pc, dc, peer }
     this.byPeer = new Map(); // peer hex -> handle
     this.nextHandle = 1;
+    this.fallbackMs = fallbackMs;
+    this.pipesOn = pipes;
+    this.pipes = new Map(); // handle -> pipe (see pipe())
+    this.pipeByPeer = new Map(); // peer hex -> handle
+    this.pipeAllowed = new Set(); // peers whose datagrams over signalling we take
+    this.pipeTokens = PIPE_BURST; // the rate budget all pipes share
+    this.pipeRefilled = Date.now();
+    this.piped = { sent: 0, received: 0, dropped: 0 }; // batches sent; datagrams received and dropped
     endpoint.onTransmit = (handle, bytes) => {
-      const l = this.links.get(handle);
       if (loss && Math.random() < loss) {
         this.dropped++;
         return;
       }
+      const pipe = this.pipes.get(handle);
+      if (pipe) return this.pipeSend(pipe, bytes);
+      const l = this.links.get(handle);
       if (!l || l.dc.readyState !== 'open') return;
       // A full SCTP buffer means the path is congested: drop like UDP would, and
       // let the core's congestion control back off. dc.send throws when it's full.
@@ -83,10 +116,14 @@ export class WebRtcTransport {
     const pc = new this.Pc({ iceServers: this.iceServers });
     const dc = pc.createDataChannel('peerwire', { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 });
     dc.binaryType = 'arraybuffer';
-    const l = { pc, dc, peer, handle: h, dialer: false };
+    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, failed: false };
     dc.onopen = () => {
+      clearTimeout(l.timer);
       if (l.dialer) this.ep.connect(h, peer);
       this.onPeer(peer, 'open');
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed') this.failed(l);
     };
     dc.onclose = () => this.onPeer(peer, 'closed');
     // Binary datagrams only: a string message would become a length in new Uint8Array(string).
@@ -101,6 +138,19 @@ export class WebRtcTransport {
     this.links.set(h, l);
     this.byPeer.set(peer, h);
     return l;
+  }
+
+  // Starts the clock on a link once its offer or answer is out.
+  watch(l) {
+    clearTimeout(l.timer);
+    if (l.dc.readyState !== 'open') l.timer = setTimeout(() => this.failed(l), this.fallbackMs);
+  }
+
+  failed(l) {
+    clearTimeout(l.timer);
+    if (l.failed || l.dc.readyState === 'open' || this.links.get(l.handle) !== l) return;
+    l.failed = true;
+    this.onPeer(l.peer, 'failed');
   }
 
   // Whether WebRTC (which hands the peer our addresses) may run with `peer`.
@@ -125,12 +175,14 @@ export class WebRtcTransport {
     await this.gathered(l.pc);
     const p = this.offerProof ? await this.offerProof.sign(peer) : undefined;
     this.sig.send(peer, { kind: 'offer', sdp: this.description(l.pc), p });
+    this.watch(l);
   }
 
   async onSignal(from, msg) {
     // Signalling is untrusted: a `from` that isn't a PeerId never gets a link.
     if (!isPeerId(from) || !msg) return void this.badSignals++;
     if (!this.allowed(from)) return;
+    if (msg.kind === 'dg') return this.pipeReceive(from, msg.d);
     const held = this.checking.get(from);
     if (held) return void held.push(msg);
     if (msg.kind === 'offer' && this.offerProof && !this.byPeer.has(from)) {
@@ -163,6 +215,7 @@ export class WebRtcTransport {
       }
       await this.gathered(l.pc);
       this.sig.send(from, { kind: 'answer', sdp: this.description(l.pc) });
+      this.watch(l);
     } else if (msg.kind === 'answer') {
       const l = this.link(from);
       try {
@@ -196,21 +249,116 @@ export class WebRtcTransport {
     return this.byPeer.has(peer);
   }
 
-  // Forgets the link to `peer`, so a later dial or offer starts afresh.
-  drop(peer) {
+  // Lets `peer` (one that proved the room key) send us datagrams over signalling.
+  allowPipe(peer) {
+    if (!this.pipesOn || this.pipeAllowed.has(peer)) return;
+    this.pipeAllowed.add(peer);
+    if (this.pipeAllowed.size > MAX_PIPE_PEERS) this.pipeAllowed.delete(this.pipeAllowed.values().next().value);
+  }
+
+  isPipe(handle) {
+    return this.pipes.has(handle);
+  }
+
+  // The endpoint address that reaches `peer` over signalling, or null if pipes are off.
+  pipe(peer) {
+    if (!this.pipesOn || !isPeerId(peer)) return null;
+    let h = this.pipeByPeer.get(peer);
+    if (h !== undefined) return h;
+    h = this.nextHandle++;
+    this.pipes.set(h, { peer, handle: h, q: [], bytes: 0, timer: null });
+    this.pipeByPeer.set(peer, h);
+    return h;
+  }
+
+  pipeSend(p, bytes) {
+    p.q.push([b64(bytes), bytes.length]);
+    p.bytes += bytes.length;
+    // Like a full UDP buffer: drop the oldest and let congestion control back off.
+    while (p.bytes > PIPE_QUEUE && p.q.length > 1) {
+      p.bytes -= p.q.shift()[1];
+      this.piped.dropped++;
+    }
+    this.pipeFlushSoon(p, PIPE_FLUSH_MS);
+  }
+
+  pipeFlushSoon(p, ms) {
+    if (!p.timer) p.timer = setTimeout(() => this.pipeFlush(p), ms);
+  }
+
+  pipeFlush(p) {
+    p.timer = null;
+    if (this.pipes.get(p.handle) !== p || !p.q.length) return;
+    const now = Date.now();
+    this.pipeTokens = Math.min(PIPE_BURST, this.pipeTokens + ((now - this.pipeRefilled) / 1000) * PIPE_RATE);
+    this.pipeRefilled = now;
+    if (this.pipeTokens < 1) return this.pipeFlushSoon(p, Math.ceil(((1 - this.pipeTokens) * 1000) / PIPE_RATE));
+    this.pipeTokens -= 1;
+    const d = [];
+    let n = 0;
+    while (p.q.length && d.length < MAX_PIPE_ITEMS && (n === 0 || n + p.q[0][1] <= PIPE_BATCH)) {
+      const [s, len] = p.q.shift();
+      n += len;
+      d.push(s);
+    }
+    p.bytes -= n;
+    this.piped.sent++;
+    try {
+      Promise.resolve(this.sig.send(p.peer, { kind: 'dg', d })).catch(() => {});
+    } catch {
+      // A closed signalling channel: the datagrams are lost, as on a dead path.
+    }
+    if (p.q.length) this.pipeFlushSoon(p, PIPE_FLUSH_MS);
+  }
+
+  pipeReceive(from, d) {
+    if (!this.pipeAllowed.has(from) || !Array.isArray(d) || d.length > MAX_PIPE_ITEMS) return void this.badSignals++;
+    const h = this.pipe(from);
+    for (const s of d) {
+      if (typeof s !== 'string' || s.length > (MAX_DATAGRAM * 4) / 3 + 4) return void this.badSignals++;
+      let bytes;
+      try {
+        bytes = unb64(s);
+      } catch {
+        return void this.badSignals++;
+      }
+      this.piped.received++;
+      this.ep.receive(h, bytes);
+    }
+  }
+
+  // Forgets the WebRTC link to `peer`, so a later dial or offer starts afresh.
+  dropRtc(peer) {
     const h = this.byPeer.get(peer);
     if (h === undefined) return;
     const l = this.links.get(h);
+    clearTimeout(l.timer);
     l.dc.onclose = null;
+    l.pc.onconnectionstatechange = null;
     l.pc.close();
     this.links.delete(h);
     this.byPeer.delete(peer);
   }
 
+  // Forgets every path to `peer`: its WebRTC link and its pipe.
+  drop(peer) {
+    this.dropRtc(peer);
+    const h = this.pipeByPeer.get(peer);
+    if (h === undefined) return;
+    clearTimeout(this.pipes.get(h).timer);
+    this.pipes.delete(h);
+    this.pipeByPeer.delete(peer);
+  }
+
   close() {
     this.checking.clear();
+    for (const p of this.pipes.values()) clearTimeout(p.timer);
+    this.pipes.clear();
+    this.pipeByPeer.clear();
     for (const l of this.links.values()) {
+      clearTimeout(l.timer);
       l.dc.onclose = null;
+      l.pc.onconnectionstatechange = null;
       l.pc.close();
     }
     this.links.clear();

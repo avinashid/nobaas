@@ -42,6 +42,7 @@ const room = await joinRoom({
   signaling: 'local',       // 'local' (tabs of one browser, one Node process) | 'nostr' | custom factory
   presence: { name: 'Ana' }, // shared with every peer when it joins
   privacy: 'direct',        // or 'public-only': no LAN addresses in ICE (see Privacy below)
+  fallback: 'auto',         // peers WebRTC can't link: 'auto' | 'peers' | 'off' (see Through any NAT)
 });
 
 room.on('peer-join', (peer, presence) => {});
@@ -54,6 +55,7 @@ room.send({ x: 1, y: 2 }, { lane: 'unreliable' }); // latest-wins, one datagram 
 room.send(bytes, { to: peer });                 // one peer, or an array of them
 room.setPresence({ name: 'Ana', typing: true });
 room.peers; room.self; room.getPresence(peer); room.rtt(peer);
+room.route(peer);                               // { kind: 'direct' | 'peer' (via) | 'signaling' }
 await room.leave();                             // peers see 'peer-leave' at once
 ```
 
@@ -123,8 +125,7 @@ Types are in `src/index.d.ts`.
 | `demo/index.html` | Mesh chat on the low-level API: every tab links to every other. |
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
-| `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player, so a player needs a link to the host only. Network panel: per-peer RTT and ICE path; `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server. Served by `demo/crew-server.mjs`, peers that can't link by WebRTC (symmetric NAT on both sides) fall back to its same-origin WebSocket relay. |
-| `demo/crew-server.mjs` | `node demo/crew-server.mjs [port] [host]`: serves the package and the Crew fallback relay at `/relay` (no dependencies; per-socket rate limits, 16 per room). |
+| `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player, so a player needs a link to the host only. Network panel: per-peer RTT and route (ICE path, or the fallback). `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server; `?rtc=off` fails this tab's WebRTC links (testing the fallback). `demo/crew-server.mjs` serves it for hosting. |
 
 Signalling is untrusted by design: whatever carries the offers, the Peerwire Noise
 handshake over the DataChannel proves each side holds its PeerId.
@@ -151,8 +152,32 @@ it is given:
 - Same browser: open `demo/index.html` or the arena pages in several tabs.
 - Different machines: add `?signal=nostr&room=<something only you know>` to every
   page. Peers meet through `wss://relay.damus.io` and `wss://nos.lol` and use
-  Google's public STUN. There is no TURN, so two peers behind symmetric NATs won't
-  connect directly; the Peerwire peer relay (`connect_via`) is the planned fallback.
+  Google's public STUN. Peers behind symmetric NATs on both sides still meet: see
+  below.
+
+## Through any NAT
+
+WebRTC can't link two peers that are both behind symmetric NAT (common on mobile
+hotspots and carrier NAT) unless a TURN server is configured. Rather than requiring
+one, `joinRoom` falls back per peer, on its own, with no setup on either side:
+
+1. **Direct WebRTC**, as always (`room.route(peer).kind === 'direct'`).
+2. **Through another member.** When a link isn't open `fallbackMs` (8 s) after its
+   offer, or its ICE fails, the dialling side dials the peer again through every member
+   it has a direct link to, including members that link later. The core forwards for
+   linked peers (`connect_via`, 256 KiB/s per peer) and sees only ciphertext (`'peer'`).
+3. **Over the signalling relays.** If no member has answered within 1 s, Peerwire
+   datagrams also go as signalling messages (a *pipe*). On Nostr each batch is sealed
+   to the peer again (`'signaling'`). This works wherever the relays are reachable.
+   It is slow, though: a relay round trip per batch, 40 ms batching, and at most 3
+   batches a second for all of a client's pipes together. That is within what public
+   relays allow one client. A relay that refuses events for its rate limit gets none
+   for 30 s, doubling up to 10 min.
+
+The core keeps the first path that completes the handshake, and the room's proofs,
+presence and messages run unchanged on it. A pipe opens only for a peer whose hello
+proved the room key. `fallback: 'peers'` skips step 3; `'off'` keeps WebRTC only.
+TURN in `iceServers` still works and is faster than step 3 when you have a server.
 
 ## Tests
 
@@ -195,8 +220,13 @@ Run these with Node and the Playwright install on this host:
   the `pagehide` handler holds the page 20 ms after it, only if it had peers.
 - `node packages/js/test/room_throttled.mjs --ab=<other packages/js>`: benchmark, not a test.
   Room send throughput when the sender's timers are throttled like a background tab's.
-- `[P2P=0] node packages/js/test/crew.mjs [tabs=4] [shot-prefix]` (`P2P=0`: every message through the fallback relay): plays `demo/crew.html` in four tabs: a kill,
+- `node packages/js/test/crew.mjs [tabs=4] [shot-prefix]`: plays `demo/crew.html` in four tabs: a kill,
   a report, a meeting with chat, the impostor voted out, then a second round won on tasks.
+  `RTC_OFF=all` fails every WebRTC link, so the game runs over the signalling fallback;
+  `RTC_OFF=1` fails tab 1's links only.
+- `node packages/js/test/room_fallback.mjs`: a fake RTCPeerConnection blocks chosen
+  pairs. A blocked pair links through a third member, or over signalling when there is
+  none (a 100 KB message arrives whole), and stays apart with `fallback: 'peers'`/`'off'`.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

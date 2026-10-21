@@ -17,6 +17,14 @@
 // within PROOF_MS is dropped, never told our presence. Use roomIds with at least
 // 128 random bits (randomRoomId()): a guessable name is a public lobby.
 //
+// When WebRTC can't link two members (symmetric NAT on both sides, and no TURN in
+// iceServers), the room falls back on its own, per peer: the dialer dials the
+// peer through every member it is linked to directly (the core relays for linked
+// peers) and over the signalling channel itself (a pipe, see webrtc.js), at once,
+// and the first path to answer wins. Every path carries the same Noise session,
+// so relays and signalling only ever see sealed datagrams. room.route(peer) says
+// which path a peer is on. `fallback: 'peers'` skips the pipe, 'off' both.
+//
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
 // numbers, ArrayBuffers), and room.sendTo(peer, data, lane) takes no options.
@@ -34,6 +42,9 @@ const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5 };
 const HELLO_EVERY_MS = 15000;
 // A link must prove the room key this soon after it connects.
 const PROOF_MS = 10000;
+// In a fallback, members get this long to relay a peer before signalling, the
+// slowest path, joins the dial.
+const PEER_FIRST_MS = 1000;
 // Frames held from one peer while its link proof is checked.
 const MAX_HELD = 256;
 // How long a pagehide handler that said goodbye holds the page. The browser may end
@@ -91,11 +102,14 @@ export async function joinRoom({
   relays,
   iceServers,
   privacy = 'direct',
+  fallback = 'auto',
+  fallbackMs,
   RTCPeerConnection = globalThis.RTCPeerConnection,
 } = {}) {
   if (!appId || !roomId) throw new TypeError('joinRoom needs an appId and a roomId');
   // A room dials every member, so relay-only (one WebRTC link, to the relay) can't apply.
   if (privacy !== 'direct' && privacy !== 'public-only') throw new TypeError(`joinRoom privacy must be 'direct' or 'public-only', not ${privacy}`);
+  if (!['auto', 'peers', 'off'].includes(fallback)) throw new TypeError(`joinRoom fallback must be 'auto', 'peers' or 'off', not ${fallback}`);
   const src = wasm ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url);
   const key = String(src);
   if (!modules.has(key)) modules.set(key, loadPeerwire(src).catch((e) => (modules.delete(key), Promise.reject(e))));
@@ -117,7 +131,8 @@ export async function joinRoom({
       sign: (to) => proof.pair('pw-rtc-offer', endpoint.id, to),
       check: (from, p) => proof.checkPair('pw-rtc-offer', from, endpoint.id, p),
     };
-    transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy, offerProof, RTCPeerConnection });
+    const pipes = fallback === 'auto';
+    transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy, offerProof, pipes, fallbackMs, RTCPeerConnection });
   } else if (signaling === 'local') {
     transport = () => new LocalTransport(endpoint, sig);
   } else {
@@ -125,7 +140,7 @@ export async function joinRoom({
     sig.close();
     throw new Error('no WebRTC in this runtime: pass RTCPeerConnection (e.g. from node-datachannel) or use signaling: \'local\'');
   }
-  const room = new Room(endpoint, sig, transport, presence, proof);
+  const room = new Room(endpoint, sig, transport, presence, proof, { fallback });
   if (queue) room.queue = [];
   await sig.ready;
   await room.hello();
@@ -134,7 +149,8 @@ export async function joinRoom({
 
 export class Room {
   static proofMs = PROOF_MS; // tests shorten it
-  constructor(endpoint, signaling, makeTransport, presence, proof) {
+  static peerFirstMs = PEER_FIRST_MS;
+  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off' } = {}) {
     this.endpoint = endpoint;
     this.signaling = signaling;
     this.self = endpoint.id;
@@ -150,8 +166,12 @@ export class Room {
     this.proven = new Set(); // linked peers that proved the room key
     this.proving = new Map(); // peer -> frames held while its proof is checked
     this.deadlines = new Map(); // peer -> timer that drops it unless it proves the key
+    this.fallback = fallback;
+    this.routes = new Map(); // linked peer -> { kind: 'direct' | 'peer' | 'signaling', via? }
+    this.fallingBack = new Set(); // peers we dial by fallback since WebRTC failed
     this.transport = makeTransport((peer, state) => {
-      if (state === 'closed') this.lost(peer, 'closed');
+      if (state === 'closed') this.rtcClosed(peer);
+      else if (state === 'failed') this.rtcFailed(peer);
     });
     endpoint.onEvent = (e) => this.onEvent(e);
     // ACKs free send window: flush the outbox as they arrive (the timer is a fallback).
@@ -236,6 +256,13 @@ export class Room {
     for (const p of this.proven) this.write(p, f, Lane.Reliable);
   }
 
+  // How `peer` is reached: { kind: 'direct' } (its own WebRTC link), { kind: 'peer',
+  // via } (relayed by member `via`), { kind: 'signaling' } (over the signalling
+  // relays), or null while not linked.
+  route(peer) {
+    return this.routes.get(peer) ?? null;
+  }
+
   rtt(peer) {
     return this.endpoint.rttMs(peer);
   }
@@ -268,6 +295,8 @@ export class Room {
     this.proving.clear();
     for (const t of this.deadlines.values()) clearTimeout(t);
     this.deadlines.clear();
+    this.routes.clear();
+    this.fallingBack.clear();
   }
 
   // Announces us on the room topic, with a proof of the room key.
@@ -278,10 +307,12 @@ export class Room {
   async onHello(peer, meta) {
     // A custom signalling adapter may pass anything along: only PeerIds are dialled.
     // `meta.pw` marks a Rust UDP peer, which WebRTC can't dial.
-    if (this.left || !isPeerId(peer) || peer === this.self || this.transport.has(peer) || meta?.pw) return;
+    if (this.left || !isPeerId(peer) || peer === this.self || meta?.pw) return;
     // Knowing the topic isn't enough: only hellos that prove the room key count.
     if (!(await this.proof.checkHello(peer, meta))) return;
-    if (this.left || this.transport.has(peer)) return;
+    // A member may reach us over signalling once WebRTC fails, whichever side dials.
+    this.transport.allowPipe?.(peer);
+    if (this.left || this.transport.has(peer) || this.fallingBack.has(peer) || this.endpoint.isConnected(peer)) return;
     // Answer a newcomer's hello once, so it learns about us too.
     if (!this.greeted.has(peer)) {
       this.greeted.add(peer);
@@ -296,6 +327,8 @@ export class Room {
     if (e.type === 'connected') {
       const peer = e.peer;
       this.linked.add(peer);
+      this.routes.set(peer, this.routeOf(e.path));
+      this.fallingBack.delete(peer);
       // Prove the room key first; presence follows once the peer has proved it too.
       this.proof.pair('pw-link', this.self, peer).then((p) => {
         if (this.linked.has(peer)) this.write(peer, frame(T.Proof, fromHex(p)), Lane.Reliable);
@@ -306,6 +339,8 @@ export class Room {
       }, Room.proofMs));
     } else if (e.type === 'message') {
       this.onMessage(e.peer, e.data, e.lane);
+    } else if (e.type === 'pathChanged') {
+      if (this.linked.has(e.peer)) this.routes.set(e.peer, this.routeOf(e.path));
     } else if (e.type === 'disconnected') {
       this.lost(e.peer, e.reason);
     } else if (e.type === 'connectFailed') {
@@ -366,9 +401,46 @@ export class Room {
       clearTimeout(this.deadlines.get(peer));
       this.deadlines.delete(peer);
       this.proven.add(peer);
+      this.relayPending(peer);
       this.write(peer, frame(T.Presence, enc.encode(JSON.stringify(this.me))), Lane.Reliable);
       for (const [d, l] of rest) this.onMessage(peer, d, l);
     });
+  }
+
+  routeOf(path) {
+    if (path.via) return { kind: 'peer', via: path.via };
+    return { kind: this.transport.isPipe?.(path.direct) ? 'signaling' : 'direct' };
+  }
+
+  // A DataChannel closed: the peer is lost if that was its path, or if no fallback
+  // is under way; otherwise only the WebRTC link goes.
+  rtcClosed(peer) {
+    const r = this.routes.get(peer);
+    if (r ? r.kind !== 'direct' : this.fallingBack.has(peer)) return this.transport.dropRtc(peer);
+    this.lost(peer, 'closed');
+  }
+
+  // WebRTC couldn't link `peer`. The side that dials (the smaller id) dials it again
+  // through every member linked to us directly (and any that links later) and, unless
+  // one answers within PEER_FIRST_MS, over signalling too; the core keeps the first
+  // path to answer. The other side just answers.
+  rtcFailed(peer) {
+    if (this.left || this.fallback === 'off' || this.self > peer || this.endpoint.isConnected(peer)) return;
+    const vias = [...this.routes].filter(([p, r]) => p !== peer && r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
+    const pipe = this.transport.pipe?.(peer);
+    // Nothing else to try: drop the dead link, so a later hello dials WebRTC again.
+    if (!vias.length && pipe == null) return this.lost(peer, 'failed');
+    this.fallingBack.add(peer);
+    for (const v of vias) this.endpoint.connectVia(v, peer);
+    if (pipe == null) return;
+    setTimeout(() => !this.left && this.fallingBack.has(peer) && this.endpoint.connect(pipe, peer), Room.peerFirstMs);
+  }
+
+  // A member just linked directly and proved the key: it can relay the peers we are
+  // still dialling by fallback (the core adds a path to a dial under way).
+  relayPending(member) {
+    if (this.routes.get(member)?.kind !== 'direct') return;
+    for (const p of this.fallingBack) if (p !== member && !this.endpoint.isConnected(p)) this.endpoint.connectVia(member, p);
   }
 
   lost(peer, reason) {
@@ -380,6 +452,8 @@ export class Room {
     this.deadlines.delete(peer);
     this.outbox.delete(peer);
     this.greeted.delete(peer);
+    this.routes.delete(peer);
+    this.fallingBack.delete(peer);
     if (this.members.delete(peer)) this.emit('peer-leave', peer, reason);
   }
 

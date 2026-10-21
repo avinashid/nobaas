@@ -11,14 +11,8 @@
 //   host -> one      role {role, tasks, partners} at the start, cd {ms} to an impostor
 //
 // Every message from a peer is untrusted: the host checks phase, roles, distances
-// and cooldowns before acting on one.
-//
-// Fallback: when two peers can't link by WebRTC (symmetric NAT on both sides, no
-// TURN), their messages go through the WebSocket relay of demo/crew-server.mjs at
-// /relay on the page's own origin, so anyone who can load the page can play. Each
-// message takes WebRTC when that peer is linked, else the relay. ?relay=off turns
-// it off, ?relay=wss://... points elsewhere, ?p2p=0 sends everything through it
-// (tests). ?turn=turn:host:3478&tu=user&tp=pass adds a TURN server.
+// and cooldowns before acting on one. ?turn=turn:host:3478&tu=user&tp=pass adds a
+// TURN server for networks that can't link directly (symmetric NAT on both sides).
 
 import { joinRoom, DEFAULT_ICE_SERVERS } from '../src/index.js';
 
@@ -90,79 +84,6 @@ function log(line) {
 
 // ---------- joining ----------
 
-// ---------- links: WebRTC, else the relay ----------
-
-const P2P = params.get('p2p') !== '0';
-const via = new Map(); // linked peer -> Set of 'rtc' | 'ws'
-let relay = null;
-
-const rtcUp = (p) => P2P && room.peers.includes(p);
-const net = {
-  get peers() { return [...via.keys()]; },
-  presence: (p) => room.getPresence(p) ?? relay?.members.get(p),
-  path: (p) => (rtcUp(p) ? 'rtc' : via.get(p)?.has('ws') ? 'ws' : ''),
-  // to: one peer, or everyone linked.
-  send(msg, to, lane) {
-    if (to) {
-      if (rtcUp(to)) room.send(msg, { to, lane });
-      else if (via.get(to)?.has('ws')) relay.send([to], msg);
-      return;
-    }
-    if (P2P && room.peers.length) room.send(msg, { lane });
-    const rest = net.peers.filter((p) => !rtcUp(p));
-    if (rest.length) relay?.send(rest, msg);
-  },
-};
-
-function up(peer, how, presence) {
-  const s = via.get(peer) ?? new Set();
-  const first = !s.size;
-  s.add(how);
-  via.set(peer, s);
-  if (first) onPeerJoin(peer, presence);
-}
-
-function down(peer, how, reason) {
-  const s = via.get(peer);
-  if (!s?.delete(how) || s.size) return;
-  via.delete(peer);
-  onPeerLeave(peer, reason);
-}
-
-async function connectRelay(code) {
-  const at = params.get('relay') ?? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/relay`;
-  if (at === 'off') return;
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${APP_ID}\n${code}`));
-  const key = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
-  const r = { members: new Map(), state: 'connecting', send() {} };
-  relay = r;
-  let ws;
-  try { ws = new WebSocket(at); } catch { r.state = 'unavailable'; return; }
-  ws.onopen = () => {
-    r.state = 'connected';
-    ws.send(JSON.stringify({ t: 'hello', room: key, id: room.self, presence: room.getPresence() }));
-    r.send = (to, m) => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'to', to, m }));
-  };
-  ws.onmessage = (e) => {
-    let m;
-    try { m = JSON.parse(e.data); } catch { return; }
-    if (m.t === 'join' && typeof m.id === 'string') {
-      r.members.set(m.id, m.presence);
-      up(m.id, 'ws', m.presence);
-    } else if (m.t === 'leave') {
-      r.members.delete(m.id);
-      down(m.id, 'ws', 'left');
-    } else if (m.t === 'msg' && via.has(m.from)) onMessage(m.m, m.from);
-    else if (m.t === 'refused') r.state = `refused (${m.why})`;
-  };
-  ws.onclose = () => {
-    r.state = r.state === 'connected' ? 'closed' : 'unavailable';
-    r.send = () => {};
-    for (const id of r.members.keys()) down(id, 'ws', 'relay closed');
-    r.members.clear();
-  };
-}
-
 function iceServers() {
   const turn = params.get('turn');
   if (!turn) return undefined;
@@ -194,12 +115,9 @@ async function enter(asHost) {
     if (!seen.has(peer)) seen.set(peer, now());
     hello(peer, meta);
   };
-  if (P2P) {
-    room.on('peer-join', (peer, presence) => up(peer, 'rtc', presence));
-    room.on('peer-leave', (peer, reason) => down(peer, 'rtc', reason));
-    room.on('message', onMessage);
-  }
-  connectRelay(code);
+  room.on('peer-join', onPeerJoin);
+  room.on('peer-leave', onPeerLeave);
+  room.on('message', onMessage);
   history.replaceState(null, '', `?${new URLSearchParams({ ...Object.fromEntries(params), room: code })}`);
   $('lobby').classList.add('hidden');
   $('me').innerHTML = `<b>${esc(myName)}</b> <span class="dim">${short(room.self)}</span><br>room <code>${esc(code)}</code>`;
@@ -256,17 +174,17 @@ function onPeerLeave(peer, reason) {
 // Host -> one player (the host itself included).
 function send(to, msg, lane = 'reliable') {
   if (to === room.self) return fromHost(msg);
-  net.send(msg, to, lane);
+  room.send(msg, { to, lane });
 }
 
 function toHost(msg, lane = 'reliable') {
   if (isHost) return hostHandle(room.self, msg);
-  if (hostId && via.has(hostId)) net.send(msg, hostId, lane);
+  if (hostId && room.peers.includes(hostId)) room.send(msg, { to: hostId, lane });
 }
 
 // Everyone, the host included.
 function broadcast(msg, lane = 'reliable') {
-  net.send(msg, null, lane);
+  if (room.peers.length) room.send(msg, { lane });
   fromHost(msg);
 }
 
@@ -281,7 +199,7 @@ function publish() {
 function onMessage(msg, from) {
   if (!msg || typeof msg !== 'object') return;
   if (isHost) return hostHandle(from, msg);
-  if (!hostId && net.presence(from)?.host) hostId = from;
+  if (!hostId && room.getPresence(from)?.host) hostId = from;
   if (from === hostId) fromHost(msg);
 }
 
@@ -493,7 +411,7 @@ setInterval(() => {
   if (!isHost || !room) return;
   if (S.phase === 'meeting' && now() > G.meetingEnds) endMeeting();
   const p = [...pos].filter(([id]) => S.players[id]).map(([id, q]) => [id, Math.round(q.x), Math.round(q.y)]);
-  net.send({ t: 'snap', p }, null, 'unreliable');
+  if (room.peers.length) room.send({ t: 'snap', p }, { lane: 'unreliable' });
 }, 66);
 
 // ---------- the player's side ----------
@@ -723,12 +641,10 @@ function findingMsg() {
   const secs = Math.round((now() - started) / 1000);
   const relays = room.signaling.stats ? `${room.signaling.stats.relaysOpen} signalling relay(s) open. ` : '';
   const heard = [...seen.keys()];
-  const linked = heard.filter((p) => via.has(p)).length;
+  const linked = heard.filter((p) => room.peers.includes(p)).length;
   let msg = `${relays}${secs}s: heard ${heard.length} peer(s) in this room, linked to ${linked}.`;
   if (secs > 15 && heard.length > linked) {
-    msg += relay?.state === 'connected'
-      ? '<br><br><b>Found peers but could not connect.</b> The host is not on the fallback relay: it may be running an older copy of the game, or opened it from another address.'
-      : `<br><br><b>Found peers but could not connect.</b> Both networks block direct connections (strict, "symmetric" NAT, typical of mobile hotspots), and the fallback relay is ${relay?.state ?? 'off'}. Open the game from a server running demo/crew-server.mjs, or add a TURN server: <code>?turn=turn:HOST:3478&amp;tu=USER&amp;tp=PASS</code>.`;
+    msg += '<br><br><b>Found peers but could not connect.</b> Both networks block direct connections (strict, "symmetric" NAT, typical of mobile hotspots). Try another network for one side, or add a TURN server: <code>?turn=turn:HOST:3478&amp;tu=USER&amp;tp=PASS</code>.';
   } else if (secs > 15 && heard.length === 0) {
     msg += '<br><br>No one with this room code yet. Check the code; the host must click "Host a game" first.';
   }
@@ -761,19 +677,18 @@ setInterval(async () => {
   if (!room) return;
   if (S.phase === 'finding' || S.phase === 'meeting') render();
   const rows = [];
-  for (const peer of net.peers) {
-    const name = net.presence(peer)?.name ?? short(peer);
-    const rtt = rtcUp(peer) ? room.rtt(peer) : null;
+  for (const peer of room.peers) {
+    const name = room.getPresence(peer)?.name ?? short(peer);
+    const rtt = room.rtt(peer);
     const tag = peer === hostId ? ' <b>host</b>' : '';
-    const how = rtcUp(peer) ? await pathOf(peer) : 'through the fallback relay (server)';
-    rows.push(`<li>${esc(name)}${tag}: ${rtt == null ? '' : `${Math.round(rtt)} ms `}<span class="dim">${how}</span></li>`);
+    rows.push(`<li>${esc(name)}${tag}: ${rtt == null ? '…' : `${Math.round(rtt)} ms`} <span class="dim">${await pathOf(peer)}</span></li>`);
   }
   for (const [peer, t] of seen) {
-    if (via.has(peer)) continue;
+    if (room.peers.includes(peer)) continue;
     rows.push(`<li class="dim">${short(peer)}: heard via signalling ${Math.round((now() - t) / 1000)}s ago, not linked</li>`);
   }
   const relays = room.signaling.stats ? `<div>signalling relays open: ${room.signaling.stats.relaysOpen}</div>` : '';
-  $('net').innerHTML = `${relays}<ul>${rows.join('') || '<li>no peers yet</li>'}</ul><div>fallback relay: ${relay?.state ?? 'off'}</div>${params.get('turn') ? '<div>TURN configured</div>' : ''}`;
+  $('net').innerHTML = `${relays}<ul>${rows.join('') || '<li>no peers yet</li>'}</ul>${params.get('turn') ? '<div>TURN configured</div>' : ''}`;
 }, 1000);
 
 // ---------- input ----------
