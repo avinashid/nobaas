@@ -157,6 +157,8 @@ export declare function randomRoomId(): string;
 
 export declare const DEFAULT_ICE_SERVERS: RTCIceServer[];
 export declare const DEFAULT_RELAYS: string[];
+export declare const RECONNECT_MS: number;
+export declare const MAX_RECONNECT_MS: number;
 
 // Lower layers.
 
@@ -341,8 +343,11 @@ export declare class NostrSignaling implements SignalingAdapter {
   constructor(pw: Peerwire, endpoint: Endpoint, options: { room: string; relays?: string[] });
   readonly id: string;
   readonly ready: Promise<void>;
-  readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; lastRejection?: string };
+  /** `relaysOpen` counts sockets open now; `reconnects` counts relays that opened again after a close. */
+  readonly stats: { published: number; received: number; rejected: number; relaysOpen: number; reconnects: number; lastRejection?: string };
   onHello: (peer: PeerId, meta?: unknown) => void;
+  /** A relay opened again after its socket closed (it is redialled on its own, and at once on going online, a network change or the page showing again). */
+  onReconnect: (url: string) => void;
   hello(meta?: unknown): Promise<void>;
   send(to: PeerId, body: unknown): Promise<void>;
   onMessage(fn: (from: PeerId, body: any) => void): void;

@@ -3,7 +3,7 @@
 // and base64 must handle bodies far larger than a signalling message. No relays:
 // events are fed straight into onRelay.
 import { loadPeerwire } from '../src/peerwire.js';
-import { BACKOFF_MS, MAX_BACKOFF_MS, NostrSignaling, MAX_SEEN, b64, unb64 } from '../src/nostr.js';
+import { BACKOFF_MS, MAX_BACKOFF_MS, RECONNECT_MS, NostrSignaling, MAX_SEEN, b64, unb64 } from '../src/nostr.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
 const pw = await loadPeerwire(wasm);
@@ -109,6 +109,67 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   s5.onRelay('a', JSON.stringify(['OK', 'v', false, 'rate-limited: much later']));
   check(s5.paused.get('a').ms === BACKOFF_MS, 'a limit after a long quiet period starts the pause over');
   s5.sockets.length = 0;
+}
+
+// 6. A relay socket that closes (phone hotspot on, network switch, tab frozen) is redialled,
+//    subscribes again and says so; a network change recycles open sockets; close() stops it.
+{
+  const Real = globalThis.WebSocket;
+  const made = [];
+  class Fake {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    constructor(url) {
+      this.url = url;
+      this.readyState = Fake.CONNECTING;
+      this.sent = [];
+      made.push(this);
+    }
+    open() {
+      this.readyState = Fake.OPEN;
+      this.onopen?.();
+    }
+    send(m) {
+      this.sent.push(m);
+    }
+    close() {
+      this.readyState = Fake.CLOSED;
+      this.onclose?.();
+    }
+  }
+  globalThis.WebSocket = Fake;
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  const s6 = new NostrSignaling(pw, pw.endpoint(), { room: 'hotspot/reconnect', relays: ['wss://a', 'wss://b'] });
+  await tick(20);
+  made.forEach((w) => w.open());
+  await s6.ready;
+  const back = [];
+  s6.onReconnect = (url) => back.push(url);
+  check(s6.stats.relaysOpen === 2 && made.every((w) => w.sent.some((m) => m.startsWith('["REQ"'))), 'both relays open and subscribed');
+  made[0].close(); // relay a drops
+  check(s6.stats.relaysOpen === 1, `a closed relay is no longer counted open (${s6.stats.relaysOpen})`);
+  await tick(RECONNECT_MS + 100);
+  const a2 = made.at(-1);
+  check(made.length === 3 && a2.url === 'wss://a', `relay a is redialled after ${RECONNECT_MS} ms (${made.length} sockets made)`);
+  a2.close(); // fails again: the delay doubles
+  await tick(RECONNECT_MS + 100);
+  check(made.length === 3, 'a second failure waits longer');
+  await tick(RECONNECT_MS + 100);
+  const a3 = made.at(-1);
+  a3.open();
+  check(made.length === 4 && a3.sent.some((m) => m.startsWith('["REQ"')) && back.join() === 'wss://a' && s6.stats.reconnects === 1 && s6.stats.relaysOpen === 2,
+    `the reopened relay subscribes again and onReconnect fires (${JSON.stringify(back)}, open ${s6.stats.relaysOpen})`);
+  await s6.publish(s6.roomTag, 'e30=');
+  check(a3.sent.some((m) => m.startsWith('["EVENT"')) && made[0].sent.every((m) => !m.startsWith('["EVENT"')), 'events go to the new socket, not the dead one');
+  s6.redial(true); // a network change: open sockets may be on the old network
+  check(made.length === 6 && s6.stats.relaysOpen === 0 && made.slice(-2).map((w) => w.url).sort().join() === 'wss://a,wss://b', 'a network change redials every relay at once');
+  made.slice(-2).forEach((w) => w.open());
+  check(s6.stats.relaysOpen === 2 && s6.sockets.length === 2, `after it, both are open again with one socket each (${s6.sockets.length})`);
+  s6.close();
+  await tick(RECONNECT_MS * 2 + 100);
+  check(made.length === 6 && s6.retry.size === 0, 'close() stops the redialling');
+  globalThis.WebSocket = Real;
 }
 
 console.log(failed ? `${failed} FAILED` : 'nostr bounds: all passed');
