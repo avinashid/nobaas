@@ -310,7 +310,8 @@ The reliable lane is a small, real-time-tuned transport:
   last copy counts, and a quarter of the minimum RTT is allowed for reordering (as in RACK) before resending.
 - **RTO.** Initial 300 ms, bounded to 20 ms–5 s, with backoff capped at 10 s. A 25 ms ACK-delay allowance (as in
   QUIC's `max_ack_delay`) covers busy game frames and browser event loops. A fragment is declared dead after 16
-  sends.
+  sends. While a hole is repaired, fragments more than 64 above it (beyond the bitmap's reach) don't time out
+  before the repair does.
 - **Tail-loss probe.** If nothing is acknowledged for `srtt + 2·rttvar + 4 ms`, the newest fragment is resent.
   A lost tail is repaired in about one RTT instead of a full RTO, which matters for sparse traffic such as a lone
   event.
