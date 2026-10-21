@@ -2,9 +2,10 @@
 // machine (BroadcastChannel signalling, loopback WebRTC): one host and three
 // players meet, the host starts, the impostor kills, a crew member reports the
 // body, everyone votes the impostor out and the crew wins. Then a second round
-// in which the crew wins by finishing every task.
+// in which the crew wins by finishing every task. Served by demo/crew-server.mjs;
+// with P2P=0 no WebRTC is used and every message goes through its /relay.
 //
-//   node packages/js/test/crew.mjs [tabs=4] [screenshot-prefix]
+//   [P2P=0] node packages/js/test/crew.mjs [tabs=4] [screenshot-prefix]
 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +17,8 @@ const tabs = Number(process.argv[2] ?? 4);
 const shot = process.argv[3];
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const port = 8765 + Math.floor(Math.random() * 1000);
-const server = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { cwd: root, stdio: 'ignore' });
+const server = spawn(process.execPath, [path.join(root, 'demo', 'crew-server.mjs'), String(port)], { stdio: 'ignore' });
+const p2p = process.env.P2P ?? '1';
 const step = (s) => console.log(`ok: ${s}`);
 let browser;
 let ok = false;
@@ -28,7 +30,7 @@ try {
   for (let i = 0; i < tabs; i++) {
     const p = await ctx.newPage();
     p.on('pageerror', (e) => console.log(`tab ${i} error: ${e.message}`));
-    const q = new URLSearchParams({ signal: 'local', room: `t${port}`, name: `p${i}`, auto: i ? 'join' : 'host' });
+    const q = new URLSearchParams({ signal: 'local', room: `t${port}`, name: `p${i}`, auto: i ? 'join' : 'host', p2p });
     await p.goto(`http://127.0.0.1:${port}/demo/crew.html?${q}`);
     pages.push(p);
   }

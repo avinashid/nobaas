@@ -123,7 +123,8 @@ Types are in `src/index.d.ts`.
 | `demo/index.html` | Mesh chat on the low-level API: every tab links to every other. |
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
-| `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player, so a player needs a link to the host only. Network panel: per-peer RTT and ICE path; `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server. |
+| `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player, so a player needs a link to the host only. Network panel: per-peer RTT and ICE path; `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server. Served by `demo/crew-server.mjs`, peers that can't link by WebRTC (symmetric NAT on both sides) fall back to its same-origin WebSocket relay. |
+| `demo/crew-server.mjs` | `node demo/crew-server.mjs [port] [host]`: serves the package and the Crew fallback relay at `/relay` (no dependencies; per-socket rate limits, 16 per room). |
 
 Signalling is untrusted by design: whatever carries the offers, the Peerwire Noise
 handshake over the DataChannel proves each side holds its PeerId.
@@ -194,7 +195,7 @@ Run these with Node and the Playwright install on this host:
   the `pagehide` handler holds the page 20 ms after it, only if it had peers.
 - `node packages/js/test/room_throttled.mjs --ab=<other packages/js>`: benchmark, not a test.
   Room send throughput when the sender's timers are throttled like a background tab's.
-- `node packages/js/test/crew.mjs [tabs=4] [shot-prefix]`: plays `demo/crew.html` in four tabs: a kill,
+- `[P2P=0] node packages/js/test/crew.mjs [tabs=4] [shot-prefix]` (`P2P=0`: every message through the fallback relay): plays `demo/crew.html` in four tabs: a kill,
   a report, a meeting with chat, the impostor voted out, then a second round won on tasks.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
