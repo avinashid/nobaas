@@ -755,7 +755,10 @@ fn dual_stack(addr: SocketAddr) -> io::Result<UdpSocket> {
 
 /// The socket's own addresses: the bound one, or, when bound to any interface, the
 /// address of each family's default route and loopback (both families for a
-/// dual-stack socket; IPv6 only with a route out, which in practice means global).
+/// dual-stack socket; IPv6 only with a route out, which in practice means global),
+/// then up to [`MAX_PRIVATE`] other private IPv4 interface addresses. Those are a
+/// phone's hotspot side (its default route is cellular) or a second LAN: a peer
+/// tethered to it reaches the socket there.
 fn local_addresses(local: SocketAddr) -> Vec<SocketAddr> {
     if !local.ip().is_unspecified() {
         return vec![local];
@@ -766,6 +769,30 @@ fn local_addresses(local: SocketAddr) -> Vec<SocketAddr> {
     out.push(at(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     if local.is_ipv6() {
         out.push(at(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+    let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
+    let private = private_v4(ifaces.iter().map(|i| (i.name.as_str(), i.ip())));
+    for ip in private.into_iter().map(at) {
+        if !out.contains(&ip) && out.len() < families.len() + 2 + MAX_PRIVATE {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// How many extra private interface addresses a socket offers (the offer holds 8).
+const MAX_PRIVATE: usize = 3;
+
+/// The private IPv4 addresses (RFC 1918) of `(interface, address)` pairs, without
+/// container and VM bridges, which no other device can reach.
+fn private_v4<'a>(ifaces: impl Iterator<Item = (&'a str, IpAddr)>) -> Vec<IpAddr> {
+    const BRIDGES: [&str; 6] = ["docker", "br-", "veth", "virbr", "vmnet", "cni"];
+    let mut out = Vec::new();
+    for (name, ip) in ifaces {
+        let IpAddr::V4(v4) = ip else { continue };
+        if v4.is_private() && !BRIDGES.iter().any(|b| name.starts_with(b)) && !out.contains(&ip) {
+            out.push(ip);
+        }
     }
     out
 }
@@ -842,6 +869,27 @@ mod tests {
         assert!(dual.contains(&at("127.0.0.1:7")) && dual.contains(&at("[::1]:7")), "{dual:?}");
         assert_eq!(dual.iter().filter(|a| a.is_ipv4()).count(), v4.len(), "the same IPv4 addresses");
         assert_eq!(local_addresses(at("[::1]:7")), vec![at("[::1]:7")]);
+    }
+
+    /// A phone sharing mobile data: its hotspot address is offered, bridges are not.
+    #[test]
+    fn private_interface_addresses_are_offered() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let ifaces = [
+            ("rmnet_data0", ip("192.0.0.4")),
+            ("wlan1", ip("10.129.132.170")),
+            ("lo", ip("127.0.0.1")),
+            ("docker0", ip("172.17.0.1")),
+            ("br-1a2b", ip("172.18.0.1")),
+            ("eth0", ip("192.168.1.5")),
+            ("eth0", ip("2001:db8::5")),
+            ("tun0", ip("100.74.51.161")),
+            ("wlan1", ip("10.129.132.170")),
+        ];
+        assert_eq!(private_v4(ifaces.into_iter()), vec![ip("10.129.132.170"), ip("192.168.1.5")]);
+        // On this host: the default route's address and loopback come first, at most 3 more.
+        let any = local_addresses("0.0.0.0:7".parse().unwrap());
+        assert!(any.len() <= 2 + MAX_PRIVATE && any.iter().all(|a| a.port() == 7), "{any:?}");
     }
 
     #[test]
