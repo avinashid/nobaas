@@ -240,7 +240,8 @@ gives out. Changing it affects the next invites and offers; links already up kee
     build older than `FWD_QUIET` takes frame type 11 as a protocol violation and drops the link. In the same way
     a build from before the urgent stream drops a link on its first `Urgent` message (frame types 12 and 13).
   - Cost: latency `rtt(A,R) + rtt(R,B)`, and the relay uploads every relayed byte again (capped by
-    `Config::relay_rate`, 256 KiB/s per requesting peer by default).
+    `Config::relay_rate`, 256 KiB/s per requesting peer by default, and `Config::relay_total_rate` for all peers
+    together, unlimited by default).
 
 Per-mode outcome in the simulator: a room with a public host and peers A and B over 36 pairs of NAT kinds (each
 unordered pair once) plus two peers behind one non-hairpinning NAT, from `cargo test -p nobaas-sim --release --test

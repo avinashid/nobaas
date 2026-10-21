@@ -39,6 +39,14 @@ pub struct Config {
     pub handshake_timeout: Duration,
     /// Cap on half-open responder handshakes (flood protection).
     pub max_pending_handshakes: usize,
+    /// Cap on announced links. At it a new HS1 is dropped before the
+    /// responder's DH, and an inbound handshake that completes once the cap is
+    /// reached is dropped on its first data packet, before any of it is acted
+    /// on, so nothing is relayed past the cap. Half-open handshakes don't count
+    /// (`max_pending_handshakes` bounds them). At the cap even a linked peer that
+    /// re-dials waits until its old link times out, since its identity is only
+    /// known after the DH. Links we dial ourselves are not capped.
+    pub max_links: usize,
     pub max_message: usize,
     /// Per-link cap on bytes queued or unacknowledged, for `Reliable` and for
     /// `Urgent` each, so a full reliable buffer never refuses an urgent message.
@@ -52,6 +60,9 @@ pub struct Config {
     /// Bytes per second each peer may have us relay, with a burst of `relay_burst`.
     pub relay_rate: u64,
     pub relay_burst: u64,
+    /// Bytes per second we relay for all peers together, with a burst of a
+    /// quarter of that (at least one relayed packet). 0: no node-wide limit.
+    pub relay_total_rate: u64,
     /// Relayed packets queued per outgoing link; the oldest is dropped when full.
     pub relay_queue: usize,
     /// While a link is relayed and has direct candidates, probe them this often...
@@ -79,6 +90,7 @@ impl Default for Config {
             handshake_attempts: 6,
             handshake_timeout: Duration::from_secs(10),
             max_pending_handshakes: 4096,
+            max_links: usize::MAX,
             max_message: 1 << 20,
             max_send_buffer: 4 << 20,
             reliable_window: 1024,
@@ -86,6 +98,7 @@ impl Default for Config {
             relay: true,
             relay_rate: 256 << 10,
             relay_burst: 64 << 10,
+            relay_total_rate: 0,
             relay_queue: 256,
             punch_interval: Duration::from_millis(100),
             punch_duration: Duration::from_secs(5),
@@ -396,6 +409,8 @@ pub struct Endpoint<A: Address> {
     events: VecDeque<Event<A>>,
     stats: Stats,
     relay_only: bool,
+    /// Node-wide relay bucket (`Config::relay_total_rate`): tokens and last refill.
+    relay_total: (u64, Option<Instant>),
 }
 
 impl<A: Address> Endpoint<A> {
@@ -416,6 +431,7 @@ impl<A: Address> Endpoint<A> {
             events: VecDeque::new(),
             stats: Stats::default(),
             relay_only: false,
+            relay_total: (0, None),
         }
     }
 
@@ -829,7 +845,7 @@ impl<A: Address> Endpoint<A> {
             }
             return Some(idx);
         }
-        if self.half_open.len() >= self.config.max_pending_handshakes {
+        if self.half_open.len() >= self.config.max_pending_handshakes || self.peers.len() >= self.config.max_links {
             self.stats.rx_handshake_dropped += 1;
             return None;
         }
@@ -977,6 +993,17 @@ impl<A: Address> Endpoint<A> {
             return None;
         };
         link.replay.commit(nonce);
+        // The link cap again for an inbound handshake that completed while the
+        // last slot filled: refuse it before any frame is acted on.
+        if !link.announced
+            && !link.initiator
+            && self.peers.len() >= self.config.max_links
+            && !self.peers.contains_key(&sess.peer)
+        {
+            self.stats.rx_handshake_dropped += 1;
+            self.drop_link(receiver, None);
+            return None;
+        }
         let mut path_changed = false;
         let mut reflexive = None;
         match (&from, &sess.path) {
@@ -1136,18 +1163,27 @@ impl<A: Address> Endpoint<A> {
             self.stats.relay_dropped += 1;
             return;
         }
-        // Token bucket on the requesting link.
+        // Token buckets on the requesting link and on the whole node; both must have room.
         let (rate, burst) = (self.config.relay_rate, self.config.relay_burst);
         let Some(Session { state: State::Live(sl), .. }) = self.sessions.get_mut(&src) else { return };
-        let elapsed = now.saturating_duration_since(sl.relay_refill).as_micros() as u64;
-        sl.relay_tokens = (sl.relay_tokens + elapsed * rate / 1_000_000).min(burst);
+        sl.relay_tokens = refill(sl.relay_tokens, sl.relay_refill, now, rate, burst);
         sl.relay_refill = now;
         let cost = packet.len() as u64;
-        if sl.relay_tokens < cost {
+        let total = self.config.relay_total_rate;
+        if total > 0 {
+            let (tokens, last) = self.relay_total;
+            let burst = (total / 4).max(MAX_RELAYED_PACKET as u64);
+            let tokens = last.map_or(burst, |t| refill(tokens, t, now, total, burst));
+            self.relay_total = (tokens, Some(now));
+        }
+        if sl.relay_tokens < cost || (total > 0 && self.relay_total.0 < cost) {
             self.stats.relay_dropped += 1;
             return;
         }
         sl.relay_tokens -= cost;
+        if total > 0 {
+            self.relay_total.0 -= cost;
+        }
         let mut addr = Vec::new();
         if let (Some(o), true) = (origin, self.shares_addresses()) {
             o.encode(&mut addr);
@@ -1461,6 +1497,12 @@ fn mark_ready(ready: &mut VecDeque<u32>, idx: u32, link: &mut Link) {
         link.dirty = true;
         ready.push_back(idx);
     }
+}
+
+/// A token bucket's `tokens`, last refilled at `last`, refilled at `rate` bytes/s up to `burst`.
+fn refill(tokens: u64, last: Instant, now: Instant, rate: u64, burst: u64) -> u64 {
+    let elapsed = now.saturating_duration_since(last).as_micros() as u64;
+    tokens.saturating_add(elapsed.saturating_mul(rate) / 1_000_000).min(burst)
 }
 
 fn push_relay_frame(link: &mut Link, frame: Vec<u8>, cap: usize, dropped: &mut u64) {

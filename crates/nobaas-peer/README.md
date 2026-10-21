@@ -8,7 +8,7 @@ It:
   the same;
 - prints its `nb:` invite on start and writes it to `$NOBAAS_DATA/invite` (0600, replaced atomically);
 - relays between peers linked to it (the core's peer relay, rate-limited per peer) and drops app messages sent to it;
-- closes links over `NOBAAS_MAX_PEERS` and counts them in its stats line;
+- turns away handshakes past `NOBAAS_MAX_PEERS` before any key exchange and counts them in its stats line;
 - binds `127.0.0.1:7700` by default, so nothing beyond this machine can reach it until you change `NOBAAS_BIND`.
 
 Anyone who knows its peer id and address can link to it; the invite carries both.
@@ -28,8 +28,8 @@ docker compose exec peer nobaas-peer check
 ```
 
 Settings come from the environment: `NOBAAS_BIND`, `NOBAAS_DATA`, `NOBAAS_STUN`, `NOBAAS_MAX_PEERS`, `NOBAAS_RELAY`,
-`NOBAAS_RELAY_RATE` and `NOBAAS_STATS_SECS`. [docs/DOCKER.md](../../docs/DOCKER.md) lists their defaults and covers
-exposing the peer, its logs (they hold peer addresses) and the container hardening.
+`NOBAAS_RELAY_RATE`, `NOBAAS_RELAY_TOTAL` and `NOBAAS_STATS_SECS`. [docs/DOCKER.md](../../docs/DOCKER.md) lists their
+defaults and covers exposing the peer, its logs (they hold peer addresses) and the container hardening.
 
 ## Status
 
