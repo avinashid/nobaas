@@ -5,7 +5,7 @@
 #   scripts/gate.sh             Rust tests, clippy, wasm build and checks, Node glue, browser tests (loopback)
 #   scripts/gate.sh --quick     skip the browser tests
 #   scripts/gate.sh --strict    clippy with -D warnings, and the fuzz tests again in a debug build (overflow checks)
-#   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch relay.damus.io, nos.lol,
+#   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch relay.damus.io, nos.lol, relay.primal.net,
 #                               public STUN)
 #
 # Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs).

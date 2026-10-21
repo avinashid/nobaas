@@ -105,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 use peerwire::{Node, NostrSignaling, Role};
 
 let mut node = Node::builder()
-    .signaling(NostrSignaling::default())        // wss://relay.damus.io, wss://nos.lol
+    .signaling(NostrSignaling::default())        // wss://relay.damus.io, wss://nos.lol, wss://relay.primal.net
     .bind("[::]:0")?;
 node.join_room("my-app", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4");          // full mesh
 // node.join_room_as("my-app", room, Role::Host);                     // or a star: one host,
