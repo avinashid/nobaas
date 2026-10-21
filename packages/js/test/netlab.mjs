@@ -88,12 +88,35 @@ try {
     const sdp = 'v=0\r\na=mid:0\r\na=candidate:1 1 udp 2122260223 192.0.0.4 51796 typ host generation 0\r\n'
       + 'a=candidate:2 1 udp 2122262783 2409:40d0::1 51797 typ host generation 0\r\na=candidate:3 1 tcp 1518280447 192.0.0.4 9 typ host tcptype active\r\n'
       + 'a=candidate:4 1 udp 2122260223 192.0.0.4 51796 typ host generation 0\r\na=candidate:5 1 udp 1686052607 157.49.1.2 40000 typ srflx raddr 192.0.0.4 rport 51796\r\n';
-    return { clat: h(sdp, ['192.168.43.1'], '192.0.0.'), lan: h(sdp.replaceAll('192.0.0.4', '192.168.1.5'), ['192.168.43.1'], '192.0.0.'), none: h(null) };
+    // An iPhone: hidden host, public IPv4 the same as ours; local port from rport, else the public one.
+    const ios = 'v=0\r\na=mid:0\r\na=candidate:1 1 udp 2122260223 abc.local 50000 typ host generation 0\r\n'
+      + 'a=candidate:2 1 udp 1686052607 157.49.1.2 40001 typ srflx raddr 0.0.0.0 rport 0\r\n';
+    return {
+      clat: h(sdp, ['192.168.43.1'], '192.0.0.'), lan: h(sdp.replaceAll('192.0.0.4', '192.168.1.5'), ['192.168.43.1'], '192.0.0.'), none: h(null),
+      samePub: h(sdp.replaceAll('192.0.0.4', '192.168.1.5'), ['10.1.2.3'], '192.0.0.', ['157.49.1.2']),
+      ios: h(ios, ['172.20.10.1'], '192.0.0.', ['157.49.1.2']), otherPub: h(ios, ['172.20.10.1'], '192.0.0.', ['1.2.3.4']),
+    };
   });
-  if (synth.clat.length !== 1 || !synth.clat[0].candidate.includes(' 192.168.43.1 51796 typ host') || synth.clat[0].sdpMid !== '0' || synth.lan.length || synth.none.length) {
+  const has = (list, s) => list.some((c) => c.candidate.includes(s));
+  if (synth.clat.length !== 1 || !has(synth.clat, ' 192.168.43.1 51796 typ host') || synth.clat[0].sdpMid !== '0' || synth.lan.length || synth.none.length
+    || synth.samePub.length !== 1 || !has(synth.samePub, ' 10.1.2.3 51796 typ host') || synth.ios.length !== 1 || !has(synth.ios, ' 172.20.10.1 40001 typ host') || synth.otherPub.length) {
     throw new Error(`hotspotCandidates wrong: ${JSON.stringify(synth)}`);
   }
-  step(`hotspot candidate from a CLAT host: ${synth.clat[0].candidate}`);
+  step(`hotspot candidate from a CLAT host: ${synth.clat[0].candidate}; same public IPv4: ${synth.ios[0].candidate}`);
+  // The typed hotspot address: a bad one is refused, a good one is saved and reported.
+  const gwField = await pages[0].evaluate(() => {
+    const el = document.getElementById('gw');
+    el.value = 'nope'; el.dispatchEvent(new Event('change'));
+    const bad = [document.getElementById('gwmsg').textContent, localStorage.getItem('netlab-gw')];
+    el.value = '10.129.132.170'; el.dispatchEvent(new Event('change'));
+    const good = [document.getElementById('gwmsg').textContent, localStorage.getItem('netlab-gw')];
+    el.value = ''; el.dispatchEvent(new Event('change'));
+    return { bad, good, cleared: localStorage.getItem('netlab-gw') };
+  });
+  if (!/not an IPv4/.test(gwField.bad[0]) || gwField.bad[1] || gwField.good[1] !== '10.129.132.170' || !gwField.good[0].includes('10.129.132.170') || gwField.cleared) {
+    throw new Error(`hotspot address field wrong: ${JSON.stringify(gwField)}`);
+  }
+  step(`hotspot address field: ${gwField.good[0]}`);
   // Only peers whose LAN address came through (not a tab with WebRTC off).
   if (off !== '0') {
     const r0 = await pages[0].evaluate(() => window.netlab.report());

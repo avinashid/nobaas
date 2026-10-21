@@ -12,7 +12,8 @@
 //   ?signal=local      BroadcastChannel signalling (tabs of one browser; tests)
 //   ?rtc=off           fail every WebRTC link of this tab, as behind a symmetric NAT
 //   ?gw=a,b            hotspot gateways tried for a phone sharing mobile data
-//                      (default 192.168.43.1); ?synth=off turns that off
+//                      (default 192.168.43.1 and 172.20.10.1, plus the address typed
+//                      under "phone hotspot"); ?synth=off turns that off
 //   ?relays=wss://a,…  other Nostr relays
 //   ?name=…            the name; ?auto=global joins the global room
 //   #key=…             joins that private room (a hash, so it never reaches the server)
@@ -32,9 +33,14 @@ const HEARD_WARN_MS = 20000;
 const SLOW_MS = 400;
 
 const params = new URLSearchParams(location.search);
-// The usual Android hotspot gateway (192.168.43.1), or ?gw=a,b; tried for a peer
-// whose host address starts with HOTSPOT_FROM (the CLAT range; ?gwfrom= in tests).
-const HOTSPOT_GATEWAYS = (params.get('gw') ?? '192.168.43.1').split(',').map((s) => s.trim()).filter((s) => /^[\d.]+$/.test(s)).slice(0, 4);
+// Hotspot gateways that don't change: older Android (192.168.43.1) and iPhone
+// (172.20.10.1), or ?gw=a,b; plus one typed under "phone hotspot", for the newer
+// Androids that pick a random one. Tried for a peer whose host address starts with
+// HOTSPOT_FROM (the CLAT range; ?gwfrom= in tests), or that has our public IPv4.
+const isV4 = (s) => /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(s) && s.split('.').every((n) => +n <= 255);
+const ipList = (s) => String(s ?? '').split(/[\s,]+/).filter(isV4);
+const GW_DEFAULT = params.has('gw') ? ipList(params.get('gw')) : ['192.168.43.1', '172.20.10.1'];
+const hotspotGateways = () => [...new Set([...ipList(localStorage.getItem('netlab-gw')), ...GW_DEFAULT])].slice(0, 4);
 const HOTSPOT_FROM = params.get('gwfrom') ?? '192.0.0.';
 const $ = (id) => document.getElementById(id);
 const now = () => performance.now();
@@ -213,6 +219,7 @@ async function enter(kind, key) {
   if (room) return;
   for (const b of ['global', 'create', 'joinkey']) $(b).disabled = true;
   localStorage.setItem('netlab-name', $('name').value.trim());
+  saveGw();
   roomKind = kind;
   roomKey = kind === 'private' ? key : null;
   $('joinmsg').textContent = 'connecting to the signalling relays…';
@@ -491,25 +498,38 @@ function noteTheirHosts(p, peer) {
 // A phone sharing its mobile data: Chrome on Android, without mic/camera
 // permission, lists no interfaces and offers only its mobile-data address, which
 // on IPv6-only carriers (Jio) is the CLAT one, 192.0.0.0/29. Its socket is bound to
-// every address, so the same port may answer on the hotspot side too: this adds a
-// candidate at the hotspot gateway with that port. The phone learns this side's
-// address from the first check that arrives (peer-reflexive), so the mDNS name it
-// can't resolve doesn't matter.
-function hotspotCandidates(sdp, gateways = HOTSPOT_GATEWAYS, from = HOTSPOT_FROM) {
+// every address, so the same port answers on the hotspot side too (tested: direct,
+// 6 ms): this adds a candidate at the hotspot gateway with that port. The phone
+// learns this side's address from the first check that arrives (peer-reflexive),
+// so the mDNS name it can't resolve doesn't matter. A peer with our public IPv4 is
+// behind the same NAT, maybe the phone we tether to, even when it shows no CLAT
+// host (an iPhone): its local port is the srflx rport, or else the public port.
+function hotspotCandidates(sdp, gateways = hotspotGateways(), from = HOTSPOT_FROM, myPublic = []) {
   if (typeof sdp !== 'string') return [];
   const mid = /^a=mid:(\S+)/m.exec(sdp)?.[1] ?? '0';
+  const ports = [];
+  for (const m of sdp.matchAll(/^a=candidate:\S+ 1 udp \d+ (\S+) (\d+) typ host/gim)) if (m[1].startsWith(from)) ports.push(m[2]);
+  for (const m of sdp.matchAll(/^a=candidate:\S+ 1 udp \d+ (\S+) (\d+) typ srflx(?: raddr \S+ rport (\d+))?/gim)) {
+    if (myPublic.includes(m[1])) ports.push(m[3] && m[3] !== '0' ? m[3] : m[2]);
+  }
   const out = [];
   const seen = new Set();
-  for (const m of sdp.matchAll(/^a=candidate:\S+ 1 udp \d+ (\S+) (\d+) typ host/gim)) {
-    if (!m[1].startsWith(from)) continue;
+  for (const port of ports) {
     for (const gw of gateways) {
-      const key = `${gw}:${m[2]}`;
-      if (seen.has(key) || out.length >= 4) continue;
+      const key = `${gw}:${port}`;
+      if (seen.has(key) || out.length >= 6) continue;
       seen.add(key);
-      out.push({ candidate: `candidate:pwgw${out.length} 1 udp 1677729535 ${gw} ${m[2]} typ host generation 0`, sdpMid: mid, sdpMLineIndex: 0, gw: key });
+      out.push({ candidate: `candidate:pwgw${out.length} 1 udp 1677729535 ${gw} ${port} typ host generation 0`, sdpMid: mid, sdpMLineIndex: 0, gw: key });
     }
   }
   return out;
+}
+
+// This side's public IPv4 addresses, from the link's own description and the probe.
+function myPublicV4(pc) {
+  const sdp = pc?.localDescription?.sdp ?? '';
+  const fromSdp = [...sdp.matchAll(/^a=candidate:\S+ \d+ udp \d+ (\S+) \d+ typ srflx/gim)].map((m) => m[1]);
+  return [...new Set([...fromSdp, ...(myNet?.srflx ?? []).map((c) => c.address)])].filter(isV4);
 }
 
 const hotspotAdded = new WeakMap(); // pc -> the gateway:port candidates given to it
@@ -520,7 +540,7 @@ async function tryHotspot(p, peer) {
   const added = hotspotAdded.get(pc) ?? new Set();
   hotspotAdded.set(pc, added);
   const fresh = [];
-  for (const { gw, ...c } of hotspotCandidates(pc.remoteDescription?.sdp)) {
+  for (const { gw, ...c } of hotspotCandidates(pc.remoteDescription?.sdp, hotspotGateways(), HOTSPOT_FROM, myPublicV4(pc))) {
     if (added.has(gw)) continue;
     added.add(gw);
     try {
@@ -532,7 +552,7 @@ async function tryHotspot(p, peer) {
   }
   if (!fresh.length) return;
   p.hotspot = [...new Set([...(p.hotspot ?? []), ...fresh])].slice(0, 8);
-  log('info', `${nameOf(peer)} looks like a phone sharing mobile data: also trying its hotspot address ${fresh.join(', ')}`);
+  log('info', `${nameOf(peer)} may be a phone sharing mobile data: also trying hotspot address(es) ${fresh.join(', ')}`);
 }
 
 // The offer/answer exchange, as "offer sent 0.2 s · answer received 1.9 s · 1 resend".
@@ -761,6 +781,16 @@ function downloadReport() {
 // ---------- wiring ----------
 
 $('name').value = params.get('name') ?? localStorage.getItem('netlab-name') ?? '';
+$('gw').value = localStorage.getItem('netlab-gw') ?? '';
+function saveGw() {
+  const raw = $('gw').value.trim();
+  const ok = ipList(raw);
+  if (raw && !ok.length) return ($('gwmsg').textContent = 'not an IPv4 address, e.g. 10.129.132.170');
+  $('gwmsg').textContent = ok.length ? `also trying ${ok.join(', ')} for a phone sharing its mobile data` : '';
+  if (ok.length) localStorage.setItem('netlab-gw', ok.join(','));
+  else localStorage.removeItem('netlab-gw');
+}
+$('gw').onchange = saveGw;
 $('global').onclick = () => enter('global');
 $('create').onclick = () => enter('private', randomRoomId());
 $('joinkey').onclick = () => {

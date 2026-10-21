@@ -25,6 +25,8 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 webpki-roots = { version = "1", optional = true }
 k256 = { version = "0.13", optional = true, default-features = false, features = ["schnorr", "arithmetic"] }
 serde_json = { version = "1", optional = true }
+# Private LAN/hotspot addresses for a socket bound to any interface (getifaddrs; libc is already in the tree).
+if-addrs = "0.15"
 
 [features]
 tokio = ["dep:tokio"]
