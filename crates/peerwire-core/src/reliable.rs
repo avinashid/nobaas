@@ -100,6 +100,13 @@ pub struct RecoveryStats {
     /// Of those, first sends more than 64 above the lowest unacknowledged
     /// fragment, beyond the SACK bitmap's reach.
     pub timed_out_beyond_reach: u64,
+    /// Cuts above that deepened one made earlier in the same round trip.
+    pub deepened: u64,
+    /// Timers of fragments beyond the SACK bitmap's reach put off while the
+    /// lowest unacknowledged fragment was being repaired, and restarted when
+    /// the cumulative ACK moved.
+    pub deferred: u64,
+    pub rearmed: u64,
 }
 
 /// Index of the reliable and the urgent stream in `RelSend::streams`.
@@ -118,6 +125,9 @@ struct Stream {
     /// earliest is found without walking `inflight` on each packet.
     by_due: BTreeSet<(Instant, u32)>,
     by_dup: BTreeSet<(Instant, u32)>,
+    /// Fragments whose timer was put off for being beyond the SACK bitmap's
+    /// reach (see `write_stream`); some may since have been acknowledged.
+    deferred: BTreeSet<u32>,
     buffered: usize,
     /// Wire bytes of one copy of each fragment in flight (data and frame header).
     inflight_bytes: usize,
@@ -139,6 +149,7 @@ impl Stream {
             inflight: BTreeMap::new(),
             by_due: BTreeSet::new(),
             by_dup: BTreeSet::new(),
+            deferred: BTreeSet::new(),
             buffered: 0,
             inflight_bytes: 0,
             probe_at: None,
@@ -172,8 +183,12 @@ pub(crate) struct RelSend {
     /// AIMD congestion window in slots (NewReno-style), for both streams.
     cwnd: f64,
     ssthresh: f64,
-    /// No second reduction until this time (one per round trip).
+    /// No second reduction until this time (one per round trip), except one
+    /// that keeps less than `epoch_keep`: it deepens the first, from the same
+    /// `epoch_slots` in flight.
     recover_until: Instant,
+    epoch_keep: f64,
+    epoch_slots: f64,
     min_rtt: Option<Duration>,
     path_min_rtt: Option<Duration>,
     /// Queueing delay of the latest RTT sample (sample − min_rtt); none before the first.
@@ -199,6 +214,8 @@ impl RelSend {
             cwnd: INITIAL_CWND,
             ssthresh: f64::INFINITY,
             recover_until: Instant::ZERO,
+            epoch_keep: 1.0,
+            epoch_slots: 0.0,
             min_rtt: None,
             path_min_rtt: None,
             queue_delay: None,
@@ -238,10 +255,19 @@ impl RelSend {
             && (u == REL || self.streams[REL].queued.is_empty() || self.urgent_slots() < w.div_ceil(2))
     }
 
-    /// Cuts the window to `keep` of the fragments in flight, at most once per round trip.
+    /// Cuts the window to `keep` of the fragments in flight, at most once per
+    /// round trip. A stricter signal in that round trip (a timeout after a
+    /// random loss, a loss after queueing delay) deepens the cut once, to
+    /// `keep` of the same flight, so cuts never compound.
     fn back_off(&mut self, now: Instant, keep: f64, timeout: bool) {
         if now < self.recover_until {
-            return;
+            if keep >= self.epoch_keep {
+                return;
+            }
+            self.recovery.deepened += 1;
+        } else {
+            self.epoch_slots = self.slots() as f64;
+            self.recover_until = now + self.srtt.unwrap_or(self.rto);
         }
         let r = &mut self.recovery;
         *if timeout {
@@ -253,9 +279,9 @@ impl RelSend {
         } else {
             &mut r.loss_cuts
         } += 1;
-        self.ssthresh = (self.slots() as f64 * keep).max(MIN_CWND);
+        self.epoch_keep = keep;
+        self.ssthresh = (self.epoch_slots * keep).max(MIN_CWND);
         self.cwnd = self.ssthresh;
-        self.recover_until = now + self.srtt.unwrap_or(self.rto);
     }
 
     fn arm_probe(&mut self, u: usize, now: Instant) {
@@ -323,6 +349,7 @@ impl RelSend {
     pub(crate) fn on_ack(&mut self, now: Instant, cum: u32, bits: u64, urgent: bool) {
         let u = urgent as usize;
         let st = &mut self.streams[u];
+        let base = st.inflight.first_key_value().map(|(&s, _)| s);
         let mut sample = None;
         let mut acked: Vec<u32> = st.inflight.range(..cum).map(|(&s, _)| s).collect();
         for i in 0..SACK_BITS {
@@ -354,6 +381,25 @@ impl RelSend {
                     sample = Some(now - f.sent_at);
                 }
             }
+        }
+        // The cumulative ACK moved: deferred timers restart from now, as the
+        // fragments after a repaired hole are still unreported until the next
+        // hole is found and repaired; once within the bitmap's reach, SACK
+        // reports them.
+        let lo = st.inflight.first_key_value().map(|(&s, _)| s);
+        if lo != base && !st.deferred.is_empty() {
+            let Stream { deferred, inflight, by_due, .. } = st;
+            let due = now + self.rto;
+            deferred.retain(|&s| {
+                let Some(f) = inflight.get_mut(&s) else { return false };
+                if f.due < due {
+                    by_due.remove(&(f.due, s));
+                    by_due.insert((due, s));
+                    f.due = due;
+                    self.recovery.rearmed += 1;
+                }
+                lo.is_some_and(|lo| s - lo > SACK_BITS)
+            });
         }
         let mut queued_too_long = false;
         if let Some(r) = sample {
@@ -457,11 +503,27 @@ impl RelSend {
         let st = &mut self.streams[u];
         let sent_end = st.sent_end;
         let lo = st.inflight.first_key_value().map_or(0, |(&s, _)| s);
+        let repairing = st.inflight.get(&lo).is_some_and(|f| f.fast || f.tries > 1);
         for seq in due_by_seq(&st.by_due, now) {
+            if repairing && seq - lo > SACK_BITS {
+                // Beyond the SACK bitmap's reach while the lowest fragment is
+                // repaired: whether it arrived is only known once the repair
+                // is acknowledged, so it doesn't time out before the repair
+                // does. Bounded: the repair fails the link after MAX_TRIES.
+                let to = st.inflight[&lo].due.max(now + MIN_RTO);
+                let f = st.inflight.get_mut(&seq).expect("indexed fragment in flight");
+                st.by_due.remove(&(f.due, seq));
+                st.by_due.insert((to, seq));
+                f.due = to;
+                st.deferred.insert(seq);
+                self.recovery.deferred += 1;
+                continue;
+            }
             let f = st.inflight.get_mut(&seq).expect("indexed fragment in flight");
             if out.len() + REL_OVERHEAD + f.data.len() > max {
                 break;
             }
+            st.deferred.remove(&seq);
             if !f.fast {
                 self.recovery.timed_out += 1;
                 if f.tries == 1 && seq - lo > SACK_BITS {
@@ -815,6 +877,173 @@ mod tests {
         assert_eq!(tx.delay_backoffs, 1);
     }
 
+    /// 200 one-fragment messages sent at 0 on a 100 ms path (due at 325 ms),
+    /// then the ACK for 1..=64 with 0 missing; 0 is fast-retransmitted at
+    /// 125 ms (a random loss: ×0.8 of the 136 left in flight), and the tail
+    /// probe sends 199 again at 279 ms.
+    fn hole_at_zero(bits: u64) -> RelSend {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        tx.cwnd = 300.0;
+        for i in 0..200u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(drain_window(&mut tx, Instant::ZERO, 1024).len(), 200);
+        tx.on_ack(Instant::from_millis(100), 0, bits, false);
+        assert_eq!(seqs(drain(&mut tx, Instant::from_millis(125))), vec![0]);
+        assert_eq!(seqs(drain(&mut tx, Instant::from_millis(280))), vec![199]);
+        assert_eq!(tx.retransmits(), 2);
+        tx
+    }
+
+    fn seqs(frags: Vec<(u32, bool, Vec<u8>)>) -> Vec<u32> {
+        frags.into_iter().map(|f| f.0).collect()
+    }
+
+    fn drain_window(tx: &mut RelSend, now: Instant, window: usize) -> Vec<(u32, bool, Vec<u8>)> {
+        let mut out = Vec::new();
+        tx.write_frames(now, window, &mut out, 1 << 20);
+        frames(&out)
+            .map(|f| match f.unwrap() {
+                Frame::Reliable { seq, fin, data, .. } => (seq, fin, data.to_vec()),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// PERF-10: while 0 is repaired, whether 65..199 arrived can't be
+    /// reported (the bitmap covers 1..=64), so their timers wait for the
+    /// repair's instead of firing and resending them all.
+    #[test]
+    fn fragments_beyond_sack_reach_wait_for_the_repair() {
+        let mut tx = hole_at_zero(u64::MAX);
+        assert_eq!(tx.ssthresh, 136.0 * RANDOM_LOSS_CUT);
+        let t = Instant::from_millis(340);
+        assert!(earliest(&tx.streams[REL].by_due).unwrap() <= t, "their own timers have run out");
+        assert!(drain(&mut tx, t).is_empty());
+        assert_eq!((tx.retransmits(), tx.recovery.timed_out), (2, 0));
+        assert_eq!(tx.recovery.deferred, 135);
+        assert_eq!(tx.ssthresh, 136.0 * RANDOM_LOSS_CUT, "no timeout cut");
+        assert!(tx.next_due() > Some(t));
+        // The repair is acknowledged late (a slow return path): everything is.
+        tx.on_ack(Instant::from_millis(360), 200, 0, false);
+        assert_eq!(tx.next_due(), None);
+        assert_eq!(tx.retransmits(), 2);
+        assert!(tx.streams[REL].deferred.is_empty());
+    }
+
+    /// Only fragments the bitmap can't reach are put off: 64 is reported (or
+    /// not) by the ACK's last bit, so it times out, and 65 waits. A real
+    /// timeout still halves the window.
+    #[test]
+    fn the_last_reportable_fragment_still_times_out() {
+        let mut tx = hole_at_zero(u64::MAX >> 1);
+        assert_eq!(tx.ssthresh, 137.0 * RANDOM_LOSS_CUT);
+        assert_eq!(seqs(drain(&mut tx, Instant::from_millis(340))), vec![64]);
+        assert_eq!((tx.recovery.timed_out, tx.recovery.timeout_cuts), (1, 1));
+        assert_eq!(tx.ssthresh, 137.0 * LOSS_CUT);
+        assert_eq!(tx.recovery.deferred, 135);
+    }
+
+    /// Without ACKs there is no repair to wait for: the whole flight times out
+    /// and the window halves.
+    #[test]
+    fn a_lost_flight_still_times_out_and_halves() {
+        let mut tx = RelSend::new();
+        tx.seed_rtt(Duration::from_millis(100));
+        tx.cwnd = 300.0;
+        for i in 0..200u8 {
+            tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+        }
+        assert_eq!(drain_window(&mut tx, Instant::ZERO, 1024).len(), 200);
+        let due = earliest(&tx.streams[REL].by_due).unwrap();
+        assert_eq!(drain(&mut tx, due).len(), 200);
+        assert_eq!((tx.recovery.deferred, tx.recovery.timed_out, tx.recovery.timed_out_beyond_reach), (0, 200, 135));
+        assert_eq!(tx.ssthresh, 200.0 * LOSS_CUT);
+    }
+
+    /// The repair of 0 is acknowledged after its timers ran out (the host polled
+    /// late): the next hole, 100, isn't known yet, so nothing is under repair,
+    /// but the deferred fragments restart from now instead of all timing out.
+    /// SACK then finds the hole at 100, and the one at 180 once it comes within reach.
+    #[test]
+    fn deferred_timers_restart_when_the_cumulative_ack_moves() {
+        let mut tx = hole_at_zero(u64::MAX);
+        assert!(drain(&mut tx, Instant::from_millis(340)).is_empty());
+        let t = Instant::from_millis(2000);
+        assert!(earliest(&tx.streams[REL].by_due).unwrap() < t);
+        tx.on_ack(t, 100, 0, false);
+        assert_eq!(tx.recovery.rearmed, 100);
+        assert!(drain(&mut tx, t).is_empty(), "nothing timed out or resent");
+        assert_eq!((tx.recovery.timed_out, tx.retransmits()), (0, 2));
+        assert_eq!(tx.streams[REL].deferred.len(), 35, "165..199 still beyond reach");
+        // 101..=164 arrive: 100 is a loss for fast retransmit, not a timeout.
+        let t = t + Duration::from_millis(10);
+        tx.on_ack(t, 100, u64::MAX, false);
+        assert_eq!(seqs(drain(&mut tx, t + Duration::from_millis(125))), vec![100]);
+        // Its repair lands, with 101..179 and 181..199: 180, lost beyond the
+        // reach of 100, is fast-retransmitted.
+        let t = t + Duration::from_millis(230);
+        tx.on_ack(t, 180, (1 << 19) - 1, false);
+        assert!(tx.streams[REL].deferred.is_empty());
+        assert_eq!(seqs(drain(&mut tx, t)), vec![180]);
+        assert_eq!(tx.recovery.timed_out, 0);
+    }
+
+    /// Deferral is bounded by the repair: one never acknowledged still fails
+    /// the link after MAX_TRIES, and nothing beyond reach is sent meanwhile.
+    #[test]
+    fn a_repair_never_acknowledged_still_fails_the_link() {
+        let mut tx = hole_at_zero(u64::MAX);
+        let mut resent = Vec::new();
+        for _ in 0..1000 {
+            if tx.failed {
+                break;
+            }
+            let t = tx.next_due().unwrap();
+            resent.extend(seqs(drain(&mut tx, t)));
+        }
+        assert!(tx.failed);
+        assert!(resent.iter().all(|&s| s == 0), "{resent:?}");
+        assert_eq!(resent.len() as u32, MAX_TRIES - 1, "0 went twice in hole_at_zero");
+    }
+
+    /// One cut per round trip, but a stricter one in it deepens the first, from
+    /// the flight the first was taken from: cuts never compound.
+    #[test]
+    fn a_stricter_cut_in_the_same_round_trip_deepens_the_first() {
+        let sent = || {
+            let mut tx = RelSend::new();
+            tx.seed_rtt(Duration::from_millis(100));
+            tx.cwnd = 300.0;
+            for i in 0..100u8 {
+                tx.push_message(&[i], 1 << 20, 1 << 20, false).ok().unwrap();
+            }
+            assert_eq!(drain_window(&mut tx, Instant::ZERO, 1024).len(), 100);
+            tx
+        };
+        let t = Instant::from_millis(100);
+        let mut tx = sent();
+        tx.back_off(t, DELAY_CUT, false);
+        assert_eq!(tx.ssthresh, 100.0 * DELAY_CUT);
+        tx.on_ack(t, 20, 0, false); // 80 left in flight
+        tx.back_off(t, DELAY_CUT, false);
+        assert_eq!(tx.ssthresh, 100.0 * DELAY_CUT, "the same signal again: no change");
+        tx.back_off(t, RANDOM_LOSS_CUT, false);
+        assert_eq!(tx.ssthresh, 100.0 * RANDOM_LOSS_CUT);
+        tx.back_off(t, DELAY_CUT, false);
+        tx.back_off(t, RANDOM_LOSS_CUT, false);
+        assert_eq!(tx.ssthresh, 100.0 * RANDOM_LOSS_CUT, "gentler or equal: no change");
+        tx.back_off(t, LOSS_CUT, true);
+        assert_eq!(tx.ssthresh, 100.0 * LOSS_CUT);
+        assert_eq!(tx.cwnd, tx.ssthresh);
+        let r = tx.recovery;
+        assert_eq!((r.delay_cuts, r.random_cuts, r.timeout_cuts, r.deepened), (1, 1, 1, 2));
+        // The next round trip starts afresh, from what is in flight then.
+        tx.back_off(t + Duration::from_millis(100), RANDOM_LOSS_CUT, false);
+        assert_eq!(tx.ssthresh, 80.0 * RANDOM_LOSS_CUT);
+    }
+
     #[test]
     fn retransmissions_go_out_in_sequence_order() {
         let mut tx = RelSend::new();
@@ -1025,7 +1254,7 @@ mod tests {
 
     #[test]
     fn due_indexes_match_a_full_scan() {
-        for seed in 1..=24u64 {
+        for seed in 1..=60u64 {
             let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
             let mut rand = move |n: u64| {
                 x ^= x << 13;
@@ -1034,10 +1263,22 @@ mod tests {
                 x % n
             };
             let (mut tx, mut rx) = (RelSend::new(), [RelRecv::new(RECV_WINDOW), RelRecv::new(URGENT_RECV_WINDOW)]);
-            let window = 64;
+            // A window wider than the SACK bitmap's reach, kept full on a long,
+            // less lossy link (a repair takes longer than an RTO), puts timers off.
+            let wide = seed % 3 == 0;
+            let window = if wide { 256 } else { 64 };
+            if wide {
+                tx.cwnd = 512.0;
+            }
             // One-way delay: a LAN (a retransmission can go out while its
             // urgent copy is pending) or a WAN.
-            let base = if seed % 2 == 0 { 20_000 } else { 400 };
+            let base = if wide {
+                50_000
+            } else if seed % 2 == 0 {
+                20_000
+            } else {
+                400
+            };
             let mut now = Instant::ZERO;
             // (arrival, stream, frame) on a lossy link that reorders, and ACKs back.
             let mut to_rx: Vec<(Instant, usize, u32, bool, Vec<u8>)> = Vec::new();
@@ -1045,18 +1286,24 @@ mod tests {
             let mut delivered = Vec::new();
             for _ in 0..1500 {
                 now = now + Duration::from_micros(rand(base * 2 / 5));
-                if rand(4) == 0 {
-                    let len = rand(4000) as usize;
-                    let _ = tx.push_message(&vec![7; len], 1 << 16, 1 << 20, rand(5) == 0);
+                if wide || rand(4) == 0 {
+                    let len = rand(if wide { 40_000 } else { 4000 }) as usize;
+                    let _ = tx.push_message(&vec![7; len], if wide { 1 << 20 } else { 1 << 16 }, 1 << 20, rand(5) == 0);
                     check(&tx, now, window);
                 }
-                // Retransmissions go first in each stream, in sequence order, as the scan sent them.
+                // Retransmissions go first in each stream, in sequence order, as the scan sent them,
+                // except those beyond the SACK bitmap's reach while the lowest fragment is repaired.
                 let due: Vec<Vec<u32>> = (0..2)
-                    .map(|u| tx.streams[u].inflight.iter().filter(|(_, f)| f.due <= now).map(|(&s, _)| s).collect())
+                    .map(|u| {
+                        let st = &tx.streams[u];
+                        let lo = st.inflight.first_key_value().map(|(&s, f)| (s, f.fast || f.tries > 1));
+                        let put_off = |s: u32| lo.is_some_and(|(lo, repairing)| repairing && s - lo > SACK_BITS);
+                        st.inflight.iter().filter(|(&s, f)| f.due <= now && !put_off(s)).map(|(&s, _)| s).collect()
+                    })
                     .collect();
                 let before: Vec<u64> = tx.streams.iter().map(|s| s.retransmits - s.probes).collect();
                 let mut out = Vec::new();
-                tx.write_frames(now, window, &mut out, 1200 + rand(3000) as usize);
+                tx.write_frames(now, window, &mut out, 1200 + rand(if wide { 30_000 } else { 3000 }) as usize);
                 check(&tx, now, window);
                 for u in 0..2 {
                     let resent = (tx.streams[u].retransmits - tx.streams[u].probes - before[u]) as usize;
@@ -1071,8 +1318,8 @@ mod tests {
                 }
                 for f in frames(&out) {
                     let Frame::Reliable { seq, fin, data, urgent } = f.unwrap() else { unreachable!() };
-                    if rand(10) != 0 {
-                        let at = now + Duration::from_micros(base + rand(base * 3 / 4));
+                    if rand(if wide { 50 } else { 10 }) != 0 {
+                        let at = now + Duration::from_micros(base + rand(if wide { base / 10 } else { base * 3 / 4 }));
                         to_rx.push((at, urgent as usize, seq, fin, data.to_vec()));
                     }
                 }
@@ -1087,7 +1334,12 @@ mod tests {
                     if rx.ack_pending && rand(3) != 0 {
                         rx.ack_pending = false;
                         let (cum, bits) = rx.ack();
-                        to_tx.push((now + Duration::from_micros(base + rand(base / 2)), u, cum, bits));
+                        to_tx.push((
+                            now + Duration::from_micros(base + rand(if wide { base / 10 } else { base / 2 })),
+                            u,
+                            cum,
+                            bits,
+                        ));
                     }
                 }
                 let mut i = 0;
