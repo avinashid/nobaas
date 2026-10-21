@@ -202,7 +202,8 @@ pub unsafe extern "C" fn nb_stats(h: *const NbEndpoint, out: *mut u64) {
     slice::from_raw_parts_mut(out, 16).copy_from_slice(&v);
 }
 
-/// `lane`: 0 reliable, 1 unreliable, 2 urgent (reliable, each fragment sent twice).
+/// `lane`: 0 reliable (up to 1 MiB), 1 unreliable (up to 1100 B), 2 urgent
+/// (reliable, each fragment sent twice, up to 64 KiB). Larger is NB_ERR_TOO_LARGE.
 #[no_mangle]
 pub unsafe extern "C" fn nb_send(
     h: *mut NbEndpoint,

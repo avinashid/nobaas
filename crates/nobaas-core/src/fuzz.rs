@@ -8,11 +8,12 @@
 //! ```
 
 use crate::addr::{Address, MAX_ADDR_LEN};
-use crate::endpoint::{Config, Endpoint, Event, Lane};
+use crate::endpoint::{Config, DisconnectReason, Endpoint, Event, Lane, SendError};
 use crate::identity::{Identity, PeerId};
 use crate::invite::Invite;
+use crate::reliable::{MAX_URGENT, RECV_WINDOW, URGENT_RECV_WINDOW};
 use crate::time::Instant;
-use crate::wire::{self, Frame, Packet, MAX_DATAGRAM, MAX_PLAINTEXT, MAX_RELAYED_PACKET};
+use crate::wire::{self, Frame, Packet, FRAGMENT, MAX_DATAGRAM, MAX_PLAINTEXT, MAX_RELAYED_PACKET};
 use crate::{sealed, stun};
 use nobaas_sim::fuzz::{cases, hex, mutate, run, seed, Rng};
 use std::cell::RefCell;
@@ -574,4 +575,60 @@ fn fuzz_hostile_peer() {
     for (i, j) in [(c, a), (a, c), (m, a), (a, m)] {
         assert!(net.reaches(i, j, &ids, b"still serving"), "{i} -> {j} after the fuzz");
     }
+}
+
+#[test]
+fn hostile_peer_pins_bounded_receive_memory() {
+    // An authenticated peer M makes A hold as much as it can on each stream:
+    // full fragments in order without a final one, so a message is partly
+    // assembled, then the next sequence number held back and everything after
+    // it sent, so the out-of-order buffer fills. The urgent stream holds at most
+    // URGENT_RECV_WINDOW - 1 fragments and MAX_URGENT bytes of message, and one
+    // fragment past that cap is a violation.
+    let keys = identities(2);
+    let ids: Vec<PeerId> = keys.iter().map(Identity::peer_id).collect();
+    let (a, m) = (0, 1);
+    let mut net = Net::new(&keys);
+    net.nodes[m].1.connect(net.now, Net::addr(a), ids[a]).unwrap();
+    net.settle();
+    assert!(net.connected(a, m, &ids));
+    let send = |net: &mut Net, urgent: bool, seq: u32| {
+        let mut pt = Vec::new();
+        wire::put_reliable(&mut pt, seq, false, &[seq as u8; FRAGMENT], urgent);
+        let pkt = net.nodes[m].1.seal_raw(&ids[a], &pt).unwrap();
+        net.nodes[a].1.handle_datagram(net.now, Net::addr(m), &pkt);
+    };
+    let mut bound = [0; 2];
+    for (u, urgent, window, max) in
+        [(0, false, RECV_WINDOW, Config::default().max_message), (1, true, URGENT_RECV_WINDOW, MAX_URGENT)]
+    {
+        let assembled = (max / FRAGMENT) as u32;
+        for seq in (0..assembled).chain(assembled + 1..assembled + 2 * window) {
+            send(&mut net, urgent, seq);
+        }
+        bound[u] = (window as usize - 1) * FRAGMENT + max;
+        let held = net.nodes[a].1.rx_held(&ids[m]).unwrap()[u];
+        assert_eq!(held, (window as usize - 1 + assembled as usize) * FRAGMENT, "stream {u}");
+        assert!(held <= bound[u]);
+    }
+    println!("receive memory a peer can pin per link: {} B (urgent {} B)", bound[0] + bound[1], bound[1]);
+    assert!(bound[1] < 140_000 && bound[0] + bound[1] < 2_320_000);
+    // The held-back fragment completes more than MAX_URGENT of message.
+    send(&mut net, true, (MAX_URGENT / FRAGMENT) as u32);
+    net.deliver();
+    let dropped =
+        |e: &Event<SocketAddr>| matches!(e, Event::Disconnected { reason: DisconnectReason::ProtocolViolation, .. });
+    assert!(net.events.iter().any(|(n, e)| *n == a && dropped(e)));
+    assert!(!net.nodes[a].1.is_connected(&ids[m]));
+
+    // An honest sender may send MAX_URGENT bytes, and not one more.
+    net.nodes[m].1.disconnect(&ids[a]);
+    net.nodes[m].1.connect(net.now, Net::addr(a), ids[a]).unwrap();
+    net.settle();
+    assert_eq!(net.nodes[m].1.send(&ids[a], Lane::Urgent, &vec![1; MAX_URGENT + 1]), Err(SendError::TooLarge));
+    net.events.clear();
+    net.nodes[m].1.send(&ids[a], Lane::Urgent, &vec![2; MAX_URGENT]).unwrap();
+    net.settle();
+    let got = |e: &Event<SocketAddr>| matches!(e, Event::Message { data, .. } if data.len() == MAX_URGENT);
+    assert!(net.events.iter().any(|(n, e)| *n == a && got(e)));
 }

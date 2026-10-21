@@ -77,8 +77,9 @@ complete host loop on std UDP sockets.
   - *Reliable*: ordered, exactly once, fragmented up to `Config::max_message` (1 MiB).
   - *Urgent*: exactly once and in order with other urgent messages, but in its own sequence,
     so it never waits for *Reliable* data queued before it. Each fragment is sent twice, 4 ms
-    apart, so a single loss costs nothing. For small, latency-critical events; it arrives as
-    `Lane::Reliable`.
+    apart, so a single loss costs nothing. For small, latency-critical events: messages up to
+    64 KiB (`MAX_URGENT`), and 64 fragments in flight, the receiver's urgent window. It arrives
+    as `Lane::Reliable`.
   - *Unreliable*: at most once, up to 1100 B (`MAX_UNRELIABLE`), drop-oldest queue.
   - Frames from every lane and ACKs are packed into one packet.
 - **Loss recovery and congestion control** on the reliable lanes:
