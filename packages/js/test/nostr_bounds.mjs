@@ -3,7 +3,7 @@
 // and base64 must handle bodies far larger than a signalling message. No relays:
 // events are fed straight into onRelay.
 import { loadPeerwire } from '../src/peerwire.js';
-import { BACKOFF_MS, NostrSignaling, MAX_SEEN, b64, unb64 } from '../src/nostr.js';
+import { BACKOFF_MS, MAX_BACKOFF_MS, NostrSignaling, MAX_SEEN, b64, unb64 } from '../src/nostr.js';
 
 const wasm = process.argv[2] ?? new URL('../pkg/peerwire_ffi.wasm', import.meta.url).pathname;
 const pw = await loadPeerwire(wasm);
@@ -105,6 +105,9 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   await s5.publish(s5.roomTag, 'e30=');
   s5.onRelay('a', JSON.stringify(['OK', 'w', false, 'rate-limited: again']));
   check(sent.a === 2 && s5.paused.get('a').ms === BACKOFF_MS * 2, 'after the pause it is tried again, and a second limit doubles the pause');
+  s5.paused.get('a').until = Date.now() - MAX_BACKOFF_MS - 1; // quiet for MAX_BACKOFF_MS since
+  s5.onRelay('a', JSON.stringify(['OK', 'v', false, 'rate-limited: much later']));
+  check(s5.paused.get('a').ms === BACKOFF_MS, 'a limit after a long quiet period starts the pause over');
   s5.sockets.length = 0;
 }
 

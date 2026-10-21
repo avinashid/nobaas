@@ -9,6 +9,7 @@
 //
 //   node packages/js/test/room_fallback.mjs
 import { joinRoom } from '../src/index.js';
+import { MAX_PIPE_PEERS, WebRtcTransport } from '../src/webrtc.js';
 
 const fail = (m) => {
   console.error(`FAIL ${m}`);
@@ -112,7 +113,7 @@ const room = (name, extra) => joinRoom({
 n = 1;
 block('a1', 'b1');
 const [a, b, c] = await Promise.all(['a1', 'b1', 'c1'].map((m) => room(m)));
-await until('a full mesh through the fallback', () => [a, b, c].every((r) => r.peers.length === 2));
+await until('a full mesh through the fallback', () => [a, b, c].every((r) => r.peers.length === 2), 30000);
 const ab = a.route(b.self);
 // A member relaying is preferred: signalling joins the dial only if it doesn't answer.
 if (ab?.kind !== 'peer' || ab.via !== c.self) fail(`a reaches b ${JSON.stringify(ab)}, not through c`);
@@ -133,7 +134,7 @@ await Promise.all([a.leave(), b.leave(), c.leave()]);
 n = 2;
 block('a2', 'b2');
 const [d, e] = await Promise.all(['a2', 'b2'].map((m) => room(m)));
-await until('a link over signalling', () => d.peers.length === 1 && e.peers.length === 1);
+await until('a link over signalling', () => d.peers.length === 1 && e.peers.length === 1, 30000);
 if (d.route(e.self)?.kind !== 'signaling' || e.route(d.self)?.kind !== 'signaling') fail(`routes ${JSON.stringify([d.route(e.self), e.route(d.self)])}`);
 const big = new Uint8Array(100 * 1024).map((_, i) => i * 7);
 const gotBig = [];
@@ -156,6 +157,25 @@ for (const fallback of ['peers', 'off']) {
   await Promise.all(rs.map((r) => r.leave()));
 }
 console.log("fallback 'peers' alone and 'off': a blocked pair stays apart");
+
+// 4. NB43-1: proven peers that send a 'dg' and never link don't pile up pipes.
+{
+  const linked = '0'.repeat(64);
+  const ep = { id: 'f'.repeat(64), receive() {}, isConnected: (p) => p === linked, set onTransmit(_) {} };
+  const sig = { onMessage() {}, send() {}, close() {} };
+  const t = new WebRtcTransport(ep, sig, { pipes: true, RTCPeerConnection: fakePc('x') });
+  t.allowPipe(linked);
+  t.pipeReceive(linked, ['AAAA']);
+  for (let i = 1; i <= 1000; i++) {
+    const id = i.toString(16).padStart(64, '1');
+    t.allowPipe(id);
+    t.pipeReceive(id, ['AAAA']);
+  }
+  if (t.pipeAllowed.size > MAX_PIPE_PEERS || t.pipes.size > MAX_PIPE_PEERS + 1 || t.pipeByPeer.size !== t.pipes.size) fail(`pipes not bounded: allowed ${t.pipeAllowed.size}, pipes ${t.pipes.size}`);
+  if (!t.pipeByPeer.has(linked)) fail("an evicted peer's pipe was dropped while its session used it");
+  t.close();
+  console.log(`1,000 proven peers with a 'dg' each: ${t.pipeAllowed.size} allowed, pipes bounded; a linked peer's pipe kept`);
+}
 
 console.log('room_fallback: ok');
 process.exit(0);

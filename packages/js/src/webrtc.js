@@ -32,7 +32,7 @@ export const PIPE_RATE = 3;
 export const PIPE_BURST = 6;
 export const PIPE_QUEUE = 64 * 1024;
 const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
-const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
+export const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
 
 // Removes `host` candidates (LAN, loopback, mDNS .local names) from an SDP, keeping
 // server-reflexive (public, from STUN) and relay ones.
@@ -253,7 +253,11 @@ export class WebRtcTransport {
   allowPipe(peer) {
     if (!this.pipesOn || this.pipeAllowed.has(peer)) return;
     this.pipeAllowed.add(peer);
-    if (this.pipeAllowed.size > MAX_PIPE_PEERS) this.pipeAllowed.delete(this.pipeAllowed.values().next().value);
+    if (this.pipeAllowed.size <= MAX_PIPE_PEERS) return;
+    const old = this.pipeAllowed.values().next().value;
+    this.pipeAllowed.delete(old);
+    // Its pipe goes too, unless a session uses it: pipes stay bounded by the allowed set and our links.
+    if (!this.ep.isConnected(old)) this.dropPipe(old);
   }
 
   isPipe(handle) {
@@ -343,6 +347,10 @@ export class WebRtcTransport {
   // Forgets every path to `peer`: its WebRTC link and its pipe.
   drop(peer) {
     this.dropRtc(peer);
+    this.dropPipe(peer);
+  }
+
+  dropPipe(peer) {
     const h = this.pipeByPeer.get(peer);
     if (h === undefined) return;
     clearTimeout(this.pipes.get(h).timer);

@@ -172,12 +172,22 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    It is slow, though: a relay round trip per batch, 40 ms batching, and at most 3
    batches a second for all of a client's pipes together. That is within what public
    relays allow one client. A relay that refuses events for its rate limit gets none
-   for 30 s, doubling up to 10 min.
+   for 30 s, doubling up to 10 min. The pause starts over at 30 s once the relay has
+   gone 10 min without refusing.
 
 The core keeps the first path that completes the handshake, and the room's proofs,
 presence and messages run unchanged on it. A pipe opens only for a peer whose hello
 proved the room key. `fallback: 'peers'` skips step 3; `'off'` keeps WebRTC only.
 TURN in `iceServers` still works and is faster than step 3 when you have a server.
+
+What the fallback reveals:
+- **To the other members.** Every member the dialler is linked to learns that the two
+  peers couldn't link directly. The member that relays sees the timing and volume of
+  their traffic, never its content. A relaying member can also move the link onto its
+  own path, which gives it no more power than dropping the traffic would.
+- **To the public relays.** On a pipe, the Nostr relays see a steady stream between two
+  tags for the whole session, where WebRTC sends them only a few signalling events.
+  They see no content and, unlike WebRTC, the peer learns no IP address.
 
 ## Tests
 
@@ -227,6 +237,7 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_fallback.mjs`: a fake RTCPeerConnection blocks chosen
   pairs. A blocked pair links through a third member, or over signalling when there is
   none (a 100 KB message arrives whole), and stays apart with `fallback: 'peers'`/`'off'`.
+  1,000 proven peers that each send one datagram over signalling leave at most 256 pipes.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

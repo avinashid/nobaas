@@ -106,7 +106,8 @@ export class NostrSignaling {
         const p = this.paused.get(url);
         // Events already on their way get refused too: count one per pause.
         if (p?.until > Date.now()) return;
-        const ms = p ? Math.min(p.ms * 2, MAX_BACKOFF_MS) : BACKOFF_MS;
+        // A relay quiet for MAX_BACKOFF_MS since its last pause starts over at BACKOFF_MS.
+        const ms = p && Date.now() - p.until < MAX_BACKOFF_MS ? Math.min(p.ms * 2, MAX_BACKOFF_MS) : BACKOFF_MS;
         this.paused.set(url, { until: Date.now() + ms, ms });
         this.stats.backoffs = (this.stats.backoffs ?? 0) + 1;
       }
