@@ -85,7 +85,7 @@ impl World {
 
     fn node(&mut self, k: &Kind) -> usize {
         let config = Config::default();
-        let node = match k {
+        match k {
             Kind::Public => self.sim.add_node(config),
             Kind::Nat(_, n) => {
                 let nat = self.sim.add_nat(n.clone(), None);
@@ -96,8 +96,7 @@ impl World {
                 let h = self.sim.add_nat(home.clone(), Some(c));
                 self.sim.add_node_behind(h, config)
             }
-        };
-        node
+        }
     }
 
     /// Another peer behind the NAT that `p` is behind (a home LAN).
