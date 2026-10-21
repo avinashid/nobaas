@@ -72,6 +72,18 @@ impl World {
     }
 
     fn add(&mut self, k: &Kind) -> usize {
+        let node = self.node(k);
+        self.attach(node)
+    }
+
+    /// A peer behind `k` on IPv4 with a firewalled global IPv6 address too (a phone).
+    fn add6(&mut self, k: &Kind) -> usize {
+        let node = self.node(k);
+        self.sim.add_ipv6(node);
+        self.attach(node)
+    }
+
+    fn node(&mut self, k: &Kind) -> usize {
         let config = Config::default();
         let node = match k {
             Kind::Public => self.sim.add_node(config),
@@ -85,7 +97,7 @@ impl World {
                 self.sim.add_node_behind(h, config)
             }
         };
-        self.attach(node)
+        node
     }
 
     /// Another peer behind the NAT that `p` is behind (a home LAN).
@@ -97,7 +109,8 @@ impl World {
     fn attach(&mut self, node: usize) -> usize {
         let identity = self.sim.nodes[node].identity.clone();
         let seed = [node as u8 + 1; 32];
-        let trav = Traversal::new(&identity, seed, BASE_MS, vec![self.sim.addr(node)], self.stun.clone());
+        let local = [Some(self.sim.addr(node)), self.sim.nodes[node].addr6].into_iter().flatten().collect();
+        let trav = Traversal::new(&identity, seed, BASE_MS, local, self.stun.clone());
         self.peers.push(Peer { node, trav, topics: BTreeSet::new(), events: Vec::new() });
         self.peers.len() - 1
     }
@@ -447,6 +460,59 @@ fn symmetric_pair_links_through_a_relay_peer_outside_the_room() {
         assert!(got_b >= 490 && got_a >= 490, "{got_b} {got_a}");
         assert_eq!(relay.relay_dropped, 0);
     }
+}
+
+/// NB-042: peers behind symmetric IPv4 NATs, which can't punch, link directly
+/// over IPv6 when both have it (through stateful firewalls, as on mobile
+/// carriers); with IPv6 on one side only, nothing changes: they fail as before.
+#[test]
+fn symmetric_ipv4_pair_links_directly_over_ipv6() {
+    for (six_a, six_b) in [(true, true), (true, false)] {
+        let mut w = World::new(12);
+        let add = |w: &mut World, six: bool| if six { w.add6(&kind("sym-random")) } else { w.add(&kind("sym-random")) };
+        let (a, b) = (add(&mut w, six_a), add(&mut w, six_b));
+        w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+        assert_eq!(w.peers[a].trav.nat_type(), NatType::Symmetric, "STUN still sees the IPv4 NAT");
+        w.join(a, "pair", Role::Peer);
+        w.join(b, "pair", Role::Peer);
+        let done = w.run_until(Duration::from_secs(45), |w| {
+            w.direct(a, b) || (w.failure(a, b).is_some() && w.failure(b, a).is_some())
+        });
+        assert!(done);
+        if !six_b {
+            let both = Some(Failure::Symmetric(Side::Both));
+            assert_eq!((w.failure(a, b), w.failure(b, a)), (both, both));
+            continue;
+        }
+        let at = |p: usize| w.sim.nodes[w.peers[p].node].addr6;
+        assert_eq!((w.path(a, b), w.path(b, a)), (at(b).map(Path::Direct), at(a).map(Path::Direct)));
+        let dropped = |p: usize| w.sim.nodes[w.peers[p].node].firewall_dropped;
+        assert!(dropped(a) + dropped(b) > 0, "a firewall turned away the first handshake: the dial punched it");
+        let (na, nb) = (w.peers[a].node, w.peers[b].node);
+        w.sim.send(na, nb, Lane::Reliable, b"over v6").unwrap();
+        let got = |w: &World| {
+            w.peers[b].events.iter().any(|e| matches!(e, Event::Message { data, .. } if data == b"over v6"))
+        };
+        assert!(w.run_until(Duration::from_secs(1), got));
+    }
+}
+
+/// Where IPv4 punches too, both families are dialled at once and the link takes
+/// whichever answers first; a peer's IPv6 is offered next to its IPv4.
+#[test]
+fn dual_stack_offers_both_families_and_links_on_the_first_answer() {
+    let mut w = World::new(13);
+    let (a, b) = (w.add6(&kind("port-restr")), w.add6(&kind("full-cone")));
+    w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+    let a6 = w.sim.nodes[w.peers[a].node].addr6.unwrap();
+    let offered = w.peers[a].trav.candidates();
+    assert!(offered.contains(&a6) && offered.iter().any(|c| !c.is_v6()), "{offered:?}");
+    w.join(a, "pair", Role::Peer);
+    w.join(b, "pair", Role::Peer);
+    assert!(w.run_until(Duration::from_secs(10), |w| w.direct(a, b)));
+    // Both families answer on these NATs: either one may carry the link.
+    let addrs = [w.peers[b].trav.candidates(), vec![w.sim.addr(w.peers[b].node)]].concat();
+    assert!(matches!(w.path(a, b), Some(Path::Direct(p)) if addrs.contains(&p)), "{:?}", w.path(a, b));
 }
 
 #[test]

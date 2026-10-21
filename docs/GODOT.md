@@ -88,8 +88,9 @@ Most players sit behind a NAT, so neither side can simply dial the other. `peerw
 [`NAT-TRAVERSAL.md`](NAT-TRAVERSAL.md)), and the binding drives it from `_poll()`; no threads are exposed to
 GDScript.
 
-1. On `host*()` / `join*()` the peer asks two STUN servers, on its game socket, what address its NAT gave it.
-   Invites list that public address first, then LAN and loopback addresses.
+1. On `host*()` / `join*()` the peer binds one dual-stack socket (`[::]`; IPv4 only on a machine without IPv6)
+   and asks two STUN servers, on it, what IPv4 address its NAT gave it. Invites list that public address first,
+   then the LAN, global IPv6 and loopback addresses.
 2. In a room, the host announces itself on the room's Nostr topic. A joiner announcing there gets a sealed offer
    from the host (its addresses, encrypted to the joiner's key) and answers with its own. Both then dial each
    other at once, which opens both NATs: the handshake goes through. `join(invite)` does the same over the host's
@@ -98,13 +99,16 @@ GDScript.
 4. A `symmetric` NAT picks a new public port for each peer, so the port it reported isn't the one the other side
    sees. If it hands ports out in sequence, the peer predicts the next one and the other side probes the ports
    around it, which punches restricted and port-restricted cones too.
-5. What still fails: two symmetric NATs, or a symmetric NAT with random ports against a *port-restricted* cone,
-   one that only lets in packets from ports it has sent to. STUN reports all cones as `cone`, so
+5. What still fails over IPv4: two symmetric NATs, or a symmetric NAT with random ports against a *port-restricted*
+   cone, one that only lets in packets from ports it has sent to. STUN reports all cones as `cone`, so
    `get_nat_type() == "cone"` doesn't promise a punch. Godot's star has no third peer both sides are linked to,
    unless the game sets a [relay peer](#relay-peers). Without one, `join*()` fails with
    `get_connect_error() == "symmetric"`, and `get_connect_error_message()` says which side is symmetric, e.g.
    "the peer's NAT is symmetric (a new public port per destination) and this side's router only lets in packets
    from ports it has sent to, ...". Peerwire runs no TURN relay, by design.
+6. IPv6 has no NAT. When both players have a global IPv6 address, as many mobile carriers give, the dial gets
+   through both firewalls whatever their IPv4 NATs are: both families are dialled at once, and the first to
+   answer carries the link (see [IPv6](NAT-TRAVERSAL.md#ipv6-dual-stack)).
 
 ```gdscript
 multiplayer.connection_failed.connect(func(): print("could not reach the host: ", peer.get_connect_error_message()))
@@ -330,8 +334,8 @@ binary:
 
 ## Limits
 
-- **NATs.** Cone NATs punch, and sequential symmetric NATs mostly do; two symmetric NATs, or a random-port
-  symmetric one against a port-restricted cone, fail with `get_connect_error() == "symmetric"` unless both are
+- **NATs.** Cone NATs punch, and sequential symmetric NATs mostly do; two symmetric NATs, or a random-port symmetric one
+  against a port-restricted cone, fail with `get_connect_error() == "symmetric"` unless both have global IPv6 or are
   linked to a [relay peer](#relay-peers) (no TURN; see [Through NATs](#through-nats)). Some networks block UDP or
   Nostr's websockets altogether.
 - **Rooms have no host election**, and a host takes `max_peers` joiners (default 32). One host per room: a second

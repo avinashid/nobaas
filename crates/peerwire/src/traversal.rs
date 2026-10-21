@@ -339,6 +339,16 @@ impl<A: Address> Traversal<A> {
         }
     }
 
+    /// Whether the socket can send to `a`: its family is one of the local
+    /// addresses' (a dual-stack socket has both). Non-IP addresses always pass.
+    pub fn reaches(&self, a: &A) -> bool {
+        let v6 = |x: &A| x.to_socket_addr().map(|s| s.ip().to_canonical().is_ipv6());
+        match v6(a) {
+            Some(fam) => self.local.is_empty() || self.local.iter().any(|l| v6(l).is_none_or(|f| f == fam)),
+            None => true,
+        }
+    }
+
     /// The public address STUN reported, if any.
     pub fn public_addr(&self) -> Option<&A> {
         self.public.as_ref()
@@ -747,7 +757,11 @@ impl<A: Address> Traversal<A> {
             }
             _ => Vec::new(),
         };
-        let addrs: Vec<A> = o.addrs.into_iter().filter(|a| dialable(a, loopback) && !self.local.contains(a)).collect();
+        let addrs: Vec<A> = o
+            .addrs
+            .into_iter()
+            .filter(|a| dialable(a, loopback) && self.reaches(a) && !self.local.contains(a))
+            .collect();
         let mut relay = self.relay();
         let reachable = ep.is_connected(&from) || !addrs.is_empty();
         if relay.is_none()
@@ -1672,6 +1686,29 @@ mod tests {
         while ep.poll_transmit(now).is_some() {}
         t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed::seal(&joiner, &me, [7; 32], &body).unwrap());
         assert_eq!(dials(&mut ep, now), vec![at(30), at(10)]);
+    }
+
+    /// NB-042: an offer's addresses are dialled only in the families the socket
+    /// can send to (both on a dual-stack one), all at once.
+    #[test]
+    fn offers_are_dialled_in_the_families_the_socket_reaches() {
+        let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        let (v4, v6) = (at("198.51.100.9:4000"), at("[2001:db8::9]:4000"));
+        let (me, key, now) = (id(1).peer_id(), room_key(ROOM.0, ROOM.1), Instant::from_millis(10));
+        let cases = [
+            (vec![at("10.0.0.1:7000")], vec![v4]),
+            (vec![at("[2001:db8::1]:7000")], vec![v6]),
+            (vec![at("10.0.0.1:7000"), at("[2001:db8::1]:7000"), at("127.0.0.1:7000")], vec![v6, v4]),
+        ];
+        for (local, want) in cases {
+            let mut t = Traversal::new(&id(1), [3; 32], 0, local.clone(), vec![]);
+            t.join_room(Instant::ZERO, ROOM.0, ROOM.1, Role::Peer, None);
+            let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+            let offer = offer_from(&id(2), &me, Some(&key), 1, Role::Peer, vec![v6, v4]);
+            t.handle_signal(now, &mut ep, Topic::peer(&me), &offer);
+            assert_eq!(dials(&mut ep, now), want, "bound to {local:?}");
+            assert!(local.iter().all(|l| t.reaches(l)));
+        }
     }
 
     /// The offers `t` published, opened with `to`'s key and decoded.

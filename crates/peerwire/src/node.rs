@@ -111,7 +111,7 @@ impl Builder {
     /// to peers like a public one: a peer can then reach this node through a
     /// symmetric NAT that hole punching can't get through. The mapping is renewed
     /// while the node lives and removed when it is dropped. It runs on a thread of
-    /// its own, for IPv4 sockets not bound to loopback. It doesn't run while the
+    /// its own, for IPv4 and dual-stack sockets not bound to loopback. It doesn't run while the
     /// node is under [`Privacy::RelayOnly`], which gives out no address (see
     /// [`PortMapping::RelayOnly`]). See [`Node::port_mapping`]. Default: off.
     pub fn port_mapping(mut self, on: bool) -> Self {
@@ -136,17 +136,21 @@ impl Builder {
         self
     }
 
-    /// Binds the UDP socket (`"0.0.0.0:0"` for any interface and a free port).
+    /// Binds the UDP socket: `"[::]:0"` for any interface, IPv4 and IPv6, and a
+    /// free port (see [`Node::bind`]).
     pub fn bind(self, addr: impl ToSocketAddrs) -> io::Result<Node> {
-        let sock = UdpSocket::bind(addr)?;
+        let sock = bind_socket(addr)?;
         sock.set_nonblocking(true)?;
         let local = sock.local_addr()?;
+        let dual = local.is_ipv6() && local.ip().is_unspecified();
         let identity = self.identity.unwrap_or_else(|| Identity::generate(&mut OsRng));
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
         let mut ep = Endpoint::new(&identity, self.config, seed);
-        // A socket on loopback can't reach STUN servers anyway.
-        let stun = if local.ip().is_loopback() { Vec::new() } else { resolve(&self.stun, local.is_ipv6()) };
+        // A socket on loopback can't reach STUN servers anyway. A dual-stack one
+        // asks over IPv4 only: its IPv6 address is global already, and answers
+        // from both families would read as a symmetric NAT.
+        let stun = if local.ip().is_loopback() { Vec::new() } else { resolve(&self.stun, local.is_ipv6() && !dual) };
         OsRng.fill_bytes(&mut seed);
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let mut trav = Traversal::new(&identity, seed, unix_ms, local_addresses(local), stun);
@@ -207,8 +211,15 @@ struct RelayPeer {
 }
 
 impl Node {
-    /// Binds a UDP socket (`"0.0.0.0:0"` for any interface and a free port) with a
-    /// fresh identity, the default [`Config`] and the [`DEFAULT_STUN_SERVERS`].
+    /// Binds a UDP socket with a fresh identity, the default [`Config`] and the
+    /// [`DEFAULT_STUN_SERVERS`].
+    ///
+    /// `"[::]:0"` (any interface, a free port) binds one dual-stack socket: the
+    /// node offers its IPv4 and its global IPv6 address, and a dial tries both at
+    /// once, keeping whichever answers first. That links peers on mobile networks
+    /// whose IPv4 is behind a carrier NAT hole punching can't get through, as their
+    /// IPv6 has no NAT. On a host without IPv6 it binds `0.0.0.0` on the same port
+    /// instead. `"0.0.0.0:0"` binds IPv4 only; a given address binds that one.
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Node> {
         Node::builder().bind(addr)
     }
@@ -237,7 +248,7 @@ impl Node {
         self.ep.peer_id()
     }
 
-    /// The address the socket is bound to.
+    /// The address the socket is bound to (`0.0.0.0` when `[::]` fell back to IPv4).
     pub fn local_addr(&self) -> SocketAddr {
         self.local
     }
@@ -328,11 +339,12 @@ impl Node {
     /// is connected: it never falls back to a direct path.
     pub fn connect(&mut self, invite: &str) -> Result<PeerId, Error> {
         let inv: Invite<SocketAddr> = Invite::parse(invite).ok_or(Error::InvalidInvite)?;
-        let mut targets: Vec<Path<SocketAddr>> = inv.addrs.iter().copied().map(Path::Direct).collect();
+        let reaches = |a: &&SocketAddr| self.trav.reaches(*a);
+        let mut targets: Vec<Path<SocketAddr>> = inv.addrs.iter().filter(reaches).copied().map(Path::Direct).collect();
         for (relay, addr) in &inv.relays {
             if self.ep.is_connected(relay) {
                 targets.push(Path::Via(*relay));
-                targets.push(Path::Direct(*addr));
+                targets.extend(Some(addr).filter(reaches).copied().map(Path::Direct));
             }
         }
         let relay = self.trav.relay();
@@ -525,6 +537,8 @@ impl Node {
         for _ in 0..MAX_READS_PER_POLL {
             match self.sock.recv_from(&mut self.buf[..]) {
                 Ok((n, from)) => {
+                    // A dual-stack socket sees IPv4 peers as ::ffff:a.b.c.d.
+                    let from = SocketAddr::new(from.ip().to_canonical(), from.port());
                     if !self.trav.handle_stun(&from, &self.buf[..n]) {
                         self.ep.handle_datagram(now, from, &self.buf[..n]);
                     }
@@ -664,7 +678,11 @@ impl Node {
 
     /// `false` only when the socket's send buffer is full.
     fn try_send(&self, t: &Transmit<SocketAddr>) -> bool {
-        match self.sock.send_to(&t.payload, t.dst) {
+        let dst = match t.dst {
+            SocketAddr::V4(a) if self.local.is_ipv6() => SocketAddr::new(a.ip().to_ipv6_mapped().into(), a.port()),
+            dst => dst,
+        };
+        match self.sock.send_to(&t.payload, dst) {
             Ok(_) => true,
             Err(e) => e.kind() != ErrorKind::WouldBlock, // unreachable addresses etc.: drop it
         }
@@ -683,27 +701,61 @@ impl Node {
     }
 }
 
+/// Binds `addr`, the first of its addresses that binds. `[::]` binds a dual-stack
+/// socket, or `0.0.0.0` on the same port where the host has no IPv6.
+fn bind_socket(addr: impl ToSocketAddrs) -> io::Result<UdpSocket> {
+    let mut last = io::Error::new(ErrorKind::InvalidInput, "no address to bind");
+    for a in addr.to_socket_addrs()? {
+        let bound = match a {
+            SocketAddr::V6(v6) if v6.ip().is_unspecified() => match dual_stack(a) {
+                Err(e) if e.kind() == ErrorKind::AddrInUse => Err(e),
+                Err(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, v6.port())),
+                ok => ok,
+            },
+            _ => UdpSocket::bind(a),
+        };
+        match bound {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// An IPv6 socket that also takes IPv4 (as v4-mapped addresses).
+fn dual_stack(addr: SocketAddr) -> io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    s.set_only_v6(false)?;
+    s.bind(&addr.into())?;
+    Ok(s.into())
+}
+
 /// The socket's own addresses: the bound one, or, when bound to any interface, the
-/// LAN address of the default route and loopback.
+/// address of each family's default route and loopback (both families for a
+/// dual-stack socket; IPv6 only with a route out, which in practice means global).
 fn local_addresses(local: SocketAddr) -> Vec<SocketAddr> {
     if !local.ip().is_unspecified() {
         return vec![local];
     }
-    let (port, v6) = (local.port(), local.is_ipv6());
-    let mut out: Vec<SocketAddr> = primary_ip(v6).map(|ip| SocketAddr::new(ip, port)).into_iter().collect();
-    let lo = if v6 { IpAddr::V6(Ipv6Addr::LOCALHOST) } else { IpAddr::V4(Ipv4Addr::LOCALHOST) };
-    out.push(SocketAddr::new(lo, port));
+    let families: &[bool] = if local.is_ipv6() { &[false, true] } else { &[false] };
+    let at = |ip| SocketAddr::new(ip, local.port());
+    let mut out: Vec<SocketAddr> = families.iter().filter_map(|&v6| primary_ip(v6)).map(at).collect();
+    out.push(at(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    if local.is_ipv6() {
+        out.push(at(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
     out
 }
 
 /// Starts router port mapping for the socket at `local`, through `at` or else the
-/// default gateway. `None` when it can't run: IPv6, loopback or no LAN address.
+/// default gateway. `None` when it can't run: no IPv4, loopback or no LAN address.
 fn start_port_mapping(local: SocketAddr, at: Option<(SocketAddr, SocketAddr)>) -> Option<Worker> {
     let (gateway, ssdp) = match at {
         Some(at) => at,
         None => {
             let lan = match local.ip() {
-                IpAddr::V4(ip) if ip.is_unspecified() => primary_ip(false)?,
+                ip if ip.is_unspecified() => primary_ip(false)?, // dual-stack sockets map their IPv4
                 ip => ip,
             };
             let IpAddr::V4(lan) = lan else { return None };
@@ -756,6 +808,18 @@ mod tests {
         assert_eq!(bound.addresses(), vec![bound.local_addr()]);
         assert_eq!((bound.public_addr(), bound.nat_type()), (None, NatType::Unknown));
         assert_eq!(bound.next_timeout(), None, "no STUN on loopback, no signaling: nothing to wake for");
+    }
+
+    /// NB-042: any interface lists IPv6 only on a dual-stack socket.
+    #[test]
+    fn any_interface_lists_both_families_when_dual_stack() {
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let v4 = local_addresses(at("0.0.0.0:7"));
+        assert!(v4.contains(&at("127.0.0.1:7")) && v4.iter().all(|a| a.is_ipv4()), "{v4:?}");
+        let dual = local_addresses(at("[::]:7"));
+        assert!(dual.contains(&at("127.0.0.1:7")) && dual.contains(&at("[::1]:7")), "{dual:?}");
+        assert_eq!(dual.iter().filter(|a| a.is_ipv4()).count(), v4.len(), "the same IPv4 addresses");
+        assert_eq!(local_addresses(at("[::1]:7")), vec![at("[::1]:7")]);
     }
 
     #[test]

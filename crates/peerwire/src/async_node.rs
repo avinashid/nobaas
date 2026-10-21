@@ -20,7 +20,7 @@ const IDLE: Duration = Duration::from_secs(3600);
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// use peerwire::{AsyncNode, Event, Lane};
 ///
-/// let mut node = AsyncNode::bind("0.0.0.0:0").await?;
+/// let mut node = AsyncNode::bind("[::]:0").await?;
 /// println!("{}", node.invite());
 /// loop {
 ///     match node.next_event().await {

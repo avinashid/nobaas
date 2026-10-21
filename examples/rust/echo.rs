@@ -9,7 +9,7 @@ use peerwire::{Event, Lane, Node};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut node = Node::bind("0.0.0.0:0")?;
+    let mut node = Node::bind("[::]:0")?;
     match std::env::args().nth(1) {
         Some(invite) => {
             node.connect(&invite)?;

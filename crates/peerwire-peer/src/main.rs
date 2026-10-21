@@ -11,7 +11,7 @@
 //!
 //! | Variable | Default | |
 //! |---|---|---|
-//! | `PEERWIRE_BIND` | `127.0.0.1:7700` | UDP address; `0.0.0.0:7700` to be reachable from other hosts |
+//! | `PEERWIRE_BIND` | `127.0.0.1:7700` | UDP address; `[::]:7700` (IPv4 and IPv6) or `0.0.0.0:7700` to be reachable from other hosts |
 //! | `PEERWIRE_DATA` | unset | directory for `identity.key` and `invite`; unset: a new identity each run |
 //! | `PEERWIRE_STUN` | the default servers | `host:port` list, comma-separated; `none` turns STUN off. Never used on loopback |
 //! | `PEERWIRE_MAX_PEERS` | `256` | most links at once; handshakes past it go unanswered |

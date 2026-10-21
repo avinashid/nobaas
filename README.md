@@ -29,7 +29,7 @@ backend in between. The same sans-IO core runs natively, in the browser as a 300
 C ABI and inside Godot 4.
 
 ```rust
-let mut node = Node::builder().signaling(NostrSignaling::default()).bind("0.0.0.0:0")?;
+let mut node = Node::builder().signaling(NostrSignaling::default()).bind("[::]:0")?;
 node.join_room("my-game", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4"); // the room name is the password
 // ...every other node in the room connects to you, through NAT where it can
 ```
@@ -80,7 +80,7 @@ use peerwire::{Event, Lane, Node};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut node = Node::bind("0.0.0.0:0")?;
+    let mut node = Node::bind("[::]:0")?;
     match std::env::args().nth(1) {
         Some(invite) => { node.connect(&invite)?; }   // joiner
         None => println!("{}", node.invite()),        // host: share this string
@@ -106,7 +106,7 @@ use peerwire::{Node, NostrSignaling, Role};
 
 let mut node = Node::builder()
     .signaling(NostrSignaling::default())        // wss://relay.damus.io, wss://nos.lol
-    .bind("0.0.0.0:0")?;
+    .bind("[::]:0")?;
 node.join_room("my-app", "9f3c1e7a2b8d4f60a1c5e9b7d3f2a8c4");          // full mesh
 // node.join_room_as("my-app", room, Role::Host);                     // or a star: one host,
 // node.join_room_as("my-app", room, Role::Client);                   //   many clients

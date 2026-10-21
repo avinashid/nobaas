@@ -9,7 +9,7 @@ use peerwire::{AsyncNode, Event, Lane};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut node = AsyncNode::bind("0.0.0.0:0").await?;
+    let mut node = AsyncNode::bind("[::]:0").await?;
     match std::env::args().nth(1) {
         Some(invite) => {
             node.connect(&invite)?;

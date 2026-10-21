@@ -26,27 +26,37 @@ use peerwire_core::{
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Duration;
 
 /// An IPv4-like address. IPs are unique across all realms, so an address
-/// also says which realm it lives in.
+/// also says which realm it lives in. IPs `0x20xx_xxxx` stand for IPv6
+/// addresses ([`Sim::add_ipv6`]), `2001:db8::` and the IP to real sockets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SimAddr {
     pub ip: u32,
     pub port: u16,
 }
 
+/// The top byte of the IPs that stand for IPv6 addresses.
+const V6_NET: u32 = 0x2000_0000;
+/// The /96 prefix they map to.
+const V6_PREFIX: [u16; 6] = [0x2001, 0xdb8, 0, 0, 0, 0];
+
 impl SimAddr {
     pub const fn new(ip: u32, port: u16) -> Self {
         SimAddr { ip, port }
+    }
+
+    /// Whether this stands for an IPv6 address.
+    pub const fn is_v6(&self) -> bool {
+        self.ip & 0xff00_0000 == V6_NET
     }
 }
 
 impl std::fmt::Display for SimAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let b = self.ip.to_be_bytes();
-        write!(f, "{}.{}.{}.{}:{}", b[0], b[1], b[2], b[3], self.port)
+        write!(f, "{}", self.to_socket_addr().expect("always an IP"))
     }
 }
 
@@ -67,13 +77,22 @@ impl Address for SimAddr {
     }
 
     fn to_socket_addr(&self) -> Option<std::net::SocketAddr> {
+        if self.is_v6() {
+            let [p0, p1, p2, p3, p4, p5] = V6_PREFIX;
+            let ip = std::net::Ipv6Addr::new(p0, p1, p2, p3, p4, p5, (self.ip >> 16) as u16, self.ip as u16);
+            return Some(std::net::SocketAddr::from((ip, self.port)));
+        }
         Some(std::net::SocketAddr::from((self.ip.to_be_bytes(), self.port)))
     }
 
     fn from_socket_addr(addr: std::net::SocketAddr) -> Option<Self> {
         match addr {
-            std::net::SocketAddr::V4(a) => Some(SimAddr::new(u32::from(*a.ip()), a.port())),
-            std::net::SocketAddr::V6(_) => None,
+            std::net::SocketAddr::V4(a) => Some(SimAddr::new(u32::from(*a.ip()), a.port())).filter(|s| !s.is_v6()),
+            std::net::SocketAddr::V6(a) => {
+                let s = a.ip().segments();
+                let ip = u32::from(s[6]) << 16 | u32::from(s[7]);
+                (s[..6] == V6_PREFIX && ip & 0xff00_0000 == V6_NET).then(|| SimAddr::new(ip, a.port()))
+            }
         }
     }
 }
@@ -84,6 +103,8 @@ pub const HOST_PORT: u16 = 7000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Owner {
     Node(usize),
+    /// A node's IPv6 address ([`Sim::add_ipv6`]), on the internet.
+    Node6(usize),
     Nat(usize),
     Stun,
 }
@@ -122,6 +143,12 @@ pub struct Node {
     pub addr: SimAddr,
     /// 0 for the internet, `n + 1` for the inside of NAT `n`.
     pub realm: usize,
+    /// A global IPv6 address behind a stateful firewall ([`Sim::add_ipv6`]).
+    pub addr6: Option<SimAddr>,
+    /// Addresses `addr6` has sent to: the only ones the firewall lets in.
+    pub pinholes: HashSet<SimAddr>,
+    /// Packets to `addr6` the firewall dropped.
+    pub firewall_dropped: u64,
     pub events: Vec<Event<SimAddr>>,
     /// Virtual time each entry of `events` was emitted.
     pub event_times: Vec<Instant>,
@@ -304,6 +331,9 @@ impl Sim {
             identity,
             addr,
             realm,
+            addr6: None,
+            pinholes: HashSet::new(),
+            firewall_dropped: 0,
             events: Vec::new(),
             event_times: Vec::new(),
             uplink_bps: None,
@@ -341,6 +371,19 @@ impl Sim {
 
     pub fn addr(&self, i: usize) -> SimAddr {
         self.nodes[i].addr
+    }
+
+    /// Gives node `i` a global IPv6 address too (on the same port), as mobile
+    /// carriers do beside a carrier-grade NAT: no NAT, but a stateful firewall
+    /// that lets in only addresses the node has sent to from it. Packets to IPv6
+    /// addresses leave from it; nodes without one can't send to them. Returns it.
+    pub fn add_ipv6(&mut self, i: usize) -> SimAddr {
+        let n = self.next_ip;
+        self.next_ip += 1;
+        let addr = SimAddr::new(V6_NET | (n & 0x00ff_ffff), HOST_PORT);
+        self.nodes[i].addr6 = Some(addr);
+        self.owners.insert(addr.ip, Owner::Node6(i));
+        addr
     }
 
     /// Moves node `i` to a new address (a NAT rebinding or a Wi-Fi to cellular switch).
@@ -468,7 +511,17 @@ impl Sim {
     }
 
     fn put_on_wire(&mut self, i: usize, to: SimAddr, mut data: Vec<u8>) {
-        let from = self.nodes[i].addr;
+        let from = match (to.is_v6(), self.nodes[i].addr6) {
+            (false, _) => self.nodes[i].addr,
+            (true, Some(a6)) => {
+                self.nodes[i].pinholes.insert(to);
+                a6
+            }
+            (true, None) => {
+                self.stats.undeliverable += 1; // no IPv6 route
+                return;
+            }
+        };
         if let (Some(_), Some(buf)) = (self.nodes[i].uplink_bps, self.nodes[i].uplink_buffer) {
             if self.nodes[i].tx_free_at > self.now + buf {
                 self.nodes[i].uplink_dropped += 1;
@@ -497,7 +550,8 @@ impl Sim {
             return;
         }
         // Climb out through NATs until the destination IP is visible.
-        let (mut realm, mut src, mut exits) = (self.nodes[i].realm, from, Vec::new());
+        let realm = if to.is_v6() { 0 } else { self.nodes[i].realm };
+        let (mut realm, mut src, mut exits) = (realm, from, Vec::new());
         while !self.visible(realm, to.ip) {
             if realm == 0 {
                 self.stats.undeliverable += 1;
@@ -604,6 +658,7 @@ impl Sim {
     fn visible(&self, realm: usize, ip: u32) -> bool {
         match self.owners.get(&ip) {
             Some(&Owner::Node(i)) => self.nodes[i].realm == realm,
+            Some(&Owner::Node6(_)) => realm == 0,
             Some(&Owner::Nat(n)) => self.nats[n].outer == realm,
             Some(&Owner::Stun) => realm == 0,
             None => false,
@@ -618,6 +673,17 @@ impl Sim {
                 Owner::Node(i) => {
                     let n = &self.nodes[i];
                     return (n.realm == realm && n.addr == dst).then_some(i);
+                }
+                Owner::Node6(i) => {
+                    let n = &mut self.nodes[i];
+                    if realm != 0 || n.addr6 != Some(dst) {
+                        return None;
+                    }
+                    if !n.pinholes.contains(&p.from) {
+                        n.firewall_dropped += 1;
+                        return None;
+                    }
+                    return Some(i);
                 }
                 Owner::Nat(n) => {
                     if self.nats[n].outer != realm {
