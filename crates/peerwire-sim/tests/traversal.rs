@@ -254,9 +254,20 @@ struct Outcome {
 
 /// Two peers join a room; nothing else is shared. Runs until they connect or both give up.
 fn room_pair(a: &Kind, b: &Kind, seed: u64) -> Outcome {
+    room_pair_with(a, b, seed, (0, 0))
+}
+
+/// [`room_pair`], with `used.0` and `used.1` more ports used up on A's and B's NATs
+/// after STUN (sent to addresses nobody holds), so their predictions are that far off.
+fn room_pair_with(a: &Kind, b: &Kind, seed: u64, used: (u32, u32)) -> Outcome {
     let mut w = World::new(seed);
     let (pa, pb) = (w.add(a), w.add(b));
     w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+    for (p, n) in [(pa, used.0), (pb, used.1)] {
+        for k in 0..n {
+            w.sim.send_raw(w.peers[p].node, SimAddr::new(0x0c00_0000 + 0x100 * p as u32 + k, 9), vec![0]);
+        }
+    }
     let t0 = w.sim.now;
     w.join(pa, "pair", Role::Peer);
     w.join(pb, "pair", Role::Peer);
@@ -447,6 +458,67 @@ fn symmetric_pair_relays_through_a_third_room_peer() {
 #[test]
 fn symmetric_pair_links_through_a_relay_peer_outside_the_room() {
     symmetric_pair_through_a_relay_peer();
+}
+
+/// NB-045: two sequential symmetric NATs (alone, or a home NAT behind a sequential
+/// carrier NAT) link directly by sweeping each other's predicted ports in lockstep,
+/// also when each NAT handed out ports since its prediction. The lower PeerId's
+/// probe `dl + 2·dh` meets the other's `dl + dh`, so the sweeps (96 and 64 probes)
+/// cover `dl + 2·dh < 96`, where each `d` also counts the dial's own new destinations.
+#[test]
+fn lockstep_prediction_links_sequential_symmetric_nats() {
+    let pairs = [("sym-seq", "sym-seq"), ("sym-seq", "cgnat(pr+sym)"), ("cgnat(pr+sym)", "cgnat(pr+sym)")];
+    let (mut direct, mut tries, mut times) = (0, 0, Vec::new());
+    for (a, b) in pairs {
+        for seed in 0..10 {
+            for (x, y) in [(a, b), (b, a)] {
+                let o = room_pair(&kind(x), &kind(y), 1500 + seed);
+                tries += 1;
+                direct += o.direct as u32;
+                times.push(o.t_connect);
+                assert!(o.direct, "{x} x {y}, seed {seed}: {o:?}");
+            }
+        }
+    }
+    times.sort();
+    println!("lockstep: {direct}/{tries} direct, connect median {:?}, max {:?}", times[tries / 2], times[tries - 1]);
+    // Ports used up on both NATs since the predictions: linked within the sweeps' reach.
+    print!("ports used up (A, B) -> direct:");
+    for used in [(1, 1), (5, 0), (0, 5), (10, 10), (20, 5), (5, 20), (28, 28)] {
+        let ok = (0..4).filter(|&seed| room_pair_with(&kind("sym-seq"), &kind("sym-seq"), 1600 + seed, used).direct);
+        let ok = ok.count();
+        print!(" {used:?} {ok}/4");
+        assert_eq!(ok, 4, "{used:?}");
+    }
+    println!();
+    // Far beyond reach, it fails as before.
+    assert!(!room_pair_with(&kind("sym-seq"), &kind("sym-seq"), 1700, (60, 60)).connected);
+}
+
+/// NB-045: two sequential symmetric NATs linked through a relay peer move to a
+/// direct path by the lockstep sweep (punches over the relayed link).
+#[test]
+fn lockstep_prediction_moves_a_relayed_link_to_direct() {
+    for seed in 0..5 {
+        let mut w = World::new(1800 + seed);
+        let (a, b) = (w.add(&kind("sym-seq")), w.add(&kind("cgnat(pr+sym)")));
+        let r = w.add(&Kind::Public);
+        w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+        let (rid, at) = (w.id(r), w.sim.addr(w.peers[r].node));
+        for p in [a, b] {
+            let now = w.sim.now;
+            w.sim.nodes[w.peers[p].node].endpoint.connect_with(now, rid, &[Path::Direct(at)]).unwrap();
+            w.peers[p].trav.set_relay_peers(vec![rid]);
+        }
+        assert!(w.run_until(Duration::from_secs(2), |w| w.connected(a, r) && w.connected(b, r)));
+        w.join(a, "pair", Role::Peer);
+        w.join(b, "pair", Role::Peer);
+        assert!(w.run_until(Duration::from_secs(5), |w| w.connected(a, b)), "seed {seed}");
+        assert_eq!(w.path(a, b), Some(Path::Via(rid)), "seed {seed}: relayed first");
+        let t0 = w.sim.now;
+        assert!(w.run_until(Duration::from_secs(10), |w| w.direct(a, b)), "seed {seed}: {:?}", w.path(a, b));
+        println!("seed {seed}: direct {:?} after relayed", w.sim.now - t0);
+    }
 }
 
 /// NB-044: a link that came up through a relay peer moves to a direct path by a
