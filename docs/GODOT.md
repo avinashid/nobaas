@@ -103,12 +103,15 @@ GDScript.
    it has sent to) links by a birthday punch, after about 2 s: the symmetric side opens 256 extra sockets for 10 s
    and the cone side sprays ports until one hits (see NAT-TRAVERSAL.md). It misses about 0.03% of the time
    (theoretical), and is tried once per peer per 5 minutes.
-6. What still fails over IPv4: two symmetric NATs. Godot's star has no third peer both sides are linked to,
-   unless the game sets a [relay peer](#relay-peers). Without one, `join*()` fails with
+6. Two symmetric NATs that both hand out ports in sequence link by lockstep prediction, after about 1.5 s: each
+   probes the other's predicted ports in an order that makes the new mappings line up.
+7. What still fails over IPv4: a symmetric NAT with random ports against another symmetric one. Godot's star has
+   no third peer both sides are linked to, unless the game sets a [relay peer](#relay-peers). Without one,
+   `join*()` fails with
    `get_connect_error() == "symmetric"`, and `get_connect_error_message()` says which side is symmetric, e.g.
    "the peer's NAT is symmetric (a new public port per destination) and this side's router only lets in packets
    from ports it has sent to, ...". Peerwire runs no TURN relay, by design.
-7. IPv6 has no NAT. When both players have a global IPv6 address, as many mobile carriers give, the dial gets
+8. IPv6 has no NAT. When both players have a global IPv6 address, as many mobile carriers give, the dial gets
    through both firewalls whatever their IPv4 NATs are: both families are dialled at once, and the first to
    answer carries the link (see [IPv6](NAT-TRAVERSAL.md#ipv6-dual-stack)).
 
@@ -340,9 +343,10 @@ binary:
 
 ## Limits
 
-- **NATs.** Cone NATs punch, sequential symmetric NATs mostly do, and a random-port symmetric one links with a cone by
-  a birthday punch; two symmetric NATs fail with `get_connect_error() == "symmetric"` unless both have global IPv6
-  or are linked to a [relay peer](#relay-peers) (no TURN; see [Through NATs](#through-nats)). Some networks block UDP or
+- **NATs.** Cone NATs punch, sequential symmetric NATs mostly do (with each other too), and a random-port symmetric
+  one links with a cone by a birthday punch; a random-port symmetric NAT against another symmetric one fails with
+  `get_connect_error() == "symmetric"` unless both have global IPv6 or are linked to a [relay peer](#relay-peers)
+  (no TURN; see [Through NATs](#through-nats)). Some networks block UDP or
   Nostr's websockets altogether.
 - **Rooms have no host election**, and a host takes `max_peers` joiners (default 32). One host per room: a second
   `host_room` with the same name is found by some joiners and not others.

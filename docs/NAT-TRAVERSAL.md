@@ -16,6 +16,7 @@ unchanged; this layer feeds it addresses.
 | Dual stack | One `[::]` socket for IPv4 and IPv6: global IPv6 host addresses are offered next to IPv4 ones |
 | Port mapping | Opt-in (`Builder::port_mapping`): the router forwards a public port to the socket, by PCP, NAT-PMP or UPnP-IGD |
 | Birthday punching | A random-port symmetric NAT opens 256 extra sockets towards a cone peer, which sprays ports of its IP until one hits |
+| Lockstep prediction | Two sequential symmetric NATs probe each other's predicted ports in an order that makes their new mappings line up |
 | Dialling | Both sides call `Endpoint::connect_with` on every candidate (plus `Path::Via` a mutual peer): a simultaneous open |
 
 ## STUN
@@ -44,7 +45,8 @@ sequence, though:
 - **Offer.** The prediction rides in the offer's address list as a tagged entry (below), only when the public
   address leads the list. It takes one of the 8 slots.
 - **Probing.** A receiver whose NAT is neither open nor symmetric (open and symmetric ones gain nothing, and a
-  symmetric one would spend a port per probe), given an offer whose first address is public and dialable, hands
+  symmetric one would spend a port per probe; two sequential symmetric NATs use
+  [lockstep prediction](#lockstep-prediction) instead), given an offer whose first address is public and dialable, hands
   the core 32 *guesses*: ports `next - 4·step` to
   `next + 27·step`, leaning forward because the NAT may have given out more since STUN asked
   (`Endpoint::set_guesses`). Guesses are probe-only, and probed three times:
@@ -99,8 +101,35 @@ can, by the birthday paradox, as Tailscale does:
 - **Cost.** The symmetric side: 256 sockets for 10 s and 256 packets of about 130 bytes (the HS1), about 33 KB.
   The cone side: up to 2048 handshakes or punches to ports of one IP, about 270 KB over 3.8 s, about 32 KB on
   average. Its own router keeps a connection-tracking entry per probe for a while; a router with a small table
-  may drop new flows meanwhile. Two random-port symmetric NATs still can't punch: neither side has a port the
-  other can hit.
+  may drop new flows meanwhile. A random-port symmetric NAT can't punch another symmetric NAT: neither side has
+  a port the other can hit.
+
+## Lockstep prediction
+
+Two symmetric NATs that hand out ports in sequence can't punch with ordinary probes: each new destination costs
+the sender's NAT its next port, so neither side's offered port is the one its probes come from (NB-045). If each
+probes the other's predicted ports in a known order, the new mappings line up:
+
+- **Who does what.** When this node and the peer both offered a [prediction](#port-prediction), each sweeps the
+  peer's predicted ports at the peer's public IP (`Endpoint::sweep`), every probe to a new address, in order:
+  - the side with the lower PeerId probes `next + k·step` for k = 0 to 95 (`LOCKSTEP_LOW`);
+  - the other probes `next + 2k·step` for k = 0 to 63 (`LOCKSTEP_HIGH`).
+- **Why it meets.** Each NAT may have handed out ports since STUN asked (the dial's own new destinations, other
+  traffic, other users of a carrier NAT): `dl` on the lower side, `dh` on the other. The lower side's probe `i`
+  then leaves from its `next + (dl + i)·step` and goes to the other's `next + i·step`; the other's probe `j` leaves
+  from its `next + (dh + j)·step` and goes to the lower side's `next + 2j·step`. For `i = dl + 2·dh` and
+  `j = dl + dh` each probe goes from the other's destination to the other's source, so whichever arrives second
+  finds the mapping open, and the answer goes back through the same pair. Equal strides would meet only when
+  `dl = -dh`; the unequal ones meet for any `dl, dh ≥ 0` with `dl + 2·dh < 96`: up to about 31 ports on each side,
+  whichever has the lower PeerId.
+- **When.** 1 s after the offer, while dialling or on a relayed link (probes are the handshake, or punches), only
+  towards a public IPv4 address, not under `RelayOnly`, and within the same limits as a
+  [birthday punch](#birthday-punching): once per peer per 5 minutes, a node budget of 4 then one per 30 s.
+- **Cost.** At most 96 handshakes (about 12 KB) to ports of one IP, and as many ports of the sender's own NAT,
+  which it keeps for its mapping timeout. In the simulator the pair links 1.51 s after joining.
+- **Limits.** A NAT whose ports jump by more than the step, or that many other users share fast enough to hand out
+  more than about 31 ports while the probes go, still fails, as do NATs that predict no port (random ones). Not
+  yet measured on real networks.
 
 ## IPv6 (dual stack)
 
@@ -374,8 +403,8 @@ unordered pair once) plus two peers behind one non-hairpinning NAT, from `cargo 
 traversal privacy_modes_matrix -- --nocapture`:
 
 ```text
-                            Direct: direct 31, relayed  6, failed 0
-                        PublicOnly: direct 30, relayed  7, failed 0
+                            Direct: direct 34, relayed  3, failed 0
+                        PublicOnly: direct 33, relayed  4, failed 0
            RelayOnly { via: None }: direct  0, relayed 37, failed 0
 ```
 
@@ -425,6 +454,8 @@ traversal privacy_modes_matrix -- --nocapture`:
   1.1 MB in a burst, then about 9 KB/s on average, at one IP per spray. The probes are Noise handshakes or sealed
   punches, about 130 bytes or less, so there is no amplification beyond the count. An offer saying `Cone` makes a
   symmetric node send 256 handshakes (about 33 KB) to the offer's address, from 256 sockets it keeps for 10 s.
+- **Lockstep sweep** (NB-045). An offer with a prediction, to a node behind a sequential symmetric NAT, makes it
+  send up to 96 handshakes (about 12 KB) to ports of the offer's IP, under the same limits as the birthday spray.
 - **Nostr relays** (`NostrSignaling`):
   - Events are checked against their NIP-01 id before deduplication, so a relay can't present one event as many.
     Signatures aren't checked: offers are sealed and authenticate themselves, and hellos carry room proofs.
@@ -483,6 +514,8 @@ Crates added to `peerwire` by NAT traversal:
   - birthday punches planned from the NAT types: a spray of every probe, each port once, from a cone towards a
     random-port symmetric peer, sockets with the dial's HS1 the other way round; none towards a private address,
     open or symmetric peers, or under `RelayOnly`; once per peer, at most 4 at once;
+  - lockstep sweeps: the peer's predicted ports in order, `next + k·step` (96) from the lower PeerId and
+    `next + 2k·step` (64) from the other, a step-3 NAT, none unless both sides predict;
   - failure messages naming the symmetric side.
 - `crates/peerwire/src/portmap.rs` unit tests: PCP mapping, renewal at half the lease and delete; NAT-PMP after a
   PCP version refusal; UPnP after PCP and NAT-PMP refusals, with port conflicts and permanent leases; the timeout
@@ -510,6 +543,10 @@ Crates added to `peerwire` by NAT traversal:
     against port-restricted and `cgnat(pr+pr)` cones, 100/100 direct over 25 seeds each way round, connect
     median 2.19 s, max 3.51 s (`cargo test -p peerwire-sim --release --test traversal birthday -- --nocapture`);
     a link relayed through a relay peer moves to direct in 1.6 to 2.5 s, and only the routed socket stays open;
+  - lockstep prediction: `sym-seq` and `cgnat(pr+sym)` pairs, 60/60 direct over 10 seeds each way round (1.51 s),
+    also with up to 28 ports used up on both NATs before the sweep (`room_pair_with`), and still failing at 60;
+    a sequential pair relayed through a relay peer moves to direct in 1.1 s
+    (`cargo test -p peerwire-sim --release --test traversal lockstep -- --nocapture`);
   - IPv6 (`Sim::add_ipv6`: a global address behind a stateful firewall): a pair behind random-port symmetric NATs
     links directly over IPv6, and with IPv6 on one side only fails as before; port-restricted and full-cone peers
     offer both families and link on the first to answer;
@@ -532,8 +569,9 @@ Crates added to `peerwire` by NAT traversal:
 Room of two, signaling only, from `cargo test -p peerwire-sim --release --test traversal -- --nocapture`. D is
 direct, with ms to connect. F S is a failure reported as `Symmetric` on both sides, as A reports it: `S<` A's
 NAT is the symmetric one, `S^` B's, `S2` both. Port prediction raised this from 43/64 direct, birthday punching
-from 51/64 (the four `sym-random` against port-restricted cells, at 2 to 4.3 s); what still fails is two symmetric
-NATs:
+from 51/64 (the four `sym-random` against port-restricted cells, at 2 to 4.3 s), lockstep prediction from 55/64
+(the four sequential symmetric pairs, at 1.5 s); what still fails is a random-port symmetric NAT against another
+symmetric one:
 
 ```text
          A \ B        public     full-cone    restricted    port-restr       sym-seq    sym-random  cgnat(pr+pr) cgnat(pr+sym)
@@ -541,11 +579,11 @@ NATs:
      full-cone         D 360         D 360         D 360         D 360         D 360         D 360         D 360         D 360
     restricted         D 510         D 510         D 510         D 530         D 530         D 860         D 510         D 530
     port-restr         D 510         D 510         D 510         D 530         D 510        D 4250         D 530         D 530
-       sym-seq         D 510         D 530         D 510         D 510          F S2          F S2         D 510          F S2
+       sym-seq         D 510         D 530         D 510         D 510        D 1510          F S2         D 510        D 1510
     sym-random         D 510         D 530         D 510        D 2010          F S2          F S2        D 2760          F S2
   cgnat(pr+pr)         D 530         D 510         D 530         D 530         D 530        D 2700         D 530         D 530
- cgnat(pr+sym)         D 510         D 530         D 530         D 530          F S2          F S2         D 530          F S2
-direct: 55/64
+ cgnat(pr+sym)         D 510         D 530         D 530         D 530        D 1510          F S2         D 530        D 1510
+direct: 59/64
 ```
 
 The simulated NATs follow RFC 4787 behaviours. Real carrier-grade NATs, mobile networks and firewalls that block

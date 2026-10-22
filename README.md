@@ -336,15 +336,17 @@ Details are in [docs/NAT-TRAVERSAL.md](docs/NAT-TRAVERSAL.md).
 | **Punching** | Both sides call `connect_with` on every *dialable* candidate at the same moment. Loopback, unspecified, multicast and broadcast addresses are refused, so an offer can't aim a node at its own host's services. PUNCH probes go every 100 ms for 5 s. A path counts as direct only after an echoed `PUNCH_ACK`. |
 | **Port prediction** | A symmetric NAT whose two STUN mappings are 1–8 ports apart looks sequential: its offer predicts the next port, and a cone peer also probes 32 ports around it, three times (first handshake sends while dialling, punch rounds while relayed). Old decoders skip the entry. |
 | **Birthday punching** | A symmetric NAT with random ports against a cone that filters by port: the symmetric side opens 256 extra sockets towards the cone, and the cone sprays up to 2048 ports of its IP until one probe lands on a socket's mapping (theoretical odds 99.97%). Automatic, once per peer per 5 minutes; also moves a relayed link to direct. |
+| **Lockstep prediction** | Two symmetric NATs that both hand out ports in sequence probe each other's predicted ports in order, one side at every step and the other at every second, so their new mappings line up even when each NAT gave out up to about 31 ports since its prediction. |
 | **Port mapping** | Opt-in (`Builder::port_mapping`). The router forwards a public UDP port to the socket, by PCP, then NAT-PMP, then UPnP-IGD. The mapping is renewed at half its lease and deleted on drop. It is offered after the STUN address, and only if the router's own address is public: behind CGNAT it isn't offered (`PortMapping::NotPublic`). |
 | **Relay fallback** | If no direct path opens, as between two symmetric NATs, the link runs `Path::Via(peer)` through a mutual peer. The relay forwards only ciphertext: `FWD` and `RELAYED` frames wrap the end-to-end packet. The link keeps trying to go direct. |
 | **Abuse limits** | Hellos answered and offers acted on each have a token budget: a burst of 30, then one every 2 s. Each sender also has its own limit: a burst of 8, then one per second. Proofs are checked before any token is spent, and answers from peers a node dialled itself don't draw on the node's budget. |
 
-**Simulated outcome.** In a room of two with signaling only, **55 of 64** NAT-type pairings connect directly, in
-360–860 ms, or 2–4.3 s for the four that need a birthday punch (43 before port prediction, 51 before birthday
-punching). These pairings cover public, full-cone, restricted, port-restricted, sequential and random symmetric,
-and two CGNAT stacks. The rest are two symmetric NATs; they are reported as `Symmetric`, naming the symmetric
-side. In a room with a third peer they connect relayed through it.
+**Simulated outcome.** In a room of two with signaling only, **59 of 64** NAT-type pairings connect directly, in
+360–860 ms, 1.5 s for the four that need lockstep prediction, or 2–4.3 s for the four that need a birthday punch
+(43 before port prediction, 51 before birthday punching, 55 before lockstep prediction). These pairings cover
+public, full-cone, restricted, port-restricted, sequential and random symmetric, and two CGNAT stacks. The rest
+are a random-port symmetric NAT against another symmetric one; they are reported as `Symmetric`, naming the
+symmetric side. In a room with a third peer they connect relayed through it.
 
 ### Invites
 
