@@ -154,8 +154,14 @@ impl World {
             }
             let stun: Vec<_> = std::iter::from_fn(|| peer.trav.poll_transmit()).collect();
             let signals: Vec<_> = std::iter::from_fn(|| peer.trav.poll_signal()).collect();
+            let birthdays: Vec<_> = std::iter::from_fn(|| peer.trav.poll_birthday()).collect();
             for t in stun {
                 self.sim.send_raw(node, t.dst, t.payload);
+            }
+            for b in birthdays {
+                for port in self.sim.open_ports(node, b.sockets, b.until) {
+                    self.sim.send_from(node, port, b.dst, b.payload.clone());
+                }
             }
             for s in signals {
                 self.signal(p, s);
@@ -336,14 +342,40 @@ fn nat_matrix_through_signaling() {
     assert!(!o.connected);
     let both = Some(Failure::Symmetric(Side::Both));
     assert_eq!(o.failures, (both, both));
-    // Against a port-restricted cone, each side names the symmetric one.
+    // Against a port-restricted cone, a birthday punch links them (NB-044).
     let o = room_pair(&kind("sym-random"), &kind("port-restr"), 9);
-    assert!(!o.connected);
-    let (Some(a), Some(b)) = o.failures else { panic!("{o:?}") };
-    assert_eq!((a, b), (Failure::Symmetric(Side::Ours), Failure::Symmetric(Side::Theirs)));
-    assert!(a.to_string().starts_with("this side's NAT is symmetric"), "{a}");
-    assert!(b.to_string().starts_with("the peer's NAT is symmetric"), "{b}");
-    assert!(b.to_string().contains("this side's router only lets in packets from ports it has sent to"), "{b}");
+    assert!(o.direct, "{o:?}");
+}
+
+/// NB-044: a random-port symmetric NAT against a cone that filters by port links
+/// directly by a birthday punch: the symmetric side opens 256 sockets towards the
+/// cone, the cone sprays 1024 ports of the symmetric side's IP. Theoretical odds per
+/// try 1 - (1 - 256/64512)^1024, about 98%.
+#[test]
+fn birthday_punch_links_random_symmetric_and_port_restricted() {
+    let pairs = [("sym-random", "port-restr"), ("sym-random", "cgnat(pr+pr)")];
+    let (mut direct, mut tries, mut times) = (0, 0, Vec::new());
+    for (a, b) in pairs {
+        for seed in 0..25 {
+            for (x, y) in [(a, b), (b, a)] {
+                let o = room_pair(&kind(x), &kind(y), 1300 + seed);
+                tries += 1;
+                if o.direct {
+                    direct += 1;
+                    times.push(o.t_connect);
+                } else {
+                    println!("{x} x {y}, seed {seed}: {o:?}");
+                }
+            }
+        }
+    }
+    times.sort();
+    println!(
+        "birthday: {direct}/{tries} direct, connect median {:?}, max {:?}",
+        times[times.len() / 2],
+        times[times.len() - 1]
+    );
+    assert!(direct * 100 >= tries * 90, "{direct}/{tries}");
 }
 
 /// NB-035: a sequential symmetric NAT predicts its next port from its two STUN
@@ -414,6 +446,47 @@ fn symmetric_pair_relays_through_a_third_room_peer() {
 /// game traffic (1 KB unreliable every 10 ms, each way) fits its relay rate.
 #[test]
 fn symmetric_pair_links_through_a_relay_peer_outside_the_room() {
+    symmetric_pair_through_a_relay_peer();
+}
+
+/// NB-044: a link that came up through a relay peer moves to a direct path by a
+/// birthday punch (punches sprayed over the live link), and the symmetric side's
+/// extra sockets close but the one carrying the link.
+#[test]
+fn birthday_punch_moves_a_relayed_link_to_direct() {
+    for seed in 0..5 {
+        let mut w = World::new(1400 + seed);
+        let (a, b) = (w.add(&kind("sym-random")), w.add(&kind("port-restr")));
+        let r = w.add(&Kind::Public);
+        w.run_until(Duration::from_secs(2), |w| w.peers.iter().all(|p| p.trav.nat_type() != NatType::Unknown));
+        let (rid, at) = (w.id(r), w.sim.addr(w.peers[r].node));
+        for p in [a, b] {
+            let now = w.sim.now;
+            w.sim.nodes[w.peers[p].node].endpoint.connect_with(now, rid, &[Path::Direct(at)]).unwrap();
+            w.peers[p].trav.set_relay_peers(vec![rid]);
+        }
+        assert!(w.run_until(Duration::from_secs(2), |w| w.connected(a, r) && w.connected(b, r)));
+        w.join(a, "pair", Role::Peer);
+        w.join(b, "pair", Role::Peer);
+        assert!(w.run_until(Duration::from_secs(5), |w| w.connected(a, b)), "seed {seed}");
+        let t0 = w.sim.now;
+        assert_eq!(w.path(a, b), Some(Path::Via(rid)), "seed {seed}: relayed first");
+        assert!(w.run_until(Duration::from_secs(10), |w| w.direct(a, b)), "seed {seed}: {:?}", w.path(a, b));
+        let (na, nb) = (w.peers[a].node, w.peers[b].node);
+        let stats = w.sim.nodes[nb].endpoint.stats();
+        println!("seed {seed}: direct {:?} after relayed, {} probes", w.sim.now - t0, stats.spray_probes);
+        assert!(stats.spray_probes > 0 && stats.punch_succeeded >= 1);
+        // The link keeps working over the extra socket, and the rest close.
+        w.run_until(Duration::from_secs(12), |_| false);
+        assert!(w.direct(a, b));
+        assert_eq!(w.sim.open_port_count(na), (1, 1), "seed {seed}");
+        w.sim.send(na, nb, Lane::Reliable, b"over the birthday socket").unwrap();
+        w.run_until(Duration::from_secs(1), |w| w.peers[b].events.iter().any(|e| matches!(e, Event::Message { .. })));
+        assert_eq!(w.messages(b), vec![b"over the birthday socket".to_vec()]);
+    }
+}
+
+fn symmetric_pair_through_a_relay_peer() {
     for with_relay in [false, true] {
         let mut w = World::new(11);
         let (a, b) = (w.add(&kind("sym-random")), w.add(&kind("sym-random")));
