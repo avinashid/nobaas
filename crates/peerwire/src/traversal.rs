@@ -2352,6 +2352,104 @@ mod tests {
         assert_eq!(sent_to("192.168.1.50:20000".parse().unwrap(), 4), attempts);
     }
 
+    /// What a node's offers from `peers` peers (each sent at every time in
+    /// `offers_ms`) start: the extra sockets it asks for, every datagram its
+    /// endpoint sends to the offered IP over 6 s, and the first of them. `sym`:
+    /// this node's NAT is symmetric with random ports (else a cone); `their`: the
+    /// offers' NAT type.
+    fn birthday_case(
+        sym: bool,
+        their: NatType,
+        predict: bool,
+        there: &str,
+        privacy: Privacy,
+        peers: u8,
+        offers_ms: &[u64],
+    ) -> (Vec<Birthday<SocketAddr>>, usize, Option<Vec<u8>>) {
+        let me = id(1).peer_id();
+        let there: SocketAddr = there.parse().unwrap();
+        let servers: [SocketAddr; 2] = ["192.0.2.1:3478".parse().unwrap(), "192.0.2.2:3478".parse().unwrap()];
+        let mut t = Traversal::new(&id(1), [3; 32], 0, vec!["10.0.0.2:7000".parse().unwrap()], servers.to_vec());
+        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+        t.set_privacy(&mut ep, privacy);
+        t.handle_timeout(Instant::ZERO, &mut ep);
+        for (i, r) in std::iter::from_fn(|| t.poll_transmit()).collect::<Vec<_>>().into_iter().enumerate() {
+            let tx = stun::parse_binding_request(&r.payload).unwrap();
+            let port = if sym { [5000, 41000][i] } else { 5000 }; // random ports: no prediction
+            t.handle_stun(&r.dst, &stun::binding_response(&tx, SocketAddr::from(([203, 0, 113, 9], port))));
+        }
+        assert_eq!(t.nat_type(), if sym { NatType::Symmetric } else { NatType::Cone });
+        assert_eq!(t.predicted_addr(), None);
+        let ids: Vec<Identity> = (0..peers).map(|n| id(10 + n)).collect();
+        for p in &ids {
+            t.introduce(Instant::ZERO, &ep, p.peer_id(), None);
+        }
+        let (mut births, mut sent, mut first, mut nonce) = (Vec::new(), 0, None, 0);
+        for ms in (0..6000).step_by(10) {
+            let now = Instant::from_millis(ms);
+            for p in ids.iter().filter(|_| offers_ms.contains(&ms)) {
+                nonce += 1;
+                let o = Offer {
+                    kind: Proof::None,
+                    reply: false,
+                    role: Role::Peer,
+                    nat: their,
+                    ts: ms,
+                    nonce,
+                    addrs: vec![there],
+                    predict: predict.then_some(Prediction { next: there.port() + 2, step: 1 }),
+                    relays: vec![],
+                };
+                let sealed = sealed::seal(p, &me, [7; 32], &o.encode()).unwrap();
+                t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed);
+            }
+            ep.handle_timeout(now);
+            if t.poll_timeout().is_some_and(|at| at <= now) {
+                t.handle_timeout(now, &mut ep);
+            }
+            births.extend(std::iter::from_fn(|| t.poll_birthday()));
+            for d in std::iter::from_fn(|| ep.poll_transmit(now)).filter(|d| d.dst.ip() == there.ip()) {
+                sent += 1;
+                first.get_or_insert(d.payload);
+            }
+        }
+        (births, sent, first)
+    }
+
+    /// NB-044: a birthday punch is planned only between a random-port symmetric
+    /// NAT and a cone, towards a public IPv4 address, once per peer, within the
+    /// node's budget, and never under `RelayOnly`.
+    #[test]
+    fn birthday_punches_follow_the_nat_types() {
+        let (public, private) = ("198.51.100.9:20000", "192.168.1.50:20000");
+        let direct = Privacy::Direct;
+        let attempts = 4; // handshake sends in 6 s: at 0, 0.5, 1.5 and 3.5 s
+        // Behind a cone, facing a random-port symmetric NAT: spray its IP, no sockets.
+        let (b, sent, _) = birthday_case(false, NatType::Symmetric, false, public, direct, 1, &[0]);
+        assert!(b.is_empty());
+        assert_eq!(sent, attempts + usize::from(BIRTHDAY_PROBES), "every probe, each port once");
+        // A predictable one is probed around its prediction instead.
+        let (b, sent, _) = birthday_case(false, NatType::Symmetric, true, public, direct, 1, &[0]);
+        assert!(b.is_empty() && sent < 200, "{sent}");
+        // Behind the symmetric NAT, facing a cone: sockets towards its address, with the dial's HS1.
+        let (b, sent, hs1) = birthday_case(true, NatType::Cone, false, public, direct, 1, &[0]);
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].dst, b[0].sockets), (public.parse().unwrap(), BIRTHDAY_SOCKETS));
+        assert_eq!(b[0].until, Instant::from_millis(1000) + BIRTHDAY_OPEN_FOR);
+        assert_eq!(Some(&b[0].payload), hs1.as_ref());
+        assert_eq!(sent, attempts, "no spray from the symmetric side");
+        // Not for a private address, nor for open or symmetric peers, nor relay-only.
+        assert!(birthday_case(true, NatType::Cone, false, private, direct, 1, &[0]).0.is_empty());
+        assert_eq!(birthday_case(false, NatType::Symmetric, false, private, direct, 1, &[0]).1, attempts);
+        assert!(birthday_case(true, NatType::Open, false, public, direct, 1, &[0]).0.is_empty());
+        assert!(birthday_case(true, NatType::Symmetric, false, public, direct, 1, &[0]).0.is_empty());
+        let relay_only = Privacy::RelayOnly { via: None };
+        assert!(birthday_case(true, NatType::Cone, false, public, relay_only, 1, &[0]).0.is_empty());
+        // Offers again within the cooldown start nothing more; the node budget is 4 at once.
+        assert_eq!(birthday_case(true, NatType::Cone, false, public, direct, 1, &[0, 2000, 4000]).0.len(), 1);
+        assert_eq!(birthday_case(true, NatType::Cone, false, public, direct, 6, &[0]).0.len(), 4);
+    }
+
     /// NB-035: a failure reads as a sentence that names the symmetric side.
     #[test]
     fn failures_say_which_side_is_symmetric() {
