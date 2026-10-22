@@ -2423,7 +2423,8 @@ mod tests {
     fn birthday_punches_follow_the_nat_types() {
         let (public, private) = ("198.51.100.9:20000", "192.168.1.50:20000");
         let direct = Privacy::Direct;
-        let attempts = 4; // handshake sends in 6 s: at 0, 0.5, 1.5 and 3.5 s
+        // Handshake sends in 6 s: at 0, 0.5, 1.5 and 3.5 s.
+        let attempts = 4;
         // Behind a cone, facing a random-port symmetric NAT: spray its IP, no sockets.
         let (b, sent, _) = birthday_case(false, NatType::Symmetric, false, public, direct, 1, &[0]);
         assert!(b.is_empty());

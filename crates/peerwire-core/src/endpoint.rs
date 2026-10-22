@@ -841,8 +841,8 @@ impl<A: Address> Endpoint<A> {
         let Some(&idx) = self.peers.get(peer).or_else(|| self.dialing.get(peer)) else { return };
         let Some(base_port) = addr.to_socket_addr().map(|s| s.port()) else { return };
         let start = self.rng.next_u32() % SPRAY_RANGE;
-        let mut stride = self.rng.next_u32() % SPRAY_RANGE | 1;
-        while stride % 3 == 0 || stride % 7 == 0 {
+        let mut stride = (self.rng.next_u32() % SPRAY_RANGE) | 1;
+        while stride.is_multiple_of(3) || stride.is_multiple_of(7) {
             stride = (stride + 2) % SPRAY_RANGE; // 64512 = 2^10 * 3^2 * 7
         }
         let relay_only = self.relay_only;
