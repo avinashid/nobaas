@@ -451,15 +451,24 @@ const bdayIce = () => (params.get('signal') === 'local' ? [] : PROBE_STUN);
 // This device's own public IPv4 (from the network probe), for the hard side's answer.
 const myProbedV4 = () => (myNet?.srflx ?? []).map((c) => c.address).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a)) ?? null;
 
-// Which side each peer plays: the symmetric NAT is "hard" (opens the fleet), the other
-// is "easy" (sprays). With neither symmetric (or unknown), the larger id is hard, so
-// both sides agree; two symmetric NATs can't be helped by this.
-function punchRoles(peer) {
+// Which side each peer plays: the symmetric NAT is "hard" (opens the fleet), the
+// cone is "easy" (sprays). The STUN "cone-like" reading is only about mapping, not
+// filtering, and mobile CGNAT often reads cone-like but is really symmetric, so when
+// neither is reported symmetric we fall back to hints: the cellular side is the likely
+// symmetric one; else the larger id (so both sides agree). `want` ('hard'|'easy') from
+// a retry overrides the guess, since the first roles may have been backwards.
+function punchRoles(peer, want) {
   const sym = (n) => n === 'symmetric';
-  const mine = myNet?.nat, theirs = peerState(peer).presence?.nat;
-  if (sym(mine) && sym(theirs)) return { bad: 'both sides are behind a symmetric NAT: a browser birthday punch needs one cone side' };
-  const iAmHard = sym(mine) !== sym(theirs) ? sym(mine) : room.self > peer;
-  return { iAmHard, forced: !sym(mine) && !sym(theirs) };
+  const cell = (c) => /cellular/i.test(c ?? '');
+  const them = peerState(peer).presence ?? {};
+  const mine = myNet?.nat;
+  if (sym(mine) && sym(them.nat)) return { bad: 'both sides are behind a symmetric NAT: a browser birthday punch needs one cone side' };
+  let iAmHard, why;
+  if (want) { iAmHard = want === 'hard'; why = 'you chose this role'; }
+  else if (sym(mine) !== sym(them.nat)) { iAmHard = sym(mine); why = 'the symmetric side opens the fleet'; }
+  else if (cell(connInfo()) !== cell(them.conn)) { iAmHard = cell(connInfo()); why = 'the cellular side is the likely symmetric one'; }
+  else { iAmHard = room.self > peer; why = "neither NAT looks symmetric: a guess (press again to swap sides)"; }
+  return { iAmHard, why, forced: !sym(mine) && !sym(them.nat) };
 }
 
 function bdayStatus(peer, status, extra = {}) {
@@ -482,15 +491,18 @@ function closeBday(peer) {
 }
 
 // Start a punch with `peer` (the button, or an automatic try on a fallback route).
+// After a failed attempt, the button retries with the roles swapped, since the first
+// guess may have been backwards (mobile CGNAT reads cone-like but is often symmetric).
 async function tryBirthday(peer) {
   if (!room || !rtcAvailable()) return;
-  const p = peerState(peer);
-  if (p.bday?.status === 'running') return;
-  const roles = punchRoles(peer);
+  const prev = peerState(peer).bday;
+  if (prev?.status === 'running') return;
+  const want = prev?.status === 'failed' && prev.role ? (prev.role === 'hard' ? 'easy' : 'hard') : undefined;
+  const roles = punchRoles(peer, want);
   if (roles.bad) return bdayFail(peer, roles.bad);
   const role = roles.iAmHard ? 'hard' : 'easy';
   bdayStatus(peer, 'running', { role, startedAt: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
-  log('info', `birthday punch with ${nameOf(peer)}: starting as the ${role} side${roles.forced ? ' (neither NAT is symmetric: forced, for the test)' : ''}`);
+  log('info', `birthday punch with ${nameOf(peer)}: starting as the ${role} side (${roles.why})`);
   room.send({ t: 'bday', step: 'start', yourRole: roles.iAmHard ? 'easy' : 'hard' }, { to: peer });
   if (!roles.iAmHard) await beEasy(peer); // the hard side waits for the easy side's offer
 }
