@@ -2,70 +2,170 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Peerwire: Net Lab</title>
+<meta name="theme-color" content="#0b0d13">
+<title>Net Lab</title>
 <style>
-  :root { color-scheme: dark; --bg: #0f1117; --panel: #181b24; --line: #2a2f3d; --text: #e6e8ee; --dim: #8b91a3;
-    --red: #e5484d; --amber: #f5a524; --green: #46a758; --blue: #3e63dd; }
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d13; --panel: #12151e; --raised: #181c27; --sunk: #0e1118; --line: #242a38; --line2: #2f3647;
+    --text: #e7e9ef; --dim: #8a91a3; --faint: #5f6678;
+    --accent: #6e8cff; --accent-bg: #1d2647; --red: #ff6b6f; --red-bg: #3a1618; --green: #5bc46d; --green-bg: #15301c;
+    --amber: #f5b03a; --amber-bg: #3a2a0c; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; padding: 0 0 env(safe-area-inset-bottom); }
-  header { position: sticky; top: 0; z-index: 2; background: #0b0d12ee; backdrop-filter: blur(6px); border-bottom: 1px solid var(--line);
-    padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
-  header h1 { font-size: 16px; margin: 0; flex: 1 0 auto; }
-  .pill { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
-  main { max-width: 1180px; margin: 0 auto; padding: 12px; display: grid; gap: 12px; grid-template-columns: 1fr; }
-  @media (min-width: 900px) { main { grid-template-columns: 1.25fr 1fr; align-items: start; } .wide { grid-column: 1 / -1; } }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; min-width: 0; }
-  .card h2 { font-size: 12px; margin: 0 0 8px; color: var(--dim); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; display: flex; justify-content: space-between; gap: 8px; }
-  input, button, select { font: inherit; color: var(--text); background: #222634; border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px; min-height: 42px; }
-  button { cursor: pointer; }
-  button.primary { background: #23367a; border-color: var(--blue); }
-  button.small { min-height: 30px; padding: 3px 10px; font-size: 13px; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  body { padding: 0 0 env(safe-area-inset-bottom); }
+  button, input { font: inherit; color: var(--text); }
+  input { background: var(--raised); border: 1px solid var(--line2); border-radius: 8px; padding: 9px 11px; min-height: 42px; min-width: 0; outline: none; }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+  button { background: var(--raised); border: 1px solid var(--line2); border-radius: 8px; padding: 8px 13px; min-height: 40px; cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { border-color: var(--dim); }
   button:disabled { opacity: .45; cursor: default; }
-  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
-  .row input { flex: 1 1 180px; min-width: 0; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); border-color: var(--accent); }
+  button.ghost { background: transparent; border-color: transparent; color: var(--dim); }
+  button.ghost:hover:not(:disabled) { color: var(--text); border-color: var(--line2); }
+  button.small { min-height: 30px; padding: 3px 10px; font-size: 12.5px; }
+  button[aria-pressed="true"] { background: var(--accent-bg); border-color: #34437d; color: #c4cfff; }
+  code, .mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
   .hidden { display: none !important; }
   .dim { color: var(--dim); }
+  .faint { color: var(--faint); }
   .ok { color: var(--green); } .warn { color: var(--amber); } .bad { color: var(--red); }
-  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; word-break: break-all; }
-  dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0; font-size: 13.5px; }
-  dt { color: var(--dim); } dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
-  .peer { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: #141720; }
-  .peer .top { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; margin-bottom: 6px; }
-  .peer .name { font-weight: 600; }
-  .big { font-size: 20px; font-weight: 700; }
-  .spark { display: block; width: 100%; height: 34px; margin: 4px 0; }
-  .note { font-size: 13px; margin-top: 6px; }
-  #chatlog, #log { overflow: auto; background: #10131b; border-radius: 8px; padding: 8px; font-size: 13.5px; }
-  #chatlog { height: 220px; margin-bottom: 8px; }
-  #log { max-height: 340px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
-  #log div { padding: 1px 0; border-bottom: 1px solid #1a1e29; }
-  #log .warn { color: var(--amber); } #log .error { color: var(--red); }
-  .stats { display: flex; flex-wrap: wrap; gap: 8px 18px; }
-  .stats div span { display: block; font-size: 12px; color: var(--dim); }
-  details summary { cursor: pointer; color: var(--dim); font-size: 13px; margin-top: 4px; }
+
+  /* Header */
+  .top { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 10px 16px;
+    background: rgba(18, 21, 30, .92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; }
+  .brand .logo { width: 22px; height: 22px; border-radius: 7px; background: linear-gradient(135deg, var(--accent), #2fc4b2); }
+  .brand small { font-weight: 400; color: var(--dim); }
+  .roombar { display: flex; align-items: center; gap: 6px; background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 3px 4px 3px 10px; min-width: 0; max-width: 100%; }
+  .roombar .label { color: var(--dim); font-size: 12px; }
+  .roombar b { font-family: var(--mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .spacer { flex: 1; }
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 2px 9px; font-size: 12px; border: 1px solid var(--line2); background: var(--raised); color: var(--dim); white-space: nowrap; }
+  .pill.ok { color: #8fdc9c; border-color: #2b5a35; background: var(--green-bg); }
+  .pill.warn { color: #ffcf7a; border-color: #6a4c14; background: var(--amber-bg); }
+  .pill.bad { color: #ff9a9d; border-color: #6b2326; background: var(--red-bg); }
+  .pill.info { color: #a9baff; border-color: #34437d; background: var(--accent-bg); }
+  @media (max-width: 700px) { .top { padding: 8px 12px; } .brand small { display: none; } }
+
+  /* Layout */
+  main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 980px) { main { grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); align-items: start; } .wide { grid-column: 1 / -1; } }
+  @media (max-width: 700px) { main { padding: 10px; gap: 10px; } }
+  .col { display: grid; gap: 14px; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; min-width: 0; }
+  .card > h2 { font-size: 11px; margin: 0 0 10px; color: var(--faint); font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
+    display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 30px; }
+  .card > h2 .tools { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+  /* Join */
+  .join h1 { font-size: 20px; margin: 0 0 4px; }
+  .join .lead { color: var(--dim); margin: 0 0 6px; max-width: 760px; }
+  .joingrid { display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 820px) { .joingrid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); } }
+  label.field { display: block; font-size: 12px; color: var(--dim); margin: 12px 0 5px; font-weight: 600; letter-spacing: .02em; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .row > input { flex: 1 1 180px; }
+  .hint { font-size: 12px; color: var(--faint); margin-top: 6px; min-height: 18px; }
+  .hint b { color: var(--dim); font-family: var(--mono); font-weight: 500; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { font-family: var(--mono); font-size: 12px; min-height: 28px; padding: 3px 10px; border-radius: 999px; }
+  .quick { display: grid; gap: 8px; align-content: start; }
+  .quick .option { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--sunk); }
+  .quick .option span { color: var(--dim); font-size: 13px; flex: 1 1 160px; }
+  .msg { margin: 10px 0 0; font-size: 13px; color: var(--dim); min-height: 18px; }
+  details { margin-top: 10px; }
+  details summary { cursor: pointer; color: var(--dim); font-size: 13px; }
+  details[open] summary { margin-bottom: 8px; }
+  .note { font-size: 12.5px; margin-top: 6px; }
+
+  /* Overview tiles */
+  .tiles { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px; min-width: 0; }
+  .tile .k { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }
+  .tile .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile .s { font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
+  @media (max-width: 700px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; } .tile .v { font-size: 19px; } }
+
+  /* Peers */
+  .peer { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; background: var(--raised); }
+  .peer.gone { opacity: .6; }
+  .phead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .avatar { width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; font-weight: 700; color: #fff; flex: none; }
+  .pname { flex: 1 1 140px; min-width: 0; }
+  .pname b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pname .mono { color: var(--faint); font-size: 11.5px; }
+  .pbig { text-align: right; margin-left: auto; }
+  .pbig .big { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .pbig .dim { display: block; font-size: 11px; }
+  .spark { display: block; width: 100%; height: 40px; margin: 10px 0 6px; }
+  .metrics { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 6px; margin: 6px 0 10px; }
+  @media (max-width: 1180px) and (min-width: 980px), (max-width: 760px) { .metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  .metric { background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; }
+  .metric span { display: block; font-size: 10.5px; color: var(--faint); text-transform: uppercase; letter-spacing: .05em; font-weight: 700; }
+  .metric b { font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; margin: 0; font-size: 13px; }
+  dt { color: var(--dim); }
+  dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  @media (max-width: 480px) { dl { grid-template-columns: minmax(0, 1fr); gap: 0; } dt { margin-top: 6px; font-size: 12px; } }
+  .hintbox { margin-top: 10px; font-size: 12.5px; color: var(--dim); background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+
+  /* Chat and log */
+  #chatlog, #log { overflow: auto; background: var(--sunk); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+  #chatlog { height: 220px; margin-bottom: 8px; font-size: 13.5px; }
+  #chatlog > div { padding: 2px 0; }
+  #log { max-height: 360px; font-family: var(--mono); font-size: 12px; }
+  #log div { padding: 3px 0; border-bottom: 1px solid #191d28; overflow-wrap: anywhere; }
+  #log .warn { color: #ffcf7a; } #log .error { color: #ff9a9d; }
+  #log.only-warn div.info { display: none; }
+  .relay { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 4px 0; }
+  .relay .mono { flex: 1; min-width: 0; }
+  .ldot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); }
+  .ldot.ok { background: var(--green); } .ldot.bad { background: var(--red); }
 </style>
 
-<header>
-  <h1>Peerwire Net Lab</h1>
-  <span class="pill" id="h-room">not in a room</span>
-  <span class="pill" id="h-peers">0 linked</span>
-  <span class="pill" id="h-ping">ping –</span>
-  <span class="pill" id="h-warn">0 warnings</span>
+<header class="top">
+  <div class="brand"><span class="logo"></span>Net Lab <small>connection diagnostics · Peerwire</small></div>
+  <div id="roombar" class="roombar hidden">
+    <span class="label">Room</span><b id="h-room">not in a room</b>
+    <button class="small" id="share" title="Copy a link that opens this room">Copy link</button>
+    <button class="small ghost" id="leave">Leave</button>
+  </div>
+  <div class="spacer"></div>
+  <div class="pills"><span class="pill" id="h-peers">0 linked</span><span class="pill" id="h-ping">ping –</span><span class="pill" id="h-warn">0 warnings</span></div>
 </header>
 
 <main>
-  <section class="card wide" id="join">
-    <h2>Connect</h2>
-    <div class="row"><input id="name" placeholder="your name (shown to others)" maxlength="20" autocomplete="nickname"></div>
-    <div class="row">
-      <button class="primary" id="global">Join the global room</button>
-      <button id="create">Create a private room</button>
+  <section class="card wide join" id="join">
+    <h1>Connect to a room</h1>
+    <p class="lead">Everyone in a room links to everyone else, and every link is measured: ping, packet loss, the route it takes and how WebRTC made it.</p>
+    <div class="joingrid">
+      <form id="nameform" autocomplete="off">
+        <label class="field" for="name">Your name</label>
+        <div class="row"><input id="name" placeholder="shown to others, e.g. Avi's phone" maxlength="20" autocomplete="nickname"></div>
+        <label class="field" for="roomname">Room name</label>
+        <div class="row">
+          <input id="roomname" placeholder="any name, e.g. office test" maxlength="40" spellcheck="false" autocapitalize="off">
+          <button type="button" id="private" title="Add a random part so only people you share it with can find it">Make private</button>
+          <button type="submit" class="primary" id="joinname">Join room</button>
+        </div>
+        <div class="hint" id="roomhint"></div>
+        <div id="recentwrap" class="hidden"><div class="chips" id="recent"></div></div>
+      </form>
+      <div class="quick">
+        <label class="field">Or</label>
+        <div class="option"><button id="global">Global room</button><span>One room for everyone using Net Lab.</span></div>
+        <div class="option"><button id="create">New private room</button><span>A random room; share its link.</span></div>
+        <details><summary>Paste a private room link or key</summary>
+          <div class="row"><input id="key" placeholder="link or key" autocomplete="off"><button id="joinkey">Join</button></div>
+        </details>
+      </div>
     </div>
-    <div class="row"><input id="key" placeholder="private room key or link" autocomplete="off"><button id="joinkey">Join private</button></div>
-    <p class="dim note">The <b>global room</b> is one shared room: anyone who opens Net Lab and joins it sees you, and you see them.
-      A <b>private room</b> has a random key: only people you send the link to can join. Either way, every member tries to link to every other member.</p>
-    <p class="note" id="joinmsg"></p>
-    <details><summary>phone hotspot (advanced)</summary>
+    <p class="msg" id="joinmsg"></p>
+    <details><summary>Phone hotspot (advanced)</summary>
       <div class="row"><input id="gw" placeholder="phone's hotspot address, e.g. 10.129.132.170" autocomplete="off" inputmode="decimal"></div>
       <p class="dim note">Only on the device that uses a phone's hotspot. Most phones choose a new address each time; enter this device's <b>default gateway</b>
         (Linux <code>ip route show default</code>, Windows <code>ipconfig</code>, Mac <code>route -n get default</code>) and the phone can link directly instead of through relays.</p>
@@ -73,32 +173,33 @@
     </details>
   </section>
 
-  <section class="card wide hidden" id="roomcard">
-    <h2><span>Room</span><span><button class="small" id="share">Share link</button> <button class="small" id="leave">Leave</button></span></h2>
-    <div class="stats" id="roomstats"></div>
-    <div class="note" id="relays"></div>
-  </section>
+  <section class="wide hidden" id="roomcard"><div class="tiles" id="roomstats"></div></section>
 
   <section class="card" id="peerscard">
-    <h2><span>Peers</span><span class="dim" id="peercount"></span></h2>
+    <h2><span>Peers</span><span class="dim" id="peercount" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
     <div id="peers"><p class="dim">Join a room to see peers.</p></div>
   </section>
 
-  <div style="display: grid; gap: 12px; min-width: 0">
+  <div class="col">
     <section class="card">
-      <h2><span>My network</span><button class="small" id="reprobe">Re-test</button></h2>
+      <h2><span>This device</span><span class="tools"><button class="small" id="reprobe">Re-test</button></span></h2>
       <div id="mynet" class="dim">testing…</div>
     </section>
-
+    <section class="card hidden" id="sigcard">
+      <h2>Signalling</h2>
+      <div id="relays"></div>
+    </section>
     <section class="card">
       <h2>Chat</h2>
       <div id="chatlog"><div class="dim">Messages go to everyone in the room.</div></div>
-      <form class="row" id="chatform" style="margin: 0"><input id="chatin" placeholder="message" maxlength="500" autocomplete="off"><button id="chatsend" disabled>Send</button></form>
+      <form class="row" id="chatform" style="margin: 0"><input id="chatin" placeholder="Message" maxlength="500" autocomplete="off"><button id="chatsend" disabled>Send</button></form>
     </section>
   </div>
 
   <section class="card wide">
-    <h2><span>Event log</span><span><button class="small" id="copy">Copy report</button> <button class="small" id="download">Download</button></span></h2>
+    <h2><span>Event log</span><span class="tools">
+      <button class="small" id="onlywarn" aria-pressed="false">Warnings only</button>
+      <button class="small" id="copy">Copy report</button><button class="small" id="download">Download</button></span></h2>
     <div id="log"></div>
   </section>
 </main>
