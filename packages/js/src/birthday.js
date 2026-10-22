@@ -72,3 +72,83 @@ export function sprayCandidates(ip, ports, sdpMid = '0') {
     sdpMLineIndex: 0,
   }));
 }
+
+// A negotiated, unreliable datagram channel (id 0), the same on both sides, so no
+// in-band negotiation is needed and either side's channel opening means the link is up.
+function dataChannel(pc) {
+  const dc = pc.createDataChannel('peerwire', { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 });
+  dc.binaryType = 'arraybuffer';
+  return dc;
+}
+
+// Strips every ICE candidate line from an SDP: the hard side's answer advertises no
+// address, so the easy side reaches it only through the sprayed guesses (as a real
+// cone NAT only lets in a port it has sprayed), and the hard side advertises none, so
+// it cannot connect on its own and the spray is what completes the link.
+export function stripCandidates(sdp) {
+  return sdp.replace(/^a=candidate:.*(\r?\n)/gm, '');
+}
+
+// The host UDP port an RTCPeerConnection gathered on, from its local description
+// (its socket's port, which the far side's spray must hit). `null` until it gathers.
+function hostPort(pc) {
+  const m = /^a=candidate:\S+ \d+ udp \d+ (\d+\.\d+\.\d+\.\d+) (\d+) typ host/m.exec(pc.localDescription?.sdp ?? '');
+  return m ? Number(m[2]) : null;
+}
+
+// The hard side (behind a symmetric NAT): opens `size` connections that share `cert`
+// and `creds` (so the easy side answers them all with one answer), each answering the
+// easy side's one `offerSdp`. Returns the one shared answer to send back (no
+// candidates), the connections, a `ports()` reader for their sockets (which the easy
+// side's spray must hit; in the real world they are the NAT's mappings, discovered by
+// the punch, not shared), and `done`: the first connection whose channel opens, with
+// the losers closed. `size` connections is heavy — the caller decides when to run it.
+export async function openFleet({ RTCPeerConnection, cert, creds, offerSdp, size = FLEET_SIZE }) {
+  const conns = Array.from({ length: size }, () => {
+    const pc = new RTCPeerConnection({ certificates: [cert] });
+    return { pc, dc: dataChannel(pc) };
+  });
+  let answer = null;
+  await Promise.all(conns.map(async ({ pc }) => {
+    await pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+    const ans = await pc.createAnswer();
+    const munged = shareCredentials(ans.sdp, creds); // same ufrag/pwd on every connection
+    await pc.setLocalDescription({ type: 'answer', sdp: munged });
+    answer ??= munged;
+  }));
+  let settled = false;
+  const done = new Promise((resolve) => {
+    for (const c of conns) {
+      c.dc.onopen = () => {
+        if (settled) return;
+        settled = true;
+        for (const o of conns) if (o !== c) o.pc.close(); // keep the winner, drop the rest
+        resolve(c);
+      };
+    }
+  });
+  return { answerSdp: stripCandidates(answer), conns, done, ports: () => conns.map((c) => hostPort(c.pc)).filter((p) => p != null) };
+}
+
+// The easy side (behind a cone that filters by port): one connection that offers to
+// the hard side, then, given the hard side's one shared answer, sprays the hard side's
+// `hardIp` at the guessed `ports`. A sprayed port that hits a hard socket completes the
+// link: the hard side responds from that socket, and a cone only now lets it in,
+// because the spray is the packet it just sent there. Returns the offer to send,
+// `applyAnswer(sdp, hardIp, ports)`, and `done` (its own channel opening).
+//
+// The offer carries no candidates, so on a test loopback (no cone filter) the hard
+// side cannot reach the easy side on its own and the spray is the only thing that
+// connects; in the real world the easy side's address reaches the hard side out of
+// band (its room offer) and the cone is what blocks the hard side until the spray.
+export async function openSpray({ RTCPeerConnection }) {
+  const pc = new RTCPeerConnection();
+  const dc = dataChannel(pc);
+  await pc.setLocalDescription(await pc.createOffer());
+  const done = new Promise((resolve) => { dc.onopen = () => resolve({ pc, dc }); });
+  const applyAnswer = async (answerSdp, hardIp, ports) => {
+    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    for (const c of sprayCandidates(hardIp, ports)) await pc.addIceCandidate(c).catch(() => {});
+  };
+  return { offerSdp: stripCandidates(pc.localDescription.sdp), pc, dc, done, applyAnswer };
+}
