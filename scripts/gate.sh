@@ -91,6 +91,7 @@ step "node room leave" node packages/js/test/room_leave.mjs
 step "node room fallback" node packages/js/test/room_fallback.mjs
 step "node nat prediction" node packages/js/test/nat_predict.mjs
 step "node late ice" node packages/js/test/late_ice.mjs
+step "node birthday primitives" node packages/js/test/birthday.mjs
 
 if [ $quick = 1 ]; then
   skip "browser" "--quick"
