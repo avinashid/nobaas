@@ -93,7 +93,9 @@ can, by the birthday paradox, as Tailscale does:
   from it (its route), everything else from the main socket. Sockets that are no route close after 10 s, a route
   once it has heard nothing for 60 s. At most 512 are open at once, and while any are, `Node::next_timeout` is at
   most 5 ms, because a host waiting on `Node::socket` can't see them.
-- **Limits.** One try per peer per 5 minutes; per node, a burst of 4, then one per 30 s.
+- **Limits.** One try per peer per 5 minutes; per node, a burst of 4, then one per 30 s. The spray aims at the IP
+  STUN saw, so it assumes the symmetric NAT maps every socket to that one IP (RFC 4787 "paired" pooling); a
+  carrier NAT that hands each mapping an IP from a pool defeats it. Not yet measured on real networks.
 - **Cost.** The symmetric side: 256 sockets for 10 s and 256 packets of about 130 bytes (the HS1), about 33 KB.
   The cone side: up to 2048 handshakes or punches to ports of one IP, about 270 KB over 3.8 s, about 32 KB on
   average. Its own router keeps a connection-tracking entry per probe for a while; a router with a small table
