@@ -137,18 +137,30 @@ export async function openFleet({ RTCPeerConnection, cert, creds, offerSdp, size
 // because the spray is the packet it just sent there. Returns the offer to send,
 // `applyAnswer(sdp, hardIp, ports)`, and `done` (its own channel opening).
 //
-// The offer carries no candidates, so on a test loopback (no cone filter) the hard
-// side cannot reach the easy side on its own and the spray is the only thing that
-// connects; in the real world the easy side's address reaches the hard side out of
-// band (its room offer) and the cone is what blocks the hard side until the spray.
-export async function openSpray({ RTCPeerConnection }) {
-  const pc = new RTCPeerConnection();
+// With `advertise` (the default, the real world), the offer carries the easy side's
+// own candidates — its public (STUN) address — so the hard side's fleet sends checks
+// to it and opens its NAT mappings; the cone then blocks the hard side until the spray
+// lands on a mapping. `iceServers` gives the STUN servers to gather that address.
+// With `advertise` false (the loopback test), the offer carries no candidates, so the
+// hard side cannot reach the easy side on its own and the spray is the only path.
+export async function openSpray({ RTCPeerConnection, iceServers = [], advertise = true, gatherMs = 3000 }) {
+  const pc = new RTCPeerConnection({ iceServers });
   const dc = dataChannel(pc);
   await pc.setLocalDescription(await pc.createOffer());
+  // Advertising: wait for a public (srflx) candidate, or gathering to finish, or the cap.
+  if (advertise && pc.iceGatheringState !== 'complete') {
+    await new Promise((resolve) => {
+      const done = () => { clearTimeout(t); pc.removeEventListener('icecandidate', onCand); resolve(); };
+      const onCand = (e) => { if (!e.candidate || / typ srflx/.test(e.candidate.candidate)) done(); };
+      const t = setTimeout(done, gatherMs);
+      pc.addEventListener('icecandidate', onCand);
+    });
+  }
+  const offerSdp = advertise ? pc.localDescription.sdp : stripCandidates(pc.localDescription.sdp);
   const done = new Promise((resolve) => { dc.onopen = () => resolve({ pc, dc }); });
   const applyAnswer = async (answerSdp, hardIp, ports) => {
     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
     for (const c of sprayCandidates(hardIp, ports)) await pc.addIceCandidate(c).catch(() => {});
   };
-  return { offerSdp: stripCandidates(pc.localDescription.sdp), pc, dc, done, applyAnswer };
+  return { offerSdp, pc, dc, done, applyAnswer };
 }

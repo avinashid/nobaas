@@ -48,7 +48,7 @@ try {
     {
       const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
       const creds = randomCredentials();
-      const easy = await openSpray({ RTCPeerConnection });
+      const easy = await openSpray({ RTCPeerConnection, advertise: false });
       const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: easy.offerSdp, size: fleet });
       // Every connection in the fleet answered with the one shared ufrag and one fingerprint.
       const sdps = hard.conns.map((c) => c.pc.localDescription.sdp);
@@ -85,7 +85,7 @@ try {
     {
       const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
       const creds = randomCredentials();
-      const easy = await openSpray({ RTCPeerConnection });
+      const easy = await openSpray({ RTCPeerConnection, advertise: false });
       const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: easy.offerSdp, size: fleet });
       await until(() => hard.ports().length >= 1);
       // Spray only low decoy ports; the fleet binds high ports, so none is hit.

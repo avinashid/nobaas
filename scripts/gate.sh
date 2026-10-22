@@ -101,6 +101,7 @@ if [ $quick = 1 ]; then
   skip "webrtc signals" "--quick"
   skip "ice restart" "--quick"
   skip "birthday fleet" "--quick"
+  skip "netlab birthday" "--quick"
   skip "tab close" "--quick"
   skip "netlab" "--quick"
   skip "netlab rooms" "--quick"
@@ -112,6 +113,7 @@ else
   step "webrtc signals" node packages/js/test/webrtc_signals.mjs
   step "ice restart" node packages/js/test/ice_restart.mjs
   step "birthday fleet" node packages/js/test/birthday_fleet.mjs 32
+  step "netlab birthday" node packages/js/test/netlab_birthday.mjs
   step "tab close" node packages/js/test/leave.mjs --runs=5 --crash=0
   step "netlab" env RTC_OFF=2 node packages/js/test/netlab.mjs 3
   step "netlab rooms" node packages/js/test/netlab_rooms.mjs

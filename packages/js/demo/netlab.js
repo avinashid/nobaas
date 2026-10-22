@@ -21,6 +21,7 @@
 //   #key=…             joins that private room
 
 import { joinRoom, randomRoomId, DEFAULT_RELAYS } from '../src/index.js';
+import { openFleet, openSpray, randomCredentials, sprayPorts, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
 
 const APP_ID = 'peerwire-netlab';
 const GLOBAL_ROOM = 'global-v1';
@@ -319,7 +320,7 @@ function peerState(peer) {
   let p = peers.get(peer);
   if (!p) {
     p = { id: peer, heardAt: null, rtcOpenAt: null, rtcFailedAt: null, joinedAt: null, leftAt: null, leaveReason: null, presence: null,
-      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set() };
+      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set(), bday: null };
     peers.set(peer, p);
   }
   return p;
@@ -430,7 +431,141 @@ function onMessage(data, peer, info) {
     if (p.samples.length > SAMPLES) p.samples.shift();
   } else if (data.t === 'chat' && typeof data.text === 'string') {
     addChat(nameOf(peer), clip(data.text, 500), routeLabel(room.route(peer)));
+  } else if (data.t === 'bday' && typeof data.step === 'string') {
+    onBirthday(peer, data).catch((e) => bdayFail(peer, `error: ${e.message}`));
   }
+}
+
+// ---------- birthday punch (diagnostic) ----------
+//
+// Runs the browser birthday punch (src/birthday.js) between this tab and a peer, over
+// the room's own signalling, and reports whether a direct WebRTC data channel forms
+// across their real NATs. This is a measurement: the channel it makes is not used for
+// room traffic (that still needs the core's fallback→direct upgrade); it answers "can
+// these two browsers punch directly?". The symmetric-NAT side opens a fleet of
+// connections sharing one certificate and credentials; the cone side sprays its IP.
+
+const BDAY_TIMEOUT_MS = 70000;
+const rtcAvailable = () => params.get('rtc') !== 'off' && typeof RTCPeerConnection === 'function';
+const bdayIce = () => (params.get('signal') === 'local' ? [] : PROBE_STUN);
+// This device's own public IPv4 (from the network probe), for the hard side's answer.
+const myProbedV4 = () => (myNet?.srflx ?? []).map((c) => c.address).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a)) ?? null;
+
+// Which side each peer plays: the symmetric NAT is "hard" (opens the fleet), the other
+// is "easy" (sprays). With neither symmetric (or unknown), the larger id is hard, so
+// both sides agree; two symmetric NATs can't be helped by this.
+function punchRoles(peer) {
+  const sym = (n) => n === 'symmetric';
+  const mine = myNet?.nat, theirs = peerState(peer).presence?.nat;
+  if (sym(mine) && sym(theirs)) return { bad: 'both sides are behind a symmetric NAT: a browser birthday punch needs one cone side' };
+  const iAmHard = sym(mine) !== sym(theirs) ? sym(mine) : room.self > peer;
+  return { iAmHard, forced: !sym(mine) && !sym(theirs) };
+}
+
+function bdayStatus(peer, status, extra = {}) {
+  const p = peerState(peer);
+  p.bday = { ...(p.bday ?? {}), status, at: now(), ...extra };
+  render();
+}
+function bdayFail(peer, why) {
+  closeBday(peer);
+  bdayStatus(peer, 'failed', { why });
+  log('warn', `birthday punch with ${nameOf(peer)}: ${why}`);
+}
+function closeBday(peer) {
+  const b = peerState(peer).bday;
+  if (!b?.ctx) return;
+  try { b.ctx.easy?.pc.close(); } catch { /* already closed */ }
+  for (const c of b.ctx.hard?.conns ?? []) try { c.pc.close(); } catch { /* already closed */ }
+  clearTimeout(b.ctx.timer);
+  b.ctx = null;
+}
+
+// Start a punch with `peer` (the button, or an automatic try on a fallback route).
+async function tryBirthday(peer) {
+  if (!room || !rtcAvailable()) return;
+  const p = peerState(peer);
+  if (p.bday?.status === 'running') return;
+  const roles = punchRoles(peer);
+  if (roles.bad) return bdayFail(peer, roles.bad);
+  const role = roles.iAmHard ? 'hard' : 'easy';
+  bdayStatus(peer, 'running', { role, startedAt: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
+  log('info', `birthday punch with ${nameOf(peer)}: starting as the ${role} side${roles.forced ? ' (neither NAT is symmetric: forced, for the test)' : ''}`);
+  room.send({ t: 'bday', step: 'start', yourRole: roles.iAmHard ? 'easy' : 'hard' }, { to: peer });
+  if (!roles.iAmHard) await beEasy(peer); // the hard side waits for the easy side's offer
+}
+
+async function onBirthday(peer, data) {
+  const p = peerState(peer);
+  if (data.step === 'start') {
+    if (p.bday?.status === 'running') return; // we also started: our own role stands
+    if (!rtcAvailable()) return;
+    const role = data.yourRole === 'hard' ? 'hard' : 'easy';
+    bdayStatus(peer, 'running', { role, startedAt: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
+    log('info', `birthday punch with ${nameOf(peer)}: ${nameOf(peer)} asked, we are the ${role} side`);
+    if (role === 'easy') await beEasy(peer);
+    return;
+  }
+  const b = p.bday;
+  if (!b || b.status !== 'running' || !b.ctx) return;
+  if (data.step === 'offer' && b.role === 'hard' && typeof data.sdp === 'string') {
+    // The hard side: open the fleet answering the easy side's one offer, send back one answer + our IP.
+    const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+    const creds = randomCredentials();
+    const size = Number(params.get('fleet')) || FLEET_SIZE;
+    const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size });
+    b.ctx.hard = hard;
+    log('info', `birthday punch with ${nameOf(peer)}: opened ${hard.conns.length} sockets, answering`);
+    room.send({ t: 'bday', step: 'answer', sdp: hard.answerSdp, ip: myProbedV4() }, { to: peer });
+    hard.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
+  } else if (data.step === 'answer' && b.role === 'easy' && typeof data.sdp === 'string') {
+    const ip = typeof data.ip === 'string' ? data.ip : null;
+    if (!ip) return bdayFail(peer, 'the peer gave no public IPv4 to spray');
+    const ports = sprayPorts(SPRAY_PORTS);
+    log('info', `birthday punch with ${nameOf(peer)}: spraying ${ports.length} ports at ${ip}`);
+    await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
+  } else if (data.step === 'abort') {
+    bdayFail(peer, `the peer stopped: ${clip(data.why, 80)}`);
+  }
+}
+
+// The easy side: one connection, offer to the hard side, spray on its answer.
+async function beEasy(peer) {
+  const b = peerState(peer).bday;
+  const easy = await openSpray({ RTCPeerConnection, iceServers: bdayIce() });
+  b.ctx.easy = easy;
+  room.send({ t: 'bday', step: 'offer', sdp: easy.offerSdp }, { to: peer });
+  easy.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
+}
+
+function bdayWon(peer, pc) {
+  const b = peerState(peer).bday;
+  if (!b || b.status !== 'running') return;
+  const ms = Math.round(now() - b.startedAt);
+  // Read the pair that won (candidate types, family) for the report.
+  pc.getStats().then((stats) => {
+    let pair = null;
+    stats.forEach((r) => { if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded')) pair = r; });
+    const l = pair && stats.get(pair.localCandidateId), r = pair && stats.get(pair.remoteCandidateId);
+    const path = l && r ? `${l.candidateType}↔${r.candidateType}` : '';
+    bdayStatus(peer, 'linked', { ms, path });
+  }).catch(() => bdayStatus(peer, 'linked', { ms }));
+  log('info', `birthday punch with ${nameOf(peer)}: direct channel formed in ${secs(ms)}`);
+  // It is a measurement, not a room link: close it after a moment so sockets don't linger.
+  setTimeout(() => closeBday(peer), 1500);
+}
+
+// The birthday-punch control + result in a peer card.
+function bdayRow(p) {
+  const b = p.bday;
+  const roles = myNet ? punchRoles(p.id) : null;
+  let label = 'Birthday punch', note = 'test a direct link across NATs', cls = 'faint';
+  if (b?.status === 'running') { label = 'Punching…'; note = `running as the ${b.role} side…`; cls = 'warn'; }
+  else if (b?.status === 'linked') { label = 'Punch again'; note = `direct channel in ${secs(b.ms)}${b.path ? ` · ${esc(b.path)}` : ''}`; cls = 'ok'; }
+  else if (b?.status === 'failed') { label = 'Try again'; note = b.why; cls = 'bad'; }
+  else if (roles?.bad) { note = roles.bad; }
+  const disabled = b?.status === 'running' || (!b && roles?.bad);
+  return `<div class="bdayrow"><button class="small" data-bday="${esc(p.id)}"${disabled ? ' disabled' : ''}>${label}</button><span class="${cls}">${esc(note)}</span></div>`;
 }
 
 // ---------- pinging ----------
@@ -806,6 +941,7 @@ async function render() {
           <dt>Their network</dt><dd>NAT <b>${esc(clip(pres.nat, 20) || '?')}</b> · IPv6 ${pres.v6 ? 'yes' : 'no'}${pres.conn && pres.conn !== 'unknown' ? ` · ${esc(clip(pres.conn, 40))}` : ''}</dd>
         </dl>
         ${hint ? `<div class="hintbox">${esc(hint)}</div>` : ''}
+        ${isLinked && rtcAvailable() ? bdayRow(p) : ''}
         ${p.pairs.size ? `<details data-d="pairs-${esc(p.id)}"><summary>Candidate pairs (${p.pairs.size})</summary><div class="mono">${[...p.pairs.values()].map((q) => `${esc(q.pair)} ${esc(q.state)}: sent ${q.requestsSent}, answered ${q.responsesReceived}, received ${q.requestsReceived}`).join('<br>')}</div></details>` : ''}
         ${p.routeLog.length > 1 ? `<details data-d="routes-${esc(p.id)}"><summary>Route history (${p.routeLog.length})</summary><div class="mono">${p.routeLog.map((x) => `${secs(x.at)}: ${esc(x.route)}`).join('<br>')}</div></details>` : ''}
       </div>`);
@@ -954,6 +1090,11 @@ $('share').onclick = async () => {
 $('reprobe').onclick = reprobe;
 $('copy').onclick = copyReport;
 $('download').onclick = downloadReport;
+// The peer cards are rebuilt each second; one delegated listener on the container survives.
+$('peers').addEventListener('click', (e) => {
+  const id = e.target.closest('[data-bday]')?.dataset.bday;
+  if (id) tryBirthday(id);
+});
 addEventListener('pagehide', () => room?.leave());
 
 // For tests and the console.
@@ -967,6 +1108,8 @@ window.netlab = {
   hotspotCandidates,
   joinGlobal: () => enter('global'),
   joinNamed: (name) => enter('named', roomIdOf(name)),
+  punch: (i = 0) => tryBirthday(room.peers[i]),
+  birthday: () => room?.peers.map((id) => ({ id, name: nameOf(id), ...(peerState(id).bday ?? { status: null }) })).map(({ ctx, ...b }) => b) ?? [],
   get room() { return roomKind && { kind: roomKind, label: roomLabel(), link: roomLink() }; },
   roomIdOf,
   joinPrivate: (key) => enter('private', key ?? randomRoomId()),
