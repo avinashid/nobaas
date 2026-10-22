@@ -90,6 +90,7 @@ step "node fuzz" node packages/js/test/fuzz.mjs
 step "node room leave" node packages/js/test/room_leave.mjs
 step "node room fallback" node packages/js/test/room_fallback.mjs
 step "node nat prediction" node packages/js/test/nat_predict.mjs
+step "node late ice" node packages/js/test/late_ice.mjs
 
 if [ $quick = 1 ]; then
   skip "browser" "--quick"

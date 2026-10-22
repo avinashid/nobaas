@@ -35,11 +35,15 @@ const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
 export const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
 // Without trickle, an offer or answer goes once ICE gathering is complete, or
 // GATHER_SETTLE_MS after the first public (srflx/relay) candidate, or at
-// GATHER_MAX_MS. Candidates found later go in one 'ice-batch', LATE_ICE_MS after
-// the description at the latest.
+// GATHER_MAX_MS. Candidates found later go in an 'ice-batch', the first LATE_ICE_MS
+// after the description at the latest; a candidate found after that batch (a slow
+// public address on a device that gathered mDNS first) is sent in a further batch,
+// LATE_FLUSH_MS after it arrives, up to MAX_LATE candidates in all.
 export const GATHER_SETTLE_MS = 300;
 export const GATHER_MAX_MS = 2000;
 export const LATE_ICE_MS = 3000;
+export const LATE_FLUSH_MS = 400;
+const MAX_LATE = 64;
 // Signalling relays drop messages: an offer with no answer is sent again at these
 // times after the first; an offer seen twice is answered with the same answer.
 export const OFFER_RESEND_MS = [3000, 6000];
@@ -218,9 +222,9 @@ export class WebRtcTransport {
     dc.binaryType = 'arraybuffer';
     // Without trickle: `described` once the offer or answer is out, `late` holds the
     // candidates found after it, `held` the peer's that came before its description.
-    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, failed: false, described: false, late: [], lateSent: false, lateTimer: null,
+    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, failed: false, described: false, late: [], lateTimer: null,
       held: [], offerMsg: null, offerSdp: null, answerMsg: null, resends: [],
-      opened: false, restarts: 0, restartTimer: null, guessed: null };
+      lateSent: 0, opened: false, restarts: 0, restartTimer: null, guessed: null };
     dc.onopen = () => {
       clearTimeout(l.timer);
       l.opened = true;
@@ -240,8 +244,13 @@ export class WebRtcTransport {
       if (c && this.privacy !== 'direct' && / typ host( |$)/.test(c.candidate)) return;
       if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: c.toJSON() }));
       if (!l.described) return; // still to go in the description
-      if (!c) this.sendLate(l); // gathering is complete
-      else if (l.late.length < MAX_ICE_BATCH) l.late.push(c.toJSON());
+      if (!c) return void this.sendLate(l); // gathering complete: send what is buffered
+      if (l.lateSent + l.late.length >= MAX_LATE) return; // bounded
+      l.late.push(c.toJSON());
+      // The first batch waits for gathering to settle (describe()'s LATE_ICE_MS timer);
+      // a candidate found after that batch is sent LATE_FLUSH_MS later, so a slow public
+      // address (a device that gathered mDNS first) still reaches the peer.
+      if (l.lateSent > 0 && !l.lateTimer) l.lateTimer = setTimeout(() => this.sendLate(l), LATE_FLUSH_MS);
     };
     if (typeof pc.addEventListener === 'function') {
       pc.addEventListener('iceconnectionstatechange', () => {
@@ -323,7 +332,7 @@ export class WebRtcTransport {
     } catch {
       return; // mid-negotiation or closed: the retry timer tries again
     }
-    Object.assign(l, { described: false, late: [], lateSent: false });
+    Object.assign(l, { described: false, late: [], lateSent: 0 });
     clearTimeout(l.lateTimer);
     await this.gathered(l.pc);
     const p = this.offerProof ? await this.offerProof.sign(l.peer) : undefined;
@@ -412,14 +421,20 @@ export class WebRtcTransport {
     return d;
   }
 
-  // Sends the candidates found after the description, once.
+  // Sends the late candidates buffered in `l.late` as an 'ice-batch', clearing it.
+  // Called when gathering completes, when the first batch is due (LATE_ICE_MS), and
+  // on the debounce after a later candidate, so candidates that arrive after the
+  // first batch are sent too, not lost. At most MAX_ICE_BATCH per batch (the receiver
+  // refuses more); the rest go next tick.
   sendLate(l) {
     clearTimeout(l.lateTimer);
-    if (l.lateSent || this.links.get(l.handle) !== l) return;
-    l.lateSent = true;
-    if (!l.late.length) return;
-    this.signal(l.peer, { kind: 'ice-batch', c: l.late, ...this.prediction(l, l.late) });
-    this.tr(l.peer, 'ice-batch-sent', candidateSummary(l.late.map((c) => `a=${c.candidate}`).join('\n')));
+    l.lateTimer = null;
+    if (this.links.get(l.handle) !== l || !l.late.length) return;
+    const batch = l.late.splice(0, MAX_ICE_BATCH);
+    l.lateSent += batch.length;
+    this.signal(l.peer, { kind: 'ice-batch', c: batch, ...this.prediction(l, batch) });
+    this.tr(l.peer, 'ice-batch-sent', { ...candidateSummary(batch.map((c) => `a=${c.candidate}`).join('\n')), more: l.late.length > 0 });
+    if (l.late.length) l.lateTimer = setTimeout(() => this.sendLate(l), 0);
   }
 
   // Opens a DataChannel to `peer` and, once open, runs the Peerwire handshake.
@@ -491,7 +506,7 @@ export class WebRtcTransport {
       }
       this.tr(from, 'offer-received', { ...candidateSummary(sdp), restart: !fresh });
       await this.addHeld(l);
-      if (!fresh) Object.assign(l, { described: false, late: [], lateSent: false });
+      if (!fresh) Object.assign(l, { described: false, late: [], lateSent: 0 });
       await this.gathered(l.pc);
       if (this.links.get(l.handle) !== l) return; // dropped meanwhile
       l.answerMsg = { kind: 'answer', sdp: this.describe(l), ...this.prediction(l) };

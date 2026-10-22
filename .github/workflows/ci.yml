@@ -67,6 +67,7 @@ jobs:
       - run: node packages/js/test/fuzz.mjs
       - run: node packages/js/test/room_leave.mjs
       - run: node packages/js/test/nat_predict.mjs
+      - run: node packages/js/test/late_ice.mjs
 
   docker:
     name: docker build
