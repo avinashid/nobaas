@@ -806,11 +806,15 @@ async function render() {
           <dt>Their network</dt><dd>NAT <b>${esc(clip(pres.nat, 20) || '?')}</b> · IPv6 ${pres.v6 ? 'yes' : 'no'}${pres.conn && pres.conn !== 'unknown' ? ` · ${esc(clip(pres.conn, 40))}` : ''}</dd>
         </dl>
         ${hint ? `<div class="hintbox">${esc(hint)}</div>` : ''}
-        ${p.pairs.size ? `<details><summary>Candidate pairs (${p.pairs.size})</summary><div class="mono">${[...p.pairs.values()].map((q) => `${esc(q.pair)} ${esc(q.state)}: sent ${q.requestsSent}, answered ${q.responsesReceived}, received ${q.requestsReceived}`).join('<br>')}</div></details>` : ''}
-        ${p.routeLog.length > 1 ? `<details><summary>Route history (${p.routeLog.length})</summary><div class="mono">${p.routeLog.map((x) => `${secs(x.at)}: ${esc(x.route)}`).join('<br>')}</div></details>` : ''}
+        ${p.pairs.size ? `<details data-d="pairs-${esc(p.id)}"><summary>Candidate pairs (${p.pairs.size})</summary><div class="mono">${[...p.pairs.values()].map((q) => `${esc(q.pair)} ${esc(q.state)}: sent ${q.requestsSent}, answered ${q.responsesReceived}, received ${q.requestsReceived}`).join('<br>')}</div></details>` : ''}
+        ${p.routeLog.length > 1 ? `<details data-d="routes-${esc(p.id)}"><summary>Route history (${p.routeLog.length})</summary><div class="mono">${p.routeLog.map((x) => `${secs(x.at)}: ${esc(x.route)}`).join('<br>')}</div></details>` : ''}
       </div>`);
     }
+    // render() rebuilds this block every second, which would collapse a <details>
+    // (candidate pairs, route history) the user opened: carry the open ones across.
+    const open = new Set([...$('peers').querySelectorAll('details[open]')].map((d) => d.dataset.d));
     $('peers').innerHTML = cards.join('') || `<p class="dim">No peers yet. ${roomKind === 'global' ? 'Anyone who opens Net Lab and joins the global room shows up here.' : 'Send the room link (Copy link, at the top) to someone, or have them type the same room name.'}</p>`;
+    for (const d of $('peers').querySelectorAll('details')) if (open.has(d.dataset.d)) d.open = true;
   } finally {
     rendering = false;
   }

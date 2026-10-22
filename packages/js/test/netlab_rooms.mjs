@@ -67,6 +67,13 @@ try {
   await c.waitForTimeout(3000);
   ok((await c.evaluate(() => window.netlab.peers().length)) === 0, 'another name is another room: no one from the first');
 
+  // A <details> (candidate pairs / route history) the user opens stays open across
+  // the 1 s re-render, instead of snapping shut.
+  const det = await a.waitForFunction(() => document.querySelector('#peers details')?.dataset.d ?? null, null, { timeout: 15000 }).then((h) => h.jsonValue());
+  await a.click(`#peers details[data-d="${det}"] summary`);
+  await a.waitForTimeout(1500); // more than one render tick
+  ok(await a.evaluate((d) => document.querySelector(`#peers details[data-d="${d}"]`)?.open === true, det), `an opened "${det.split('-')[0]}" panel stays open across re-renders`);
+
   const rep = await a.evaluate(() => JSON.stringify(window.netlab.report()));
   const at = rep.indexOf(id);
   ok(JSON.parse(rep).room.kind === 'named' && at < 0, `the report says named, without the name${at < 0 ? '' : `: …${rep.slice(at - 80, at + 40)}`}`);
