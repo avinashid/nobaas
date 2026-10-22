@@ -325,9 +325,11 @@ function addrText(d) {
 }
 
 const SIG_TEXT = {
-  'offer-sent': (d) => d.resend ? 'no answer yet: offer sent again' : `offer sent (${addrText(d)})`,
-  'offer-received': (d) => `offer received (${addrText(d)})`,
+  'offer-sent': (d) => d.resend ? 'no answer yet: offer sent again' : `${d.restart ? 'ICE restart offer' : 'offer'} sent (${addrText(d)})`,
+  'offer-received': (d) => `${d.restart ? 'ICE restart offer' : 'offer'} received (${addrText(d)})`,
   'answer-sent': (d) => d.resend ? 'their offer came again (our answer lost?): answer sent again' : `answer sent (${addrText(d)})`,
+  'ice-restart': (d) => d.dialer ? `ICE lost (${d.reason}): restarting, try ${d.n}` : `ICE lost (${d.reason}): asked them to restart, try ${d.n}`,
+  guesses: (d) => `their NAT is sequential symmetric: trying ${d.n} ports around ${d.ip}:${d.next} (step ${d.step})`,
   'answer-received': (d) => `answer received (${addrText(d)})`,
   'ice-batch-sent': (d) => `late addresses sent (${addrText(d)})`,
   'ice-batch-received': (d) => `late addresses received (${addrText(d)})`,
@@ -350,7 +352,7 @@ function onTrace(peer, what, d) {
     tryHotspot(p, peer);
     setTimeout(() => { noteTheirHosts(p, peer); tryHotspot(p, peer); }, 500);
   }
-  const bad = d.resend || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'));
+  const bad = d.resend || what === 'ice-restart' || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'));
   log(bad ? 'warn' : 'info', `WebRTC with ${nameOf(peer)}: ${text}${at != null ? ` (${secs(at)} after hearing it)` : ''}`);
 }
 

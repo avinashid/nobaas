@@ -167,7 +167,22 @@ WebRTC can't link two peers that are both behind symmetric NAT (common on mobile
 hotspots and carrier NAT) unless a TURN server is configured. Rather than requiring
 one, `joinRoom` falls back per peer, on its own, with no setup on either side:
 
-1. **Direct WebRTC**, as always (`room.route(peer).kind === 'direct'`).
+1. **Direct WebRTC**, as always (`room.route(peer).kind === 'direct'`). Two things help
+   it through more NATs:
+   - **Port prediction.** A browser behind a NAT that hands out ports in sequence sees it
+     from its two STUN servers' answers (`natFromSdp`: one IPv4 address, two ports 1 to 8
+     apart). Its offer, answer or late candidates then carry `nat: { ip, next, step }`. A
+     peer that isn't behind a symmetric NAT itself adds 32 candidates at the ports around
+     `next` (`predictedCandidates`), so its checks open its NAT to the port the other's
+     will come from. Peers that don't know the field ignore it.
+   - **ICE restart.** When a link that was open loses ICE (a Wi-Fi to mobile switch, a
+     hotspot dropping), it isn't dropped: after 2 s of `disconnected`, or at once on
+     `failed`, the dialling side renegotiates with new ICE credentials, so ICE gathers the
+     new network's addresses and checks again; the other side asks it to. The DataChannel
+     and the Peerwire session over it carry on, so the app sees no leave. At most 3 tries
+     (2, 4, 8 s apart) until ICE connects again. `online` and `navigator.connection`
+     changes restart links whose ICE is down at once. Each restart is an offer and an
+     answer over signalling.
 2. **Through another member.** When a link isn't open `fallbackMs` (8 s) after its
    offer, or its ICE fails, the dialling side dials the peer again through every member
    it has a direct link to, including members that link later. The core forwards for
@@ -223,6 +238,14 @@ Run these with Node and the Playwright install on this host:
   `stats.rejected` counts refused events). Without trickle, a lost first offer or first
   answer still links two transports (in about 3.2 s), candidates that overtake their
   description are held, and gathering stops 300 ms after the first public candidate.
+- `node packages/js/test/nat_predict.mjs`: NAT type and prediction from server-reflexive
+  candidates, the 32 predicted candidates, and a peer's prediction refused unless it is an
+  IPv4 address and ports in range (nothing can be spliced into a candidate line).
+- `node packages/js/test/ice_restart.mjs` (Chromium, loopback): an ICE restart by either side
+  renews the ICE credentials while the DataChannel stays open and datagrams flow; ICE
+  `disconnected` restarts after 2 s, `failed` at once; at most 3 while ICE stays down;
+  `networkChanged()` touches only links whose ICE is down; an offer's prediction adds 32
+  candidates, a malformed one none.
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.
