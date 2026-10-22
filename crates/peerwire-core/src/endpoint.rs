@@ -21,6 +21,15 @@ const GUESS_ROUNDS: u32 = 5;
 /// predicted port lands within the first second or never; later rounds would only
 /// spray the peer's IP.
 const GUESS_PROBES: u32 = 3;
+/// A birthday spray ([`Endpoint::spray`]) sends this many probes per batch, a
+/// batch every `SPRAY_GAP` (about 530 a second): 2048 probes take about 3.8 s.
+const SPRAY_BATCH: u16 = 16;
+const SPRAY_GAP: Duration = Duration::from_millis(30);
+/// Most probes in one spray.
+pub const MAX_SPRAY: u16 = 4096;
+/// Sprayed ports: `SPRAY_LOW` and up, where NATs hand ports out.
+const SPRAY_LOW: u32 = 1024;
+const SPRAY_RANGE: u32 = 65536 - SPRAY_LOW;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -251,6 +260,8 @@ pub struct Stats {
     /// Punch rounds that ran out without a direct path.
     pub punch_failed: u64,
     pub direct_fallbacks: u64,
+    /// Probes sent by birthday sprays ([`Endpoint::spray`]).
+    pub spray_probes: u64,
 }
 
 /// Per-link counters for one connected peer; see [`Endpoint::peer_stats`].
@@ -298,6 +309,40 @@ struct Dial<A> {
     attempts: u8,
     sent_at: Instant,
     resend_at: Instant,
+    /// When a peer's HS1 on a path we already dial may next be answered with
+    /// ours (see `on_hs1`).
+    echo_at: Instant,
+}
+
+/// Probes of every port of one IP but the low ones, in an order that visits
+/// each once: `SPRAY_LOW + (start + k * stride) mod SPRAY_RANGE`, with `stride`
+/// coprime to the range.
+struct Spray<A> {
+    base: A,
+    base_port: u16,
+    start: u32,
+    stride: u32,
+    sent: u16,
+    count: u16,
+    next_at: Instant,
+}
+
+impl<A: Address> Spray<A> {
+    /// The next `n` probe addresses.
+    fn next(&mut self, n: u16) -> Vec<A> {
+        let mut out = Vec::new();
+        while self.sent < self.count && out.len() < n as usize {
+            let k = u64::from(self.sent) * u64::from(self.stride) + u64::from(self.start);
+            let port = SPRAY_LOW + (k % u64::from(SPRAY_RANGE)) as u32;
+            self.sent += 1;
+            out.extend(self.base.port_offset(port as i32 - i32::from(self.base_port)));
+        }
+        out
+    }
+
+    fn done(&self) -> bool {
+        self.sent >= self.count
+    }
 }
 
 struct Punch {
@@ -397,6 +442,8 @@ struct Session<A> {
     guesses: Vec<A>,
     /// Probes of `guesses` left: handshake sends while dialling, punch rounds while relayed.
     guess_probes: u32,
+    /// A birthday spray under way ([`Endpoint::spray`]).
+    spray: Option<Spray<A>>,
     punch: Option<Punch>,
     last_direct: Instant,
     /// The address this peer last said it sees us at.
@@ -672,6 +719,7 @@ impl<A: Address> Endpoint<A> {
             attempts: 1,
             sent_at: now,
             resend_at: now + self.config.handshake_retry,
+            echo_at: now,
         };
         self.sessions.insert(
             idx,
@@ -683,6 +731,7 @@ impl<A: Address> Endpoint<A> {
                 candidates,
                 guesses: Vec::new(),
                 guess_probes: 0,
+                spray: None,
                 punch: None,
                 last_direct: now,
                 seen_as: None,
@@ -727,7 +776,7 @@ impl<A: Address> Endpoint<A> {
         let until = now + self.config.punch_duration;
         let token = self.rng.next_u64();
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
-        let nothing = sess.candidates.is_empty() && sess.guesses.is_empty();
+        let nothing = sess.candidates.is_empty() && sess.guesses.is_empty() && sess.spray.is_none();
         if !matches!(sess.path, Path::Via(_)) || nothing || !matches!(sess.state, State::Live(_)) {
             return;
         }
@@ -775,6 +824,68 @@ impl<A: Address> Endpoint<A> {
             }
         } else {
             self.start_punch(now, idx);
+        }
+    }
+
+    /// Birthday punching, from behind a NAT that keeps one port for every
+    /// destination (a cone): probes `count` (at most [`MAX_SPRAY`]) ports of
+    /// `addr`'s IP, each once, in a random order, `SPRAY_BATCH` every `SPRAY_GAP`.
+    /// The peer is behind a symmetric NAT with random ports and has opened many
+    /// sockets towards us ([`opener`](Endpoint::opener)), each with its own
+    /// mapping; one probe that lands on one of them lets that socket's answer
+    /// through our NAT, and the link takes that path. While dialling, the probes
+    /// are the handshake; on a relayed link, punches. Replaces an earlier spray
+    /// for the peer; ignored for a peer linked directly, or reached through a
+    /// relay by a relay-only endpoint, and for addresses without ports.
+    pub fn spray(&mut self, now: Instant, peer: &PeerId, addr: &A, count: u16) {
+        let Some(&idx) = self.peers.get(peer).or_else(|| self.dialing.get(peer)) else { return };
+        let Some(base_port) = addr.to_socket_addr().map(|s| s.port()) else { return };
+        let start = self.rng.next_u32() % SPRAY_RANGE;
+        let mut stride = self.rng.next_u32() % SPRAY_RANGE | 1;
+        while stride % 3 == 0 || stride % 7 == 0 {
+            stride = (stride + 2) % SPRAY_RANGE; // 64512 = 2^10 * 3^2 * 7
+        }
+        let relay_only = self.relay_only;
+        let Some(sess) = self.sessions.get_mut(&idx) else { return };
+        let relayed = match &sess.state {
+            State::Dialing(d) => d.targets.iter().any(|t| matches!(t, Path::Via(_))),
+            State::Live(_) => matches!(sess.path, Path::Via(_)),
+        };
+        if (relay_only && relayed) || (matches!(sess.state, State::Live(_)) && !relayed) {
+            return;
+        }
+        let count = count.min(MAX_SPRAY);
+        sess.spray = Some(Spray { base: addr.clone(), base_port, start, stride, sent: 0, count, next_at: now });
+        if matches!(sess.state, State::Live(_)) {
+            self.start_punch(now, idx);
+        }
+    }
+
+    /// Birthday punching, from behind a symmetric NAT with random ports: a
+    /// packet for `peer` that the host sends from each of many extra sockets
+    /// towards the peer's address, so that each gets a mapping the peer's NAT
+    /// will answer through once the peer's [`spray`](Endpoint::spray) hits it.
+    /// The host then hands the endpoint what each socket receives and sends
+    /// replies to that sender from the socket that heard it. The handshake while
+    /// dialling, a punch on a relayed link (which starts punching); `None` once
+    /// linked directly, for a relay-only endpoint's relayed link, or with no link
+    /// or dial.
+    pub fn opener(&mut self, now: Instant, peer: &PeerId) -> Option<Vec<u8>> {
+        let &idx = self.peers.get(peer).or_else(|| self.dialing.get(peer))?;
+        let token = self.rng.next_u64();
+        let until = now + self.config.punch_duration;
+        let relay_only = self.relay_only;
+        let sess = self.sessions.get_mut(&idx)?;
+        match &mut sess.state {
+            State::Dialing(d) => Some(d.hs1.clone()),
+            State::Live(link) if matches!(sess.path, Path::Via(_)) && !relay_only => {
+                let p = sess.punch.get_or_insert(Punch { token, next_at: now, until, round: 0 });
+                p.until = p.until.max(until);
+                let mut f = Vec::with_capacity(9);
+                wire::put_punch(&mut f, false, p.token);
+                seal(link, &f)
+            }
+            State::Live(_) => None,
         }
     }
 
@@ -908,11 +1019,18 @@ impl<A: Address> Endpoint<A> {
             // Simultaneous open: the dial from the smaller PeerId wins.
             if self.me < peer {
                 let mut resend = None;
+                let retry = self.config.handshake_retry;
                 if let Some(sess) = self.sessions.get_mut(&didx) {
                     if let State::Dialing(d) = &mut sess.state {
                         if !d.targets.contains(&from) && d.targets.len() < 16 {
                             // Their packet proves this path works; aim our dial along it too.
                             d.targets.push(from.clone());
+                            resend = Some(d.hs1.clone());
+                        } else if matches!(from, Path::Direct(_)) && now >= d.echo_at {
+                            // A path we dial already, which may only now work (a birthday
+                            // spray hit one of the host's extra sockets): answer now, not
+                            // at the next retry, at most once per retry interval.
+                            d.echo_at = now + retry;
                             resend = Some(d.hs1.clone());
                         }
                     }
@@ -950,6 +1068,7 @@ impl<A: Address> Endpoint<A> {
                 candidates: inherited.1,
                 guesses: Vec::new(),
                 guess_probes: 0,
+                spray: None,
                 punch: None,
                 last_direct: now,
                 seen_as: None,
@@ -993,7 +1112,10 @@ impl<A: Address> Endpoint<A> {
             Path::Via(r) => {
                 sess.relay.get_or_insert(*r);
             }
-            Path::Direct(_) => sess.guesses.clear(),
+            Path::Direct(_) => {
+                sess.guesses.clear();
+                sess.spray = None;
+            }
         }
         sess.path = from;
         self.sessions.insert(receiver, sess);
@@ -1123,6 +1245,7 @@ impl<A: Address> Endpoint<A> {
             sess.path = Path::Direct(a);
             sess.punch = None;
             sess.guesses.clear();
+            sess.spray = None;
             sess.last_direct = now;
             self.stats.punch_succeeded += 1;
             path_changed = true;
@@ -1271,6 +1394,34 @@ impl<A: Address> Endpoint<A> {
         let mut fallbacks = Vec::new();
         let spray = self.config.punch_spray as i32;
         for (&idx, sess) in self.sessions.iter_mut() {
+            if let Some(s) = sess.spray.as_mut().filter(|s| now >= s.next_at) {
+                s.next_at = now + SPRAY_GAP;
+                let batch = s.next(SPRAY_BATCH);
+                let done = s.done();
+                self.stats.spray_probes += batch.len() as u64;
+                match &mut sess.state {
+                    State::Dialing(d) => {
+                        resend.extend(batch.into_iter().map(|a| (Path::Direct(a), sess.peer, d.hs1.clone())))
+                    }
+                    State::Live(link) => {
+                        let Some(p) = &sess.punch else {
+                            sess.spray = None; // punching ran out
+                            continue;
+                        };
+                        let mut f = Vec::with_capacity(9);
+                        wire::put_punch(&mut f, false, p.token);
+                        for dst in batch {
+                            if let Some(payload) = seal(link, &f) {
+                                self.stats.tx_packets += 1;
+                                self.outbox.push_back(Transmit { dst, payload });
+                            }
+                        }
+                    }
+                }
+                if done {
+                    sess.spray = None;
+                }
+            }
             match &mut sess.state {
                 State::Dialing(d) => {
                     if now < d.resend_at {
@@ -1392,6 +1543,9 @@ impl<A: Address> Endpoint<A> {
         for sess in self.sessions.values() {
             if let Some(p) = &sess.punch {
                 min(p.next_at.min(p.until));
+            }
+            if let Some(s) = &sess.spray {
+                min(s.next_at);
             }
             match &sess.state {
                 State::Dialing(d) => min(d.resend_at),
