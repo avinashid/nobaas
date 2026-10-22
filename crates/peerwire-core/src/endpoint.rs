@@ -314,17 +314,20 @@ struct Dial<A> {
     echo_at: Instant,
 }
 
-/// Probes of every port of one IP but the low ones, in an order that visits
-/// each once: `SPRAY_LOW + (start + k * stride) mod SPRAY_RANGE`, with `stride`
-/// coprime to the range.
+/// Probes, paced: of every port of one IP but the low ones, or of a given list.
 struct Spray<A> {
-    base: A,
-    base_port: u16,
-    start: u32,
-    stride: u32,
+    targets: Targets<A>,
     sent: u16,
     count: u16,
     next_at: Instant,
+}
+
+enum Targets<A> {
+    /// Ports of `base`'s IP in an order that visits each once:
+    /// `SPRAY_LOW + (start + k * stride) mod SPRAY_RANGE`, `stride` coprime to the range.
+    Ports { base: A, base_port: u16, start: u32, stride: u32 },
+    /// These, in this order ([`Endpoint::sweep`]).
+    List(Vec<A>),
 }
 
 impl<A: Address> Spray<A> {
@@ -332,10 +335,16 @@ impl<A: Address> Spray<A> {
     fn next(&mut self, n: u16) -> Vec<A> {
         let mut out = Vec::new();
         while self.sent < self.count && out.len() < n as usize {
-            let k = u64::from(self.sent) * u64::from(self.stride) + u64::from(self.start);
-            let port = SPRAY_LOW + (k % u64::from(SPRAY_RANGE)) as u32;
+            let k = self.sent;
             self.sent += 1;
-            out.extend(self.base.port_offset(port as i32 - i32::from(self.base_port)));
+            match &self.targets {
+                Targets::Ports { base, base_port, start, stride } => {
+                    let k = u64::from(k) * u64::from(*stride) + u64::from(*start);
+                    let port = SPRAY_LOW + (k % u64::from(SPRAY_RANGE)) as u32;
+                    out.extend(base.port_offset(port as i32 - i32::from(*base_port)));
+                }
+                Targets::List(list) => out.extend(list.get(usize::from(k)).cloned()),
+            }
         }
         out
     }
@@ -838,13 +847,28 @@ impl<A: Address> Endpoint<A> {
     /// for the peer; ignored for a peer linked directly, or reached through a
     /// relay by a relay-only endpoint, and for addresses without ports.
     pub fn spray(&mut self, now: Instant, peer: &PeerId, addr: &A, count: u16) {
-        let Some(&idx) = self.peers.get(peer).or_else(|| self.dialing.get(peer)) else { return };
         let Some(base_port) = addr.to_socket_addr().map(|s| s.port()) else { return };
         let start = self.rng.next_u32() % SPRAY_RANGE;
         let mut stride = (self.rng.next_u32() % SPRAY_RANGE) | 1;
         while stride.is_multiple_of(3) || stride.is_multiple_of(7) {
             stride = (stride + 2) % SPRAY_RANGE; // 64512 = 2^10 * 3^2 * 7
         }
+        let targets = Targets::Ports { base: addr.clone(), base_port, start, stride };
+        self.start_spray(now, peer, targets, count);
+    }
+
+    /// Probes `addrs` (at most [`MAX_SPRAY`]) in this order, each once, paced as a
+    /// [`spray`](Endpoint::spray), which it replaces, as are the cases it is
+    /// ignored in. For two sequential symmetric NATs probing each other's
+    /// predicted ports: every probe goes to a new address, so each costs the NAT
+    /// the next port, and the order makes the two sides' mappings line up.
+    pub fn sweep(&mut self, now: Instant, peer: &PeerId, addrs: &[A]) {
+        let n = addrs.len().min(usize::from(MAX_SPRAY));
+        self.start_spray(now, peer, Targets::List(addrs[..n].to_vec()), n as u16);
+    }
+
+    fn start_spray(&mut self, now: Instant, peer: &PeerId, targets: Targets<A>, count: u16) {
+        let Some(&idx) = self.peers.get(peer).or_else(|| self.dialing.get(peer)) else { return };
         let relay_only = self.relay_only;
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
         let relayed = match &sess.state {
@@ -855,7 +879,7 @@ impl<A: Address> Endpoint<A> {
             return;
         }
         let count = count.min(MAX_SPRAY);
-        sess.spray = Some(Spray { base: addr.clone(), base_port, start, stride, sent: 0, count, next_at: now });
+        sess.spray = Some(Spray { targets, sent: 0, count, next_at: now });
         if matches!(sess.state, State::Live(_)) {
             self.start_punch(now, idx);
         }
