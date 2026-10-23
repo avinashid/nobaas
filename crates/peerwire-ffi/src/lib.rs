@@ -129,6 +129,9 @@ pub unsafe extern "C" fn pw_secret(h: *const PwEndpoint, out: *mut u8) {
     slice::from_raw_parts_mut(out, 32).copy_from_slice(&(*h).identity.secret_bytes());
 }
 
+/// Dials `peer_id` at `addr`. A no-op if already linked, or while relay-only if
+/// dialling it through a relay (the dial stays relayed); otherwise a dial already
+/// running takes `addr` as one more path.
 #[no_mangle]
 pub unsafe extern "C" fn pw_connect(h: *mut PwEndpoint, now_us: u64, addr: u32, peer_id: *const u8) -> i32 {
     let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
@@ -150,8 +153,9 @@ pub unsafe extern "C" fn pw_connect_via(h: *mut PwEndpoint, now_us: u64, relay: 
 
 /// Adds `addr` as a direct address of `peer_id`, a relayed or dialling peer: the
 /// endpoint punches towards it and moves the link there once the peer answers
-/// from it. Does nothing for a peer linked directly, an unknown one, or a
-/// relayed link while relay-only.
+/// from it. Does nothing for a peer linked directly, an unknown one, or, while
+/// relay-only, a peer linked or being dialled through a relay: nothing is sent to
+/// `addr`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr: u32, peer_id: *const u8) -> i32 {
     let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
@@ -160,8 +164,9 @@ pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr:
 }
 
 /// Relay-only (`on` != 0): relayed links stay relayed (no punching, no direct
-/// path), relays are asked not to tag our packets with our address, and a direct
-/// handshake is answered only from a peer this endpoint is dialling directly.
+/// path), dials through a relay, also one under way, send nothing direct, relays
+/// are asked not to tag our packets with our address, and a direct handshake is
+/// answered only from a peer this endpoint is dialling directly.
 #[no_mangle]
 pub unsafe extern "C" fn pw_set_relay_only(h: *mut PwEndpoint, on: u32) {
     (*h).ep.set_relay_only(on != 0);
@@ -520,9 +525,10 @@ mod tests {
     type Hop = (usize, u32);
 
     /// Delivers every queued datagram along `routes`: (from endpoint, its handle)
-    /// → (to endpoint, the handle `to` sees it at). Datagrams to other handles are lost.
-    unsafe fn route(eps: &[*mut PwEndpoint], routes: &[(Hop, Hop)], t: u64) {
-        let (mut buf, mut addr) = (vec![0u8; 2048], 0u32);
+    /// → (to endpoint, the handle `to` sees it at). Datagrams to other handles are
+    /// lost. Returns where each datagram was sent, delivered or not.
+    unsafe fn route(eps: &[*mut PwEndpoint], routes: &[(Hop, Hop)], t: u64) -> Vec<Hop> {
+        let (mut buf, mut addr, mut sent) = (vec![0u8; 2048], 0u32, Vec::new());
         loop {
             let mut moved = false;
             for (i, &h) in eps.iter().enumerate() {
@@ -531,6 +537,7 @@ mod tests {
                     if n <= 0 {
                         break;
                     }
+                    sent.push((i, addr));
                     if let Some(&(_, (to, seen))) = routes.iter().find(|(from, _)| *from == (i, addr)) {
                         pw_handle_datagram(eps[to], t, seen, buf.as_ptr(), n as usize);
                         moved = true;
@@ -538,7 +545,7 @@ mod tests {
                 }
             }
             if !moved {
-                break;
+                return sent;
             }
         }
     }
@@ -606,6 +613,69 @@ mod tests {
                 for h in eps {
                     pw_endpoint_free(h);
                 }
+            }
+        }
+    }
+
+    /// NB48b-4: relay-only, a dial through relay r sends nothing to a direct
+    /// address of the peer added while it is pending (pw_add_candidate, or
+    /// pw_connect) or once the link is up, though that path would work: the link
+    /// comes up through r and stays there.
+    #[test]
+    fn relay_only_dial_through_a_relay_sends_nothing_direct() {
+        unsafe {
+            let mut ids = [[0u8; 32]; 3];
+            let eps: Vec<_> = (0..3)
+                .map(|i| pw_endpoint_new(std::ptr::null(), [i as u8 + 1; 32].as_ptr(), 0, ids[i].as_mut_ptr()))
+                .collect();
+            let (a, b) = (eps[0], eps[1]);
+            // As above (a sees r at 10, b at 11; ...), with the direct path open from the start.
+            let routes = [
+                ((0, 10), (2, 30)),
+                ((1, 20), (2, 31)),
+                ((2, 30), (0, 10)),
+                ((2, 31), (1, 20)),
+                ((0, 11), (1, 21)),
+                ((1, 21), (0, 11)),
+            ];
+            let mut t = 1000u64;
+            assert_eq!(pw_connect(a, t, 10, ids[2].as_ptr()), 0);
+            assert_eq!(pw_connect(b, t, 20, ids[2].as_ptr()), 0);
+            route(&eps, &routes, t);
+            pw_set_relay_only(a, 1);
+            assert_eq!(pw_connect_via(a, t, ids[2].as_ptr(), ids[1].as_ptr()), 0);
+            let mut events = Vec::new();
+            for live in [false, true] {
+                // First while the dial is pending (nothing routed yet), then on the live link.
+                assert_eq!(pw_add_candidate(a, t, 11, ids[1].as_ptr()), 0);
+                assert_eq!(pw_connect(a, t, 11, ids[1].as_ptr()), 0);
+                let mut sent = Vec::new();
+                for _ in 0..40 {
+                    sent.extend(route(&eps, &routes, t));
+                    t += 50_000;
+                    for &h in &eps {
+                        pw_handle_timeout(h, t);
+                    }
+                }
+                let direct = sent.iter().filter(|&&s| s == (0, 11)).count();
+                assert_eq!(direct, 0, "live {live}: datagrams from a to b's direct handle");
+                assert!(live || sent.contains(&(0, 10)), "the dial goes to r");
+                assert_eq!((pw_is_connected(a, ids[1].as_ptr()), pw_is_connected(b, ids[0].as_ptr())), (1, 1));
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let n = pw_poll_event(a, buf.as_mut_ptr(), buf.len());
+                    if n <= 0 {
+                        break;
+                    }
+                    events.push(buf[..n as usize].to_vec());
+                }
+            }
+            // a's link to b came up through r and never moved.
+            let to_b: Vec<_> = events.iter().filter(|e| e[1..33] == ids[1]).collect();
+            assert_eq!(to_b.len(), 1, "one event for b: {to_b:?}");
+            assert_eq!((to_b[0][0], &to_b[0][34..]), (1, &[&[1u8][..], &ids[2]].concat()[..]), "connected via r");
+            for h in eps {
+                pw_endpoint_free(h);
             }
         }
     }

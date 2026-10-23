@@ -506,21 +506,35 @@ impl<A: Address> Endpoint<A> {
 
     /// Keeps relayed links relayed, so peers reached through a relay never learn
     /// this endpoint's address from it: they are asked to forward without the
-    /// origin tag (FWD_QUIET), dials that name a relay skip their direct
-    /// targets, and relayed links take no direct candidates, never
-    /// punch, never answer a punch and never move to a direct path. This endpoint
-    /// also stops sharing the addresses it sees (OBSERVED frames, origin tags), as
-    /// with `share_addresses` off, and answers a handshake at its own address
-    /// only from a peer it is dialling directly or already has a direct link
-    /// with. Direct links, such as the one to the relay, are unaffected; links
-    /// already up keep their path.
+    /// origin tag (FWD_QUIET), dials that name a relay go through it alone
+    /// (their direct targets, port guesses and sprays are dropped, also those of
+    /// a dial already under way, and an answer to it at this endpoint's own
+    /// address is ignored), and relayed links take no direct candidates, never
+    /// punch, never answer a punch and never move to a direct path. This
+    /// endpoint also stops sharing the addresses it sees (OBSERVED frames,
+    /// origin tags), as with `share_addresses` off, and answers a handshake at
+    /// its own address only from a peer it is dialling directly or already has
+    /// a direct link with. Direct links and dials, such as those to the relay,
+    /// are unaffected; links already up keep their path.
     pub fn set_relay_only(&mut self, on: bool) {
         self.relay_only = on;
-        if on {
-            for sess in self.sessions.values_mut().filter(|s| matches!(s.path, Path::Via(_))) {
-                sess.punch = None;
-                sess.candidates.clear();
+        if !on {
+            return;
+        }
+        for sess in self.sessions.values_mut() {
+            if let (State::Dialing(d), Some(r)) = (&mut sess.state, sess.relay) {
+                d.targets.retain(|t| matches!(t, Path::Via(_)));
+                if d.targets.is_empty() {
+                    d.targets.push(Path::Via(r)); // the relay was named when the targets were full
+                }
+            } else if !matches!(sess.path, Path::Via(_)) {
+                continue;
             }
+            sess.punch = None;
+            sess.candidates.clear();
+            sess.guesses.clear();
+            sess.guess_probes = 0;
+            sess.spray = None;
         }
     }
 
@@ -662,7 +676,8 @@ impl<A: Address> Endpoint<A> {
     /// Sends the handshake along every path in `targets` at once (all of a
     /// peer's known addresses, a relay, or both). If both peers do this at the
     /// same time towards each other's public addresses, the handshakes punch
-    /// through cone NATs. Calling it again while dialling adds paths.
+    /// through cone NATs. Calling it again while dialling adds paths, except
+    /// direct ones to a dial through a relay while relay-only.
     pub fn connect_with(&mut self, now: Instant, peer: PeerId, targets: &[Path<A>]) -> Result<(), ConnectError> {
         if peer == self.me {
             return Err(ConnectError::SelfConnect);
@@ -687,6 +702,10 @@ impl<A: Address> Endpoint<A> {
             let State::Dialing(d) = &mut sess.state else { return Ok(()) };
             let mut new = Vec::new();
             for t in targets {
+                // Relay-only: a dial through a relay takes no direct paths later either.
+                if self.relay_only && sess.relay.is_some() && matches!(t, Path::Direct(_)) {
+                    continue;
+                }
                 if !d.targets.contains(t) && d.targets.len() < 16 {
                     d.targets.push(t.clone());
                     new.push((t.clone(), d.hs1.clone()));
@@ -751,7 +770,8 @@ impl<A: Address> Endpoint<A> {
     }
 
     /// Adds direct addresses (learned through signalling) for a dialling or
-    /// relayed peer, and starts punching towards them.
+    /// relayed peer, and starts punching towards them. Ignored while relay-only
+    /// for a peer reached, or being dialled, through a relay.
     pub fn add_candidates(&mut self, now: Instant, peer: &PeerId, addrs: &[A]) {
         if let Some(&idx) = self.peers.get(peer) {
             for a in addrs {
@@ -1124,6 +1144,12 @@ impl<A: Address> Endpoint<A> {
         let State::Dialing(dial) = &mut sess.state else {
             return Some(receiver); // duplicate HS2 for a link that is already up
         };
+        // Relay-only: a dial through a relay completes through it, even if an HS1
+        // sent direct before relay-only was turned on is answered there.
+        if self.relay_only && sess.relay.is_some() && matches!(from, Path::Direct(_)) {
+            self.stats.rx_handshake_dropped += 1;
+            return None;
+        }
         let mut payload = [0u8; 64];
         if dial.hs.read_message(noise, &mut payload).is_err() || !dial.hs.is_handshake_finished() {
             self.stats.rx_auth_failed += 1;
@@ -1750,4 +1776,128 @@ fn seal(link: &mut Link, pt: &[u8]) -> Option<Vec<u8>> {
     out.truncate(wire::DATA_HEADER + n);
     link.send_nonce += 1;
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The direct addresses `ep` sends to from `t` until `t + 2 s`, its timers run every 50 ms.
+    fn direct_sends(ep: &mut Endpoint<u32>, t: &mut Instant) -> Vec<u32> {
+        let mut sent = Vec::new();
+        for _ in 0..40 {
+            while let Some(tx) = ep.poll_transmit(*t) {
+                sent.push(tx.dst);
+            }
+            *t = *t + Duration::from_millis(50);
+            ep.handle_timeout(*t);
+        }
+        sent
+    }
+
+    /// NB48b-4: relay-only, a dial through a relay takes no direct path added
+    /// while it is pending, through `add_candidates`, `connect` or `connect_with`
+    /// naming the relay too: nothing is sent there, at once or on a retry.
+    /// Without relay-only all three are dialled, and a relay-only endpoint's
+    /// direct dial still takes more direct paths.
+    #[test]
+    fn relay_only_dial_through_a_relay_takes_no_direct_paths() {
+        let ids: Vec<Identity> = (1..=4u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (b, r, c) = (ids[1].peer_id(), ids[2].peer_id(), ids[3].peer_id());
+        for relay_only in [true, false] {
+            let mut t = Instant::from_millis(1);
+            let mut a = Endpoint::<u32>::new(&ids[0], Config::default(), [7; 32]);
+            a.set_relay_only(relay_only);
+            a.connect_via(t, r, b, &[]).unwrap();
+            a.add_candidates(t, &b, &[11]);
+            a.connect(t, 12, b).unwrap();
+            a.connect_with(t, b, &[Path::Via(r), Path::Direct(13)]).unwrap();
+            let sent = direct_sends(&mut a, &mut t);
+            if relay_only {
+                assert_eq!(sent, Vec::<u32>::new());
+            } else {
+                assert!([11, 12, 13].iter().all(|x| sent.contains(x)), "{sent:?}");
+            }
+            a.connect(t, 21, c).unwrap();
+            a.add_candidates(t, &c, &[22]);
+            let sent = direct_sends(&mut a, &mut t);
+            assert!(sent.contains(&21) && sent.contains(&22), "relay_only {relay_only}: {sent:?}");
+        }
+    }
+
+    /// Runs `eps`, endpoint `i` at address `i + 1`, for `ms` from `t` with timers
+    /// every 10 ms, delivering every datagram between them except those to
+    /// `down`; returns each datagram sent as (sender index, destination).
+    fn route(eps: &mut [Endpoint<u32>], t: &mut Instant, ms: u64, down: Option<u32>) -> Vec<(usize, u32)> {
+        let mut sent = Vec::new();
+        for _ in 0..ms / 10 {
+            for _ in 0..100 {
+                let mut quiet = true;
+                for i in 0..eps.len() {
+                    let out: Vec<_> = std::iter::from_fn(|| eps[i].poll_transmit(*t)).collect();
+                    for tx in out {
+                        quiet = false;
+                        sent.push((i, tx.dst));
+                        let to = (Some(tx.dst) != down).then(|| (tx.dst as usize).checked_sub(1)).flatten();
+                        if let Some(ep) = to.and_then(|j| eps.get_mut(j)) {
+                            ep.handle_datagram(*t, i as u32 + 1, &tx.payload);
+                        }
+                    }
+                }
+                if quiet {
+                    break;
+                }
+            }
+            *t = *t + Duration::from_millis(10);
+            for ep in eps.iter_mut() {
+                ep.handle_timeout(*t);
+            }
+        }
+        sent
+    }
+
+    /// Relay-only turned on while a dial through a relay is under way: the dial
+    /// drops its direct targets, port guesses and sweep, so nothing more goes
+    /// direct, ignores the peer's answer at our address to an HS1 sent there
+    /// before the switch, and completes through the relay. A direct dial goes on.
+    #[test]
+    fn relay_only_turned_on_mid_dial_dials_through_the_relay_alone() {
+        let ids: Vec<Identity> = (1..=4u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (b, r, c) = (ids[1].peer_id(), ids[2].peer_id(), ids[3].peer_id());
+        // a, b and r at addresses 1, 2 and 3, a and b linked to r; c is never reached.
+        let mut eps: Vec<Endpoint<u32>> =
+            ids[..3].iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, 3, r).unwrap();
+        eps[1].connect(t, 3, r).unwrap();
+        route(&mut eps, &mut t, 100, None);
+        assert!(eps[2].is_connected(&ids[0].peer_id()) && eps[2].is_connected(&b));
+
+        let a = &mut eps[0];
+        a.connect_via(t, r, b, &[2, 12]).unwrap();
+        a.set_guesses(t, &b, &[30, 31]);
+        a.sweep(t, &b, &(100..300).collect::<Vec<u32>>());
+        a.connect(t, 21, c).unwrap();
+        a.add_candidates(t, &c, &[22]);
+        a.set_guesses(t, &c, &[23]);
+        a.sweep(t, &c, &(500..600).collect::<Vec<u32>>());
+        // Drained once: b gets the direct HS1 and answers it at a's address.
+        let first: Vec<_> = std::iter::from_fn(|| eps[0].poll_transmit(t)).collect();
+        for tx in first.iter().filter(|tx| tx.dst == 2) {
+            eps[1].handle_datagram(t, 1, &tx.payload);
+        }
+        assert_eq!(first.iter().filter(|tx| tx.dst == 2).count(), 1);
+
+        eps[0].set_relay_only(true);
+        // r out of reach for 2 s, so the dial is still pending; then back.
+        let mut sent = route(&mut eps, &mut t, 2000, Some(3));
+        sent.extend(route(&mut eps, &mut t, 3000, None));
+        let to_c = |d: &u32| [21, 22, 23].contains(d) || (500..600).contains(d);
+        let to_b: Vec<u32> = sent.iter().filter(|&&(i, d)| i == 0 && d != 3 && !to_c(&d)).map(|s| s.1).collect();
+        assert_eq!(to_b, Vec::<u32>::new(), "direct sends from a after relay-only");
+        assert_eq!(eps[0].stats().rx_handshake_dropped, 1, "b's HS2 at a's address is ignored");
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(r)), "the dial completes through r");
+        let to_c: Vec<u32> = sent.iter().filter(|&&(i, d)| i == 0 && to_c(&d)).map(|s| s.1).collect();
+        assert!([21, 22, 23].into_iter().chain(500..600).all(|x| to_c.contains(&x)), "{to_c:?}");
+    }
 }

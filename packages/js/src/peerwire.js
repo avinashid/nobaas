@@ -233,7 +233,8 @@ export class Endpoint {
   }
   // A direct address `addr` for a relayed (or dialling) `peer`: the endpoint punches
   // to it and moves the link there once the peer answers from it. Does nothing for a
-  // peer linked directly or unknown, or after close().
+  // peer linked directly or unknown, while relay-only for one linked or being dialled
+  // through a relay (nothing is sent to `addr`), or after close().
   addCandidate(addr, peer) {
     if (this.closed) return;
     this.pw.x.pw_add_candidate(this.h, nowUs(), addr, this.setPeer(peer));
