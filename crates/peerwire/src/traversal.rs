@@ -114,6 +114,14 @@ const BIRTHDAY_OPEN_FOR: Duration = Duration::from_secs(10);
 const BIRTHDAY_COOLDOWN: Duration = Duration::from_secs(300);
 const BIRTHDAY_BURST: u32 = 4;
 const BIRTHDAY_REFILL: Duration = Duration::from_secs(30);
+/// Per destination IP across all peers (NB44-1): at most `BIRTHDAY_IP_MAX` punches per
+/// `BIRTHDAY_IP_WINDOW`, and only one running at a time (another to the same IP waits
+/// `BIRTHDAY_IP_BUSY`, longer than a punch runs). The per-peer cooldown alone doesn't
+/// bound traffic at one victim, because a room-key holder can mint any number of
+/// PeerIds and aim them all at that IP; this caps what lands on any one address.
+const BIRTHDAY_IP_MAX: usize = 2;
+const BIRTHDAY_IP_WINDOW: Duration = Duration::from_secs(300);
+const BIRTHDAY_IP_BUSY: Duration = Duration::from_secs(20);
 /// Two-sided prediction, for two sequential symmetric NATs: both probe the other's
 /// predicted ports in order, the side with the lower PeerId at `next + k·step`, the
 /// other at `next + 2k·step`. Every probe goes to a new address, so each costs the
@@ -238,6 +246,16 @@ enum Plan<A> {
     Spray(A),
     /// Two sequential symmetric NATs: probe these, in order ([`LOCKSTEP_LOW`]).
     Sweep(Vec<A>),
+}
+
+/// The destination IP a planned punch aims at (all its targets share one IP), for the
+/// NB44-1 per-IP cap. `None` for an address that isn't an IP.
+fn plan_ip<A: Address>(side: &Plan<A>) -> Option<std::net::IpAddr> {
+    let a = match side {
+        Plan::Open(a) | Plan::Spray(a) => Some(a),
+        Plan::Sweep(v) => v.first(),
+    };
+    a.and_then(|a| a.to_socket_addr()).map(|s| s.ip().to_canonical())
 }
 
 /// Something the host must do on its signaling carrier.
@@ -370,6 +388,8 @@ pub struct Traversal<A: Address> {
     relay_peers: Vec<PeerId>,
     /// Planned punches started, node-wide.
     planned: Bucket,
+    /// Recent birthday-punch starts per destination IP, for the NB44-1 per-IP cap.
+    punch_ips: HashMap<std::net::IpAddr, VecDeque<Instant>>,
     sockets: VecDeque<Birthday<A>>,
     transmits: VecDeque<Transmit<A>>,
     signals: VecDeque<Signal>,
@@ -416,6 +436,7 @@ impl<A: Address> Traversal<A> {
             invite_key,
             relay_peers: Vec::new(),
             planned: Bucket::default(),
+            punch_ips: HashMap::new(),
             sockets: VecDeque::new(),
             transmits: VecDeque::new(),
             signals: VecDeque::from([Signal::Subscribe(inbox)]),
@@ -734,6 +755,12 @@ impl<A: Address> Traversal<A> {
         self.start_plans(now, ep);
         self.remotes.retain(|p, r| now - r.seen_at < FORGET || ep.is_connected(p));
         self.nonces.retain(|_, t| now - *t < Duration::from_millis(2 * FRESH_MS));
+        self.punch_ips.retain(|_, times| {
+            while times.front().is_some_and(|t| now - *t >= BIRTHDAY_IP_WINDOW) {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
     }
 
     /// When [`handle_timeout`](Traversal::handle_timeout) is next due.
@@ -772,8 +799,28 @@ impl<A: Address> Traversal<A> {
         for peer in due {
             let Some((_, side)) = self.remotes.get_mut(&peer).and_then(|r| r.plan.take()) else { continue };
             let direct = matches!(ep.path(&peer), Some(Path::Direct(_)));
-            if direct || relay_only || !self.planned.take(now, BIRTHDAY_BURST, BIRTHDAY_REFILL) {
+            if direct || relay_only {
                 continue;
+            }
+            // NB44-1: one punch per destination IP at a time, and at most BIRTHDAY_IP_MAX
+            // per window, across all peers, so offers from many PeerIds naming one victim
+            // can't make the node spray it more than that. Checked before the node token.
+            let ip = plan_ip(&side);
+            if let Some(ip) = ip {
+                let times = self.punch_ips.entry(ip).or_default();
+                while times.front().is_some_and(|t| now - *t >= BIRTHDAY_IP_WINDOW) {
+                    times.pop_front();
+                }
+                let busy = times.back().is_some_and(|t| now - *t < BIRTHDAY_IP_BUSY);
+                if busy || times.len() >= BIRTHDAY_IP_MAX {
+                    continue;
+                }
+            }
+            if !self.planned.take(now, BIRTHDAY_BURST, BIRTHDAY_REFILL) {
+                continue;
+            }
+            if let Some(ip) = ip {
+                self.punch_ips.entry(ip).or_default().push_back(now);
             }
             if let Some(r) = self.remotes.get_mut(&peer) {
                 r.plan_at = Some(now);
@@ -2495,9 +2542,21 @@ mod tests {
         assert!(birthday_case(SYM, NatType::Symmetric, false, public, direct, 1, &[0]).0.is_empty());
         let relay_only = Privacy::RelayOnly { via: None };
         assert!(birthday_case(SYM, NatType::Cone, false, public, relay_only, 1, &[0]).0.is_empty());
-        // Offers again within the cooldown start nothing more; the node budget is 4 at once.
+        // Offers again within the per-peer cooldown start nothing more.
         assert_eq!(birthday_case(SYM, NatType::Cone, false, public, direct, 1, &[0, 2000, 4000]).0.len(), 1);
-        assert_eq!(birthday_case(SYM, NatType::Cone, false, public, direct, 6, &[0]).0.len(), 4);
+        // NB44-1: many PeerIds (minted freely by a room-key holder) naming ONE victim IP
+        // start only one punch at it — the per-IP cap, not the node budget of 4. The open
+        // side opens one fleet, and the spray side sprays once.
+        assert_eq!(birthday_case(SYM, NatType::Cone, false, public, direct, 6, &[0]).0.len(), 1);
+        // The spray side: 4 PeerIds naming one IP send one spray's worth of probes, not
+        // four (before NB44-1 this was ~8,208 datagrams to the victim).
+        let four = birthday_case(CONE, NatType::Symmetric, false, public, direct, 4, &[0]).1;
+        let probes = usize::from(BIRTHDAY_PROBES);
+        assert!(
+            four >= probes && four < 2 * probes,
+            "NB44-1: 4 peers at one IP spray once ({four}), not 4x (~{})",
+            4 * probes
+        );
     }
 
     /// NB-045: two sequential symmetric NATs sweep each other's predicted ports in

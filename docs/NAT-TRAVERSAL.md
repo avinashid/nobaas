@@ -95,9 +95,12 @@ can, by the birthday paradox, as Tailscale does:
   from it (its route), everything else from the main socket. Sockets that are no route close after 10 s, a route
   once it has heard nothing for 60 s. At most 512 are open at once, and while any are, `Node::next_timeout` is at
   most 5 ms, because a host waiting on `Node::socket` can't see them.
-- **Limits.** One try per peer per 5 minutes; per node, a burst of 4, then one per 30 s. The spray aims at the IP
-  STUN saw, so it assumes the symmetric NAT maps every socket to that one IP (RFC 4787 "paired" pooling); a
-  carrier NAT that hands each mapping an IP from a pool defeats it. Not yet measured on real networks.
+- **Limits.** One try per peer per 5 minutes; per node, a burst of 4, then one per 30 s; and, per destination IP
+  across all peers (NB44-1), only one punch to an IP at a time and at most 2 per 5 minutes, so a flood of offers
+  from many PeerIds (a room-key holder can mint them freely) naming one victim can't make the node punch it four
+  times over. The spray aims at the IP STUN saw, so it assumes the symmetric NAT maps every socket to that one IP
+  (RFC 4787 "paired" pooling); a carrier NAT that hands each mapping an IP from a pool defeats it. Not yet measured
+  on real networks.
 - **Cost.** The symmetric side: 256 sockets for 10 s and 256 packets of about 130 bytes (the HS1), about 33 KB.
   The cone side: up to 2048 handshakes or punches to ports of one IP, about 270 KB over 3.8 s, about 32 KB on
   average. Its own router keeps a connection-tracking entry per probe for a while; a router with a small table
@@ -450,10 +453,13 @@ traversal privacy_modes_matrix -- --nocapture`:
 - **Birthday spray** (NB-044). An offer that says `Symmetric` with no prediction, to a node behind a cone, makes it
   spray up to 2048 ports of the offer's first address's IP: about 270 KB over 3.8 s, unless a probe links first.
   Only a room member or a peer the node dialled can get an offer acted on, the address must be public IPv4, and
-  it happens once per peer per 5 minutes and at most 4 times at once per node, then once per 30 s: at most about
-  1.1 MB in a burst, then about 9 KB/s on average, at one IP per spray. The probes are Noise handshakes or sealed
-  punches, about 130 bytes or less, so there is no amplification beyond the count. An offer saying `Cone` makes a
-  symmetric node send 256 handshakes (about 33 KB) to the offer's address, from 256 sockets it keeps for 10 s.
+  it happens once per peer per 5 minutes and at most 4 times at once per node, then once per 30 s. Per victim IP
+  the cap is tighter (NB44-1): one spray at a time and at most 2 per 5 minutes across all peers, so a single
+  address receives at most about 550 KB per 5 minutes however many PeerIds name it. The probes are Noise
+  handshakes or sealed punches, about 130 bytes each (~270 KB for a full 2048-probe spray, ~270× the offer that
+  triggered it — a reflection amplifier, which is why the per-IP cap bounds what reaches one victim). An offer
+  saying `Cone` makes a symmetric node send 256 handshakes (about 33 KB) to the offer's address, from 256 sockets
+  it keeps for 10 s.
 - **Lockstep sweep** (NB-045). An offer with a prediction, to a node behind a sequential symmetric NAT, makes it
   send up to 96 handshakes (about 12 KB) to ports of the offer's IP, under the same limits as the birthday spray.
 - **Nostr relays** (`NostrSignaling`):
