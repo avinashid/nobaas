@@ -12,11 +12,12 @@
 //   left open to the caller; a channel that closes while waiting: false;
 // - a link that is direct already: false, at once;
 // - while the endpoint's path still names a relayed channel that just closed, the old
-//   WebRTC link to the peer closing doesn't drop it (NB48b-5).
+//   WebRTC link to the peer closing doesn't drop it (NB48b-5);
+// - 500 CARRY get a handful of CARRIED, none past the buffer cap (NB48b-6).
 //
 //   node packages/js/test/room_adopt.mjs
 import { joinRoom } from '../src/index.js';
-import { CARRY_WAIT_MS } from '../src/webrtc.js';
+import { CARRY, CARRIED, CARRY_EVERY_MS, CARRY_WAIT_MS, MAX_BUFFERED } from '../src/webrtc.js';
 
 const fail = (m) => {
   console.error(`FAIL ${m}`);
@@ -193,6 +194,29 @@ block('a1', 'b1');
   const t2 = Date.now();
   if ((await a.adoptChannel(b.self, s.pc, s.dc)) !== false || Date.now() - t2 > 2000) fail('a channel closed while waiting was not refused promptly');
   console.log('a channel closed while waiting: false at once');
+
+  // 5. A CARRY flood (NB48b-6): a handful of CARRIED, at most one per CARRY_EVERY_MS,
+  // sent through dcSend, so none goes past the buffer cap.
+  const [f, g] = punched();
+  let replies = 0;
+  g.dc.onmessage = (e) => {
+    const v = new Uint8Array(e.data);
+    if (v.length === 1 && v[0] === CARRIED) replies++;
+  };
+  const adopted = a.transport.adopt(b.self, f.pc, f.dc);
+  for (let i = 0; i < 500; i++) g.dc.send(Uint8Array.of(CARRY));
+  if ((await adopted) < 0) fail('the flooded channel was not adopted');
+  await sleep(100);
+  if (replies > 3) fail(`500 CARRY got ${replies} CARRIED`);
+  const flood = replies;
+  await sleep(CARRY_EVERY_MS);
+  const congested = a.transport.congested;
+  f.dc.bufferedAmount = MAX_BUFFERED + 1;
+  for (let i = 0; i < 50; i++) g.dc.send(Uint8Array.of(CARRY));
+  await sleep(100);
+  if (replies !== flood || a.transport.congested === congested) fail(`with the buffer full, ${replies - flood} CARRIED went out (congested ${a.transport.congested - congested})`);
+  console.log(`a CARRY flood: 500 in, ${flood} CARRIED out; with the buffer full, none`);
+  f.pc.close();
   await Promise.all([a.leave(), b.leave()]);
 }
 
