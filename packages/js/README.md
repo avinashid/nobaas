@@ -145,7 +145,10 @@ it is given:
 - `'direct'` (default): every candidate.
 - `'public-only'`: no `host` candidates (LAN, loopback, mDNS `.local` names), in
   trickled ICE and in the SDP. Only what STUN reports goes out, so two tabs on one
-  machine with no STUN server can't link this way.
+  machine with no STUN server can't link this way. No other local address goes either:
+  a candidate's related address (its local socket, which browsers show once a page has
+  mic or camera permission) is cleared, and so is the default address that gathering
+  writes into the SDP's `c=` line and m-line port.
 - `'relay-only'` with `relay: <peer id>`: WebRTC runs with the relay only (also
   public-only); offers from anyone else are ignored and `dial()` to them throws.
   Reach other peers with `endpoint.connectVia(relay, peer)`: the endpoint is
@@ -325,8 +328,14 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/netlab_mic.mjs [shot-prefix]`: Net Lab's "Use microphone" button, with fake
   media and the browser's mDNS hiding on. Before, the local addresses are `.local`; after a grant the
   report says `granted`, the network test lists real local addresses and reads the same NAT, the room
-  is joined again, and the other tab sees `mic` and real local addresses and links direct. A refused
+  is joined again, and the other tab sees `mic` and real local addresses and links direct. The global
+  room, with the grant stored before the tabs open or given while they're in it, gives the other tab
+  no local address and still links, and a birthday punch's offer carries no candidate. A refused
   prompt reports `denied` and doesn't rejoin.
+- `node packages/js/test/netlab_punch_close.mjs`: a Net Lab birthday punch that ends (the peer's abort)
+  while its certificate, fleet, spray connection or answer is still being set up closes the connections
+  made after it ended, and its card keeps the reason it ended, not a stale error. A second offer or
+  answer from the peer is ignored: one fleet, all of it closed at the end.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

@@ -95,5 +95,16 @@ for (const [name, line] of Object.entries(endings)) {
   }
 }
 
+// MIC-1: gathering writes the default candidate (a host one when no STUN server answered)
+// into the connection line and the m-line port; the strip puts both back as they were
+// before gathering, so the SDP names no address at all.
+for (const c of ['c=IN IP4 10.0.0.170', 'c=IN IP6 2001:db8::5']) {
+  const gathered = ['v=0', 'm=application 56167 UDP/DTLS/SCTP webrtc-datachannel', c, 'a=rtcp:56167 IN IP4 10.0.0.170',
+    'a=candidate:1 1 udp 2122260223 10.0.0.170 56167 typ host', 'a=candidate:2 1 udp 1686052607 203.0.113.9 61000 typ srflx raddr 10.0.0.170 rport 56167', 'a=mid:0', ''].join('\r\n');
+  const out = stripCandidates(gathered);
+  ok(out === ['v=0', 'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'c=IN IP4 0.0.0.0', 'a=rtcp:9 IN IP4 0.0.0.0', 'a=mid:0', ''].join('\r\n'),
+    `strip, a gathered SDP (${c}): no candidate, c= 0.0.0.0, port 9${out.includes('10.0.0.170') || out.includes('2001:db8') ? `; left: ${JSON.stringify(out)}` : ''}`);
+}
+
 console.log(failed ? `${failed} FAILED` : 'all passed');
 process.exit(failed ? 1 : 0);

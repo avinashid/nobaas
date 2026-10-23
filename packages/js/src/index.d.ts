@@ -63,7 +63,8 @@ export interface JoinRoomOptions {
   /** Default: none for `'local'`, Google and Cloudflare STUN otherwise. */
   iceServers?: RTCIceServer[];
   /** Which of your addresses peers see in ICE candidates. `'direct'` (default): all of them.
-   * `'public-only'`: no LAN or loopback (`host`) candidates, only what STUN reports, so tabs of one
+   * `'public-only'`: no LAN or loopback (`host`) candidates, only what STUN reports (and no local address in
+   * a candidate's related address or the SDP's `c=` line either), so tabs of one
    * machine with no STUN server can't link. Relay-only is not available for rooms: use
    * `WebRtcTransport` with `privacy: 'relay-only'`. */
   privacy?: 'direct' | 'public-only';

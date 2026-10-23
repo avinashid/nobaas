@@ -8,7 +8,8 @@
 // and a ping measured by the page itself on whatever route is in use (min/avg/max,
 // jitter, loss). It also probes this
 // device's network (public addresses, IPv6, a NAT mapping estimate), can ask for the
-// microphone so the browser shows this device's local addresses, shows the
+// microphone so the browser shares this device's local addresses with named and
+// private rooms (never the global one), shows the
 // signalling relays' state, has a chat, logs every event, warning and error, and
 // copies all of it as one JSON report.
 //
@@ -23,7 +24,7 @@
 //   #key=…             joins that private room
 
 import { joinRoom, randomRoomId, DEFAULT_RELAYS } from '../src/index.js';
-import { openFleet, openSpray, randomCredentials, sprayPorts, isPublicV4, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
+import { openFleet, openSpray, randomCredentials, sprayPorts, isPublicV4, stripCandidates, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
 
 const APP_ID = 'peerwire-netlab';
 const GLOBAL_ROOM = 'global-v1';
@@ -216,46 +217,67 @@ function presence() {
 // so a laptop on a phone's hotspot may link to the phone directly. A connection made
 // before the grant stays hidden, so a grant re-runs the network test and rejoins the
 // room, which makes every link a new connection. Only the permission is needed: the
-// microphone is closed at once.
+// microphone is closed at once. The grant is the site's, for later visits too, and anyone
+// can open the global room: while the microphone is allowed, the global room is joined
+// with privacy 'public-only', so its members never get the local addresses (MIC-1).
 let micState = typeof navigator.mediaDevices?.getUserMedia === 'function' ? 'prompt' : 'unsupported';
+let micChecked = Promise.resolve(); // watchMic()'s first query
+let askingMic = false; // the button's own request, which rejoins by itself
+let roomPrivacy = null; // the privacy the room was joined with
 async function watchMic() {
   if (micState !== 'unsupported') {
     try {
       const st = await navigator.permissions.query({ name: 'microphone' });
       micState = st.state;
-      st.onchange = () => { micState = st.state; renderMic(); };
+      st.onchange = () => {
+        micState = st.state;
+        renderMic();
+        guardGlobal();
+      };
     } catch { /* no 'microphone' query (Firefox): 'prompt' until the button is used */ }
   }
   renderMic();
 }
 function renderMic() {
+  const shares = "this site's pages give the members of named and private rooms this device's local addresses (Wi-Fi, hotspot, VPN), on later visits too";
   const [cls, text] = {
-    granted: ['ok', "allowed: new links offer this device's local addresses"],
+    granted: ['ok', `allowed: ${shares}; remove the microphone in the site settings to stop`],
     denied: ['warn', 'not allowed: local addresses stay hidden (allow the microphone in the site settings)'],
     unsupported: ['faint', 'not available here (needs HTTPS)'],
-  }[micState] ?? ['faint', "for a phone's hotspot: a laptop on it may then link directly. The microphone closes at once"];
+  }[micState] ?? ['faint', `lets ${shares}, until you remove the microphone in the site settings; the microphone closes at once`];
   $('mic').disabled = micState === 'unsupported';
   $('micmsg').className = cls;
-  $('micmsg').textContent = text;
+  $('micmsg').textContent = `${text}${roomKind === 'global' && micState !== 'unsupported' ? ' · local addresses are kept out of the global room' : ''}`;
+}
+// The global room never gets the local addresses: one joined without that guard while
+// the microphone is now allowed (in another tab of this site, in the site settings, or
+// as it joined) is joined again with it.
+function guardGlobal() {
+  if (askingMic || !room || roomKind !== 'global' || roomPrivacy === 'public-only' || micState !== 'granted') return;
+  log('info', 'the microphone is allowed on this site: rejoining the global room without local addresses');
+  rejoin();
 }
 async function useMic() {
   $('mic').disabled = true;
+  askingMic = true;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     for (const t of stream.getTracks()) t.stop();
     micState = 'granted';
   } catch (e) {
+    askingMic = false;
     if (e?.name === 'NotAllowedError' || e?.name === 'SecurityError') micState = 'denied';
     log('warn', `microphone ${micState === 'denied' ? 'not allowed' : 'unavailable'}: ${e?.name ?? 'error'}${e?.message ? ` (${clip(e.message, 120)})` : ''}; local addresses stay hidden`);
     return renderMic();
   }
   renderMic();
   $('mic').disabled = true; // until the room is joined again
-  log('info', `microphone allowed (closed again at once): new connections offer this device's local addresses; re-testing the network${room ? ' and rejoining the room' : ''}`);
+  log('info', `microphone allowed (closed again at once): new links in named and private rooms offer this device's local addresses (never the global room's); re-testing the network${room ? ' and rejoining the room' : ''}`);
   try {
     await reprobe();
     await rejoin();
   } finally {
+    askingMic = false;
     renderMic();
   }
 }
@@ -355,7 +377,9 @@ async function enter(kind, key) {
   $('joinmsg').textContent = 'connecting to the signalling relays…';
   const relays = params.get('relays')?.split(',').filter(Boolean);
   const signaling = params.get('signal') === 'local' ? 'local' : 'nostr';
-  log('info', `joining the ${kind} room over ${signaling === 'local' ? 'local BroadcastChannel' : `Nostr (${(relays ?? DEFAULT_RELAYS).join(', ')})`}${params.get('rtc') === 'off' ? ', WebRTC disabled (?rtc=off)' : ''}`);
+  await micChecked; // a stored grant must be known before choosing the global room's privacy
+  const privacy = kind === 'global' && micState === 'granted' ? 'public-only' : 'direct';
+  log('info', `joining the ${kind} room over ${signaling === 'local' ? 'local BroadcastChannel' : `Nostr (${(relays ?? DEFAULT_RELAYS).join(', ')})`}${params.get('rtc') === 'off' ? ', WebRTC disabled (?rtc=off)' : ''}${privacy === 'public-only' ? ', without local addresses (the microphone is allowed)' : ''}`);
   const started = now();
   try {
     room = await joinRoom({
@@ -363,6 +387,7 @@ async function enter(kind, key) {
       // Named rooms get a prefix, so no name opens the global room or a private one.
       roomId: kind === 'global' ? GLOBAL_ROOM : kind === 'named' ? `named/${key}` : key,
       signaling,
+      privacy,
       presence: { ...presence(), name: clip($('name').value.trim(), 20) || 'guest' },
       ...(relays?.length && { relays }),
       ...(params.get('rtc') === 'off' && { RTCPeerConnection: NoIcePc }),
@@ -374,9 +399,12 @@ async function enter(kind, key) {
     return;
   }
   joinedAt = now();
+  roomPrivacy = privacy;
   if (!$('name').value.trim()) room.setPresence(presence());
   log('info', `joined in ${ms(joinedAt - started)} as ${short(room.self)}; waiting for peers`);
   hook();
+  renderMic();
+  guardGlobal(); // the microphone was allowed while this joined
   if (kind === 'private') history.replaceState(null, '', `${location.pathname}${location.search}#key=${key}`);
   if (kind === 'named') {
     history.replaceState(null, '', `${location.pathname}${location.search}#room=${encodeURIComponent(key)}`);
@@ -578,6 +606,10 @@ function bdayFail(peer, why) {
   bdayStatus(peer, 'failed', { why });
   log('warn', `birthday punch with ${nameOf(peer)}: ${why}`);
 }
+// Whether `b` is still `peer`'s punch in progress: not closed (a failure, the timeout,
+// the peer's abort) nor left behind by a rejoin. Checked after every await of a punch's
+// setup, so what it opened meanwhile is closed, not kept running (MIC-2).
+const current = (peer, b) => peers.get(peer)?.bday === b && !!b.ctx;
 function closeBday(peer) {
   if (bdayBusy === peer) bdayBusy = null; // NB48b-2: only the punch holding the slot frees it, not a refusal
   const b = peerState(peer).bday;
@@ -645,22 +677,38 @@ async function onBirthday(peer, data) {
     return;
   }
   if (data.step === 'offer' && b.role === 'hard' && typeof data.sdp === 'string') {
+    // One offer per punch, marked before any await: a second would open a second fleet,
+    // and closing the punch would close only the last one.
+    if (b.ctx.offered) return;
+    b.ctx.offered = true;
     // The hard side: open the fleet answering the easy side's one offer, aimed only at the
     // one validated address it gave (openFleet strips the offer's candidates). Answer with our IP.
     const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+    if (!current(peer, b)) return;
     const creds = randomCredentials();
     const size = Number(params.get('fleet')) || FLEET_SIZE;
     const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size, easyAddr: data.addr });
+    if (!current(peer, b)) {
+      for (const c of hard.conns) c.pc.close();
+      return;
+    }
     b.ctx.hard = hard;
     log('info', `birthday punch with ${nameOf(peer)}: opened ${hard.conns.length} sockets, answering`);
     room.send({ t: 'bday', step: 'answer', sdp: hard.answerSdp, ip: myProbedV4() }, { to: peer });
     hard.done.then((c) => bdayWon(peer, c)).catch(() => {});
   } else if (data.step === 'answer' && b.role === 'easy' && typeof data.sdp === 'string') {
+    // One answer per punch: a second would be applied to a connection that has one.
+    if (b.ctx.answered) return;
+    b.ctx.answered = true;
     const ip = typeof data.ip === 'string' ? data.ip : null;
     if (!isPublicV4(ip)) return bdayFail(peer, 'the peer named no public IPv4 to spray'); // NB48-2
     const ports = sprayPorts(SPRAY_PORTS);
     log('info', `birthday punch with ${nameOf(peer)}: spraying ${ports.length} ports at ${ip}`);
-    await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
+    try {
+      await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
+    } catch (e) {
+      if (current(peer, b)) throw e; // else the punch ended meanwhile, and its end closed the connection
+    }
   } else if (data.step === 'abort') {
     bdayFail(peer, `the peer stopped: ${clip(data.why, 80)}`);
   }
@@ -670,8 +718,12 @@ async function onBirthday(peer, data) {
 async function beEasy(peer) {
   const b = peerState(peer).bday;
   const easy = await openSpray({ RTCPeerConnection, iceServers: bdayIce() });
+  if (!current(peer, b)) return void easy.pc.close();
   b.ctx.easy = easy;
-  room.send({ t: 'bday', step: 'offer', sdp: easy.offerSdp, addr: srflxAddr(easy.offerSdp) }, { to: peer });
+  // The offer goes without its candidates: the hard side uses none (openFleet strips them
+  // and aims at `addr`), and after a mic grant they would name every local address, in
+  // the global room too (MIC-1).
+  room.send({ t: 'bday', step: 'offer', sdp: stripCandidates(easy.offerSdp), addr: srflxAddr(easy.offerSdp) }, { to: peer });
   easy.done.then((c) => bdayWon(peer, c)).catch(() => {});
 }
 
@@ -1331,7 +1383,7 @@ const hashRoom = parseRoom(location.hash);
 $('roomname').value = hashRoom ?? params.get('room') ?? '';
 roomHint();
 showRecent();
-watchMic();
+micChecked = watchMic();
 reprobe();
 if (hashKey) enter('private', hashKey);
 else if (hashRoom) enter('named', hashRoom);
