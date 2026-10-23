@@ -120,7 +120,13 @@ try {
       const ids = await Promise.all([g1, g2].map((p) => wait(p, () => window.netlab.self).then(() => p.evaluate(() => window.netlab.self))));
       await Promise.all([linkedTo(g1, ids[1]), linkedTo(g2, ids[0])]);
       const r1 = await report(g1);
-      return { hosts: [await hostsOf(g1, ids[1]), await hostsOf(g2, ids[0])], mic: r1.me.mediaPermission,
+      const hosts = [await hostsOf(g1, ids[1]), await hostsOf(g2, ids[0])];
+      // A birthday punch's offer: the smaller id plays the easy side, which sends it at once.
+      const [easy, hard] = ids[0] < ids[1] ? [g1, g2] : [g2, g1];
+      const easyId = ids[0] < ids[1] ? ids[0] : ids[1];
+      await easy.evaluate(() => window.netlab.punch(0));
+      const offer = await hard.waitForFunction((x) => window.netlab.birthday().find((b) => b.id === x)?.pendingOffer?.sdp, easyId, { timeout: 20000 }).then((v) => v.jsonValue());
+      return { hosts, offer, mic: r1.me.mediaPermission,
         joinLog: r1.log.find((e) => e.msg.startsWith('joining the global room'))?.msg, note: await g1.textContent('#micmsg'), page: g1 };
     })(),
     (async () => {
@@ -139,6 +145,8 @@ try {
     const g = gSettled.value;
     ok(g.mic === 'granted' && none(g.hosts), `global room, grant stored before: linked, local addresses given ${JSON.stringify(g.hosts)}`);
     ok(/without local addresses/.test(g.joinLog) && /kept out of the global room/.test(g.note), `and it says so: "${g.joinLog}" · "${g.note.split(' · ')[1]}"`);
+    const cands = g.offer.split('\n').filter((l) => /^a=candidate:/.test(l.trim()));
+    ok(/^v=0/.test(g.offer) && /\nm=application /.test(g.offer) && !cands.length, `and a birthday punch's offer carries no candidate (${cands.length}${cands.length ? `: ${cands.map((l) => l.split(' ')[4]).join(', ')}` : ''})`);
     if (shot) await card(g.page).screenshot({ path: `${shot}-global.png` });
   }
   if (hSettled.status === 'rejected') ok(false, `global room, granted while in it: ${hSettled.reason.message}`);

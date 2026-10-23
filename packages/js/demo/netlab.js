@@ -24,7 +24,7 @@
 //   #key=…             joins that private room
 
 import { joinRoom, randomRoomId, DEFAULT_RELAYS } from '../src/index.js';
-import { openFleet, openSpray, randomCredentials, sprayPorts, isPublicV4, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
+import { openFleet, openSpray, randomCredentials, sprayPorts, isPublicV4, stripCandidates, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
 
 const APP_ID = 'peerwire-netlab';
 const GLOBAL_ROOM = 'global-v1';
@@ -698,7 +698,10 @@ async function beEasy(peer) {
   const b = peerState(peer).bday;
   const easy = await openSpray({ RTCPeerConnection, iceServers: bdayIce() });
   b.ctx.easy = easy;
-  room.send({ t: 'bday', step: 'offer', sdp: easy.offerSdp, addr: srflxAddr(easy.offerSdp) }, { to: peer });
+  // The offer goes without its candidates: the hard side uses none (openFleet strips them
+  // and aims at `addr`), and after a mic grant they would name every local address, in
+  // the global room too (MIC-1).
+  room.send({ t: 'bday', step: 'offer', sdp: stripCandidates(easy.offerSdp), addr: srflxAddr(easy.offerSdp) }, { to: peer });
   easy.done.then((c) => bdayWon(peer, c)).catch(() => {});
 }
 
