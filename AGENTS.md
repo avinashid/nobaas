@@ -46,10 +46,16 @@ runs share this host's 4 cores, so running it on every branch as well costs more
   ```
 
   A change comes with its test; run it. A change to docs or comments only needs no run: say so on the card.
+  When every file changed since `origin/main` is JS, docs or another non-Rust path, the gate skips the Rust steps
+  (`SKIP cargo test (no Rust change since origin/main <sha>)`); `--full` runs them anyway.
 - **Reviewing** (security, QA): read the diff against the code. Re-run a test only to reproduce a problem or try a
   mutant, and say which.
 - **After merging** (the lead): `scripts/gate.sh --strict` once on the merged `main`, before asking to push. CI runs
   the Rust and Node steps on push but not the browser tests, so this is their only full run.
+
+The gate builds first, then runs the Rust tests (under `cargo-nextest` when it is installed) beside the Node tests,
+`GATE_JOBS` (default 4) at a time, so a Node test must not use a fixed port or file. Each step logs to
+`target/gate-logs/<step>.log`; a failed step's log is printed in full above the summary.
 
 Browser tests use headless Chromium through Playwright (already installed; do not install it):
 `node packages/js/test/browser.mjs [tabs]` and `node packages/js/test/arena.mjs` run on loopback only.

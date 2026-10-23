@@ -1,0 +1,13 @@
+# cargo-nextest settings (https://nexte.st). scripts/gate.sh runs the Rust tests with `--profile gate`.
+# Every test binary binds only ephemeral loopback ports (127.0.0.1:0, [::1]:0), so tests from different binaries
+# can run at once: no serial test group is needed. Add one here if a test ever needs a fixed port or file.
+
+[profile.gate]
+# Run every test after a failure too, so the log lists every failing test, not just the first.
+fail-fast = false
+
+# The slowest tests (5-18 s each) start first, so none of them is left running alone at the end. A renamed test
+# just loses its place in the queue.
+[[profile.gate.overrides]]
+filter = 'test(/overloaded_super_peer_degrades|worker_stopped_mid_upnp_chain|islands_survive_a_super_peer_dying|fuzz_hostile_peer|fuzz_sealed|fuzz_the_c_abi/)'
+priority = 100

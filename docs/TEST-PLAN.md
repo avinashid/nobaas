@@ -11,6 +11,7 @@ scripts/gate.sh             # everything below that stays on loopback
 scripts/gate.sh --quick     # skip the browser tests (no Playwright needed)
 scripts/gate.sh --strict    # clippy with -D warnings, and the fuzz tests again in a debug build
 scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a change touches signaling
+scripts/gate.sh --full      # the Rust steps even when no Rust changed since origin/main (GATE_BASE)
 ```
 
 **Who runs what** (details in `AGENTS.md`): the author runs `--quick` (with `--strict` after a Rust change) plus
@@ -20,9 +21,9 @@ browser tests.
 
 | Step | Command | Passes when |
 |---|---|---|
-| Rust tests | `cargo test --workspace --release` | every test passes (ignored tests are known gaps, below) |
+| Rust tests | `cargo nextest run --workspace --release --profile gate` and `cargo test --doc --workspace --release` (`cargo test --workspace --release` without cargo-nextest) | every test passes (ignored tests are known gaps, below) |
 | Lints | `cargo clippy --workspace --all-targets` (`-- -D warnings` with `--strict`) | no errors; `--strict` is clean today |
-| Fuzz, debug build (`--strict`) | `cargo test --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz` | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
+| Fuzz, debug build (`--strict`) | `cargo nextest run --profile gate --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz` (or `cargo test` with the same arguments) | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
 | Format | `cargo fmt --all -- --check` | no diff (skipped if rustfmt is not installed) |
 | wasm build | `packages/js/build.sh` | builds `packages/js/pkg/peerwire_ffi.wasm` |
 | wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
@@ -234,4 +235,4 @@ On Linux CI, `scripts/gate.sh --strict` alone covers every job except the macOS 
 Each backlog task's acceptance criteria get a named test before the task moves to review: unit or crate
 integration for an API, a simulator test for anything that crosses the network, a browser test for anything in
 `packages/js` or `examples/`. The task card lists the test names and the gate output. When reviewing a branch, QA
-runs `scripts/gate.sh --strict` on it and posts the summary block plus any failing output on the card.
+reads the diff against the code and re-runs a test only to reproduce a problem or try a mutant (see `AGENTS.md`).
