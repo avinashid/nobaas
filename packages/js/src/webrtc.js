@@ -142,9 +142,19 @@ export function candidateSummary(sdp) {
 }
 
 // Removes `host` candidates (LAN, loopback, mDNS .local names) from an SDP, keeping
-// server-reflexive (public, from STUN) and relay ones.
+// server-reflexive (public, from STUN) and relay ones, and every other local address
+// with them (MIC-1): a kept candidate's related address (its local socket, once the page
+// has mic or camera permission) is cleared, and the connection line and m-line port go
+// back to the values before gathering (which writes the default candidate there, a host
+// one when no STUN server answered). ICE reads none of those.
 export function withoutHostCandidates(sdp) {
-  return sdp.split('\r\n').filter((l) => !(l.startsWith('a=candidate:') && / typ host( |$)/.test(l))).join('\r\n');
+  return sdp.split('\r\n').filter((l) => !(l.startsWith('a=candidate:') && / typ host( |$)/.test(l))).map(unaddressed).join('\r\n');
+}
+
+// A candidate (with or without `a=`) or SDP line that names no local address.
+function unaddressed(l) {
+  return l.replace(/ raddr \S+ rport \d+/, ' raddr 0.0.0.0 rport 0').replace(/^c=IN IP[46] [^\s]+/i, 'c=IN IP4 0.0.0.0')
+    .replace(/^(m=\S+ )\d+/, (_, m) => `${m}9`).replace(/^a=rtcp:\d+ IN IP[46] [^\s]+/i, 'a=rtcp:9 IN IP4 0.0.0.0');
 }
 
 export class WebRtcTransport {
@@ -260,11 +270,11 @@ export class WebRtcTransport {
     pc.onicecandidate = (e) => {
       const c = e.candidate;
       if (c && this.privacy !== 'direct' && / typ host( |$)/.test(c.candidate)) return;
-      if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: c.toJSON() }));
+      if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: this.outgoing(c) }));
       if (!l.described) return; // still to go in the description
       if (!c) return void this.sendLate(l); // gathering complete: send what is buffered
       if (l.lateSent + l.late.length >= MAX_LATE) return; // bounded
-      l.late.push(c.toJSON());
+      l.late.push(this.outgoing(c));
       // The first batch waits for gathering to settle (describe()'s LATE_ICE_MS timer);
       // a candidate found after that batch is sent LATE_FLUSH_MS later, so a slow public
       // address (a device that gathered mDNS first) still reaches the peer.
@@ -406,6 +416,12 @@ export class WebRtcTransport {
   // Whether WebRTC (which hands the peer our addresses) may run with `peer`.
   allowed(peer) {
     return this.privacy !== 'relay-only' || peer === this.relay;
+  }
+
+  // A candidate to send: unless 'direct', with its related address (a local socket) cleared.
+  outgoing(c) {
+    const j = c.toJSON();
+    return this.privacy === 'direct' ? j : { ...j, candidate: unaddressed(j.candidate ?? '') };
   }
 
   // The local description to send, with host candidates left out unless 'direct'.

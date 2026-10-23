@@ -110,8 +110,17 @@ function dataChannel(pc) {
 // NB48b-3: lines are split the way Chrome's SDP parser splits them, on `\n` only, so a
 // candidate line ending in `\r\r\n`, a stray `\r` or a U+2028 is dropped like any other
 // (a regex line model kept those, and Chrome still parsed them as candidates).
+// MIC-1: gathering also writes the default candidate (a host one when no STUN server
+// answered) into the connection line and the m-line port; those go back to the values
+// before gathering, so the SDP names no address at all. ICE reads only candidate lines.
 export function stripCandidates(sdp) {
-  return sdp.split('\n').filter((l) => !/^\s*a=candidate:/i.test(l)).join('\n');
+  return sdp.split('\n').filter((l) => !/^\s*a=candidate:/i.test(l)).map(unaddressed).join('\n');
+}
+// An SDP line with the address gathering wrote into it put back: `c=`, the m-line port
+// and `a=rtcp:` as before gathering (webrtc.js does the same for its descriptions).
+function unaddressed(l) {
+  return l.replace(/^c=IN IP[46] [^\s]+/i, 'c=IN IP4 0.0.0.0').replace(/^(m=\S+ )\d+/, (_, m) => `${m}9`)
+    .replace(/^a=rtcp:\d+ IN IP[46] [^\s]+/i, 'a=rtcp:9 IN IP4 0.0.0.0');
 }
 
 // NB48b-3: Chrome's own view of a remote description we stripped must carry no
