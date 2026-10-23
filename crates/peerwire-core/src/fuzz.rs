@@ -646,3 +646,42 @@ fn hostile_peer_pins_bounded_receive_memory() {
         assert!(net.events.iter().any(|(n, e)| *n == a && dropped(e)), "urgent {urgent}");
     }
 }
+
+#[test]
+fn fuzz_birthday_spray() {
+    // NB-044: a spray from a dial probes min(count, MAX_SPRAY) ports of the
+    // base's IP, each once, all from 1024 up, at most SPRAY_BATCH (16) per batch.
+    use crate::endpoint::MAX_SPRAY;
+    let keys = identities(2);
+    let mut rng = Rng::for_target("spray");
+    let mut total = 0usize;
+    for _ in 0..cases(60) {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&rng.u64().to_le_bytes());
+        let mut ep = Endpoint::new(&keys[0], Config::default(), seed);
+        let target = SocketAddr::from(([198, 51, 100, 7], 4000)); // the dial's retries go here
+        ep.connect(Instant::ZERO, target, keys[1].peer_id()).unwrap();
+        while ep.poll_transmit(Instant::ZERO).is_some() {}
+        let base = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(rng.u32() | 1 << 31)), rng.u32() as u16);
+        let count = rng.below(6000) as u16;
+        ep.spray(Instant::ZERO, &keys[1].peer_id(), &base, count);
+        let mut seen = std::collections::HashSet::new();
+        for ms in (0..30_000).step_by(10) {
+            let now = Instant::from_millis(ms);
+            ep.handle_timeout(now);
+            let probes: Vec<SocketAddr> =
+                std::iter::from_fn(|| ep.poll_transmit(now)).map(|t| t.dst).filter(|d| *d != target).collect();
+            assert!(probes.len() <= 16, "{} probes at {ms} ms", probes.len());
+            for d in probes {
+                assert_eq!(d.ip(), base.ip());
+                assert!(d.port() >= 1024, "{d}");
+                assert!(seen.insert(d.port()), "port {} probed twice", d.port());
+            }
+        }
+        let want = usize::from(count.min(MAX_SPRAY));
+        assert_eq!(seen.len(), want);
+        assert_eq!(ep.stats().spray_probes as usize, want);
+        total += want;
+    }
+    println!("fuzz spray: {total} probes, every port once");
+}

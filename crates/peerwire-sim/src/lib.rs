@@ -170,6 +170,31 @@ pub struct Node {
     /// [`Sim::measure_cpu`] is on. Not virtual time, so not deterministic.
     pub cpu: Duration,
     tx_free_at: Instant,
+    /// Extra sockets ([`Sim::open_ports`]) by local port, on `addr`'s IP.
+    extra: HashMap<u16, ExtraPort>,
+    /// Which extra port sends to an address: the first that heard from it.
+    routes: HashMap<SimAddr, u16>,
+    next_port: u16,
+}
+
+/// An extra socket, as a host opens for birthday punching.
+struct ExtraPort {
+    /// Closed then unless it is a route.
+    until: Instant,
+    /// Last heard from an address it is the route for.
+    last_recv: Option<Instant>,
+}
+
+/// A routed extra port is closed once it has heard nothing for this long.
+pub const ROUTE_IDLE: Duration = Duration::from_secs(60);
+
+impl ExtraPort {
+    fn open(&self, now: Instant) -> bool {
+        match self.last_recv {
+            Some(t) => now < t + ROUTE_IDLE,
+            None => now < self.until,
+        }
+    }
 }
 
 struct InFlight {
@@ -346,6 +371,9 @@ impl Sim {
             stun_inbox: Vec::new(),
             cpu: Duration::ZERO,
             tx_free_at: Instant::ZERO,
+            extra: HashMap::new(),
+            routes: HashMap::new(),
+            next_port: HOST_PORT,
         });
         self.timers.push(None);
         self.is_touched.push(false);
@@ -442,6 +470,44 @@ impl Sim {
         self.put_on_wire(i, to, data);
     }
 
+    /// Opens `n` extra sockets on node `i`'s IPv4 address, as a host does for
+    /// birthday punching (`peerwire`'s `Traversal::poll_birthday`); returns their
+    /// ports. Like the host, the simulator hands the endpoint what they receive,
+    /// and sends the endpoint's datagrams to an address one of them heard from out
+    /// of the first that did (its route). One that is no address's route closes at
+    /// `until`; a route, after [`ROUTE_IDLE`] without a packet.
+    pub fn open_ports(&mut self, i: usize, n: u16, until: Instant) -> Vec<u16> {
+        let now = self.now;
+        let node = &mut self.nodes[i];
+        node.extra.retain(|_, p| p.open(now));
+        let extra = &node.extra;
+        node.routes.retain(|_, p| extra.contains_key(p));
+        let mut ports = Vec::new();
+        while ports.len() < n as usize && node.extra.len() < 60_000 {
+            node.next_port = if node.next_port == u16::MAX { 1024 } else { node.next_port + 1 };
+            let p = node.next_port;
+            if p != node.addr.port && !node.extra.contains_key(&p) {
+                node.extra.insert(p, ExtraPort { until, last_recv: None });
+                ports.push(p);
+            }
+        }
+        ports
+    }
+
+    /// Sends a datagram from node `i`'s extra socket `port` ([`Sim::open_ports`]).
+    pub fn send_from(&mut self, i: usize, port: u16, to: SimAddr, data: Vec<u8>) {
+        if self.nodes[i].extra.get(&port).is_some_and(|p| p.open(self.now)) {
+            self.put_on_wire_from(i, Some(port), to, data);
+        }
+    }
+
+    /// Extra sockets of node `i` still open, and how many of them have a route.
+    pub fn open_port_count(&self, i: usize) -> (usize, usize) {
+        let n = &self.nodes[i];
+        let open = n.extra.values().filter(|p| p.open(self.now)).count();
+        (open, n.extra.values().filter(|p| p.open(self.now) && p.last_recv.is_some()).count())
+    }
+
     /// Answers a Binding request that reached a STUN server with the address it came from.
     fn answer_stun(&mut self, p: &InFlight) {
         let (Some(tx), Some(seen)) = (stun::parse_binding_request(&p.data), p.from.to_socket_addr()) else { return };
@@ -510,9 +576,17 @@ impl Sim {
         (self.rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    fn put_on_wire(&mut self, i: usize, to: SimAddr, mut data: Vec<u8>) {
+    fn put_on_wire(&mut self, i: usize, to: SimAddr, data: Vec<u8>) {
+        self.put_on_wire_from(i, None, to, data)
+    }
+
+    /// From `port`, an extra socket, or else the one routed to `to`, or else the main one.
+    fn put_on_wire_from(&mut self, i: usize, port: Option<u16>, to: SimAddr, mut data: Vec<u8>) {
+        let now = self.now;
+        let n = &self.nodes[i];
+        let routed = n.routes.get(&to).copied().filter(|p| n.extra.get(p).is_some_and(|x| x.open(now)));
         let from = match (to.is_v6(), self.nodes[i].addr6) {
-            (false, _) => self.nodes[i].addr,
+            (false, _) => SimAddr::new(n.addr.ip, port.or(routed).unwrap_or(n.addr.port)),
             (true, Some(a6)) => {
                 self.nodes[i].pinholes.insert(to);
                 a6
@@ -593,9 +667,20 @@ impl Sim {
                 continue;
             }
             match self.descend(&p) {
-                Some(i) => {
+                Some((i, port)) => {
                     self.stats.delivered += 1;
+                    let now = self.now;
                     let n = &mut self.nodes[i];
+                    if n.extra.contains_key(&port) {
+                        // The first open extra port to hear from an address is its route;
+                        // only a route stays open past `until`.
+                        let open = |r: &u16| n.extra.get(r).is_some_and(|x| x.open(now));
+                        let route = n.routes.get(&p.from).copied().filter(open).unwrap_or(port);
+                        n.routes.insert(p.from, route);
+                        if route == port {
+                            n.extra.get_mut(&port).expect("extra port").last_recv = Some(now);
+                        }
+                    }
                     n.rx_packets += 1;
                     n.rx_bytes += p.data.len() as u64 + 28;
                     if stun::is_stun(&p.data) {
@@ -665,14 +750,17 @@ impl Sim {
         }
     }
 
-    /// Walks an arriving packet down through NATs to its node.
-    fn descend(&mut self, p: &InFlight) -> Option<usize> {
+    /// Walks an arriving packet down through NATs to its node; returns it and the
+    /// local port it arrived at.
+    fn descend(&mut self, p: &InFlight) -> Option<(usize, u16)> {
         let (mut realm, mut dst) = (p.realm, p.to);
+        let now = self.now;
         loop {
             match *self.owners.get(&dst.ip)? {
                 Owner::Node(i) => {
                     let n = &self.nodes[i];
-                    return (n.realm == realm && n.addr == dst).then_some(i);
+                    let port = dst.port == n.addr.port || n.extra.get(&dst.port).is_some_and(|x| x.open(now));
+                    return (n.realm == realm && n.addr.ip == dst.ip && port).then_some((i, dst.port));
                 }
                 Owner::Node6(i) => {
                     let n = &mut self.nodes[i];
@@ -683,7 +771,7 @@ impl Sim {
                         n.firewall_dropped += 1;
                         return None;
                     }
-                    return Some(i);
+                    return Some((i, dst.port));
                 }
                 Owner::Nat(n) => {
                     if self.nats[n].outer != realm {

@@ -1,6 +1,6 @@
 use crate::portmap::{self, PortMapping, Worker};
 use crate::signaling::Signaling;
-use crate::traversal::{Failure, NatType, Privacy, Role, Signal, Traversal};
+use crate::traversal::{Birthday, Failure, NatType, Privacy, Role, Signal, Traversal};
 use crate::Event;
 use peerwire_core::{
     Config, ConnectError, Endpoint, Identity, Invite, Lane, Path, PeerId, PeerStats, SendError, Transmit,
@@ -24,6 +24,13 @@ const SIGNAL_POLL: Duration = Duration::from_millis(50);
 /// wait starts over once a link has held for 30 s.
 const RELAY_REDIAL: Duration = Duration::from_secs(1);
 const RELAY_REDIAL_MAX: Duration = Duration::from_secs(30);
+/// Most extra sockets open at once, for birthday punching (two punches' worth).
+const MAX_EXTRA_SOCKETS: usize = 512;
+/// An extra socket that carries a route is closed once it has heard nothing for this long.
+const ROUTE_IDLE: Duration = Duration::from_secs(60);
+/// While extra sockets are open, a host sleeping on `next_timeout` wakes at least
+/// this often to read them (it can only wait on the main socket).
+const EXTRA_POLL: Duration = Duration::from_millis(5);
 
 /// Public STUN servers [`Node::bind`] asks for the node's public address.
 pub const DEFAULT_STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
@@ -174,6 +181,9 @@ impl Builder {
             portmap_at: self.portmap_at,
             releasing: None,
             relay_peers: Vec::new(),
+            extra: HashMap::new(),
+            routes: HashMap::new(),
+            next_extra: 0,
         };
         node.sync_port_mapping();
         node.pump_signals();
@@ -200,6 +210,29 @@ pub struct Node {
     /// A worker stopped by a switch to relay-only, deleting its mapping.
     releasing: Option<Worker>,
     relay_peers: Vec<RelayPeer>,
+    /// Extra sockets for birthday punching ([`Traversal::poll_birthday`]), by id.
+    extra: HashMap<u64, Extra>,
+    /// The extra socket that sends to an address: the first to hear from it.
+    routes: HashMap<SocketAddr, u64>,
+    next_extra: u64,
+}
+
+/// An extra socket, opened for birthday punching.
+struct Extra {
+    sock: UdpSocket,
+    /// Closed then, unless it is some address's route.
+    until: peerwire_core::Instant,
+    /// Last heard from an address it is the route for.
+    last_recv: Option<peerwire_core::Instant>,
+}
+
+impl Extra {
+    fn open(&self, now: peerwire_core::Instant) -> bool {
+        match self.last_recv {
+            Some(t) => now < t + ROUTE_IDLE,
+            None => now < self.until,
+        }
+    }
 }
 
 /// An always-on peer kept linked as a relay ([`Node::set_relay_peers`]).
@@ -573,6 +606,7 @@ impl Node {
                 Err(_) => continue,
             }
         }
+        self.read_extra(now);
         if let Some(sig) = self.signaling.as_mut() {
             for _ in 0..MAX_SIGNALS_PER_POLL {
                 let Some((topic, payload)) = sig.poll() else { break };
@@ -585,6 +619,10 @@ impl Node {
         if self.trav.poll_timeout().is_some_and(|t| t <= now) {
             self.trav.handle_timeout(now, &mut self.ep);
         }
+        while let Some(b) = self.trav.poll_birthday() {
+            self.open_extra(&b);
+        }
+        self.close_extra(now);
         while let Some(e) = self.ep.poll_event() {
             let about = match &e {
                 Event::Connected { peer, .. }
@@ -642,7 +680,8 @@ impl Node {
         let redial = self.relay_peers.iter().filter(|r| self.status(&r.peer) == Status::Disconnected);
         let redial = redial.map(|r| r.retry_at.saturating_duration_since(wall)).min();
         let redial = redial.filter(|_| !matches!(self.privacy(), Privacy::RelayOnly { .. }));
-        let t = [t, redial].into_iter().flatten().min();
+        let extra = (!self.extra.is_empty()).then_some(EXTRA_POLL);
+        let t = [t, redial, extra].into_iter().flatten().min();
         match self.signaling {
             Some(_) => Some(t.map_or(SIGNAL_POLL, |t| t.min(SIGNAL_POLL))),
             None => t,
@@ -650,6 +689,9 @@ impl Node {
     }
 
     /// The UDP socket, for hosts that wait on its readiness (it is non-blocking).
+    /// While a birthday punch keeps extra sockets open (see
+    /// [`Traversal::poll_birthday`]), [`next_timeout`](Node::next_timeout) is at most
+    /// 5 ms, so a host waiting on this socket still reads them.
     pub fn socket(&self) -> &UdpSocket {
         &self.sock
     }
@@ -698,16 +740,85 @@ impl Node {
         }
     }
 
-    /// `false` only when the socket's send buffer is full.
+    /// `false` only when the socket's send buffer is full. Goes out of the extra
+    /// socket that is `t.dst`'s route, if any, else the main one.
     fn try_send(&self, t: &Transmit<SocketAddr>) -> bool {
-        let dst = match t.dst {
-            SocketAddr::V4(a) if self.local.is_ipv6() => SocketAddr::new(a.ip().to_ipv6_mapped().into(), a.port()),
-            dst => dst,
-        };
-        match self.sock.send_to(&t.payload, dst) {
+        let sock = self.routes.get(&t.dst).and_then(|id| self.extra.get(id)).map_or(&self.sock, |x| &x.sock);
+        match sock.send_to(&t.payload, self.wire_addr(t.dst)) {
             Ok(_) => true,
             Err(e) => e.kind() != ErrorKind::WouldBlock, // unreachable addresses etc.: drop it
         }
+    }
+
+    /// `dst` as the socket takes it: IPv4 as `::ffff:a.b.c.d` on an IPv6 socket.
+    fn wire_addr(&self, dst: SocketAddr) -> SocketAddr {
+        match dst {
+            SocketAddr::V4(a) if self.local.is_ipv6() => SocketAddr::new(a.ip().to_ipv6_mapped().into(), a.port()),
+            dst => dst,
+        }
+    }
+
+    /// Opens a birthday punch's sockets, on the main socket's address but any
+    /// port, and sends its payload from each (see [`Traversal::poll_birthday`]).
+    fn open_extra(&mut self, b: &Birthday<SocketAddr>) {
+        let any = SocketAddr::new(self.local.ip(), 0);
+        let n = (b.sockets as usize).min(MAX_EXTRA_SOCKETS.saturating_sub(self.extra.len()));
+        for _ in 0..n {
+            let Ok(sock) = bind_socket(any) else { break };
+            if sock.set_nonblocking(true).is_err() {
+                continue;
+            }
+            let _ = sock.send_to(&b.payload, self.wire_addr(b.dst));
+            self.next_extra += 1;
+            self.extra.insert(self.next_extra, Extra { sock, until: b.until, last_recv: None });
+        }
+    }
+
+    /// Hands the endpoint what the extra sockets heard. The first open one to hear
+    /// from an address becomes its route.
+    fn read_extra(&mut self, now: peerwire_core::Instant) {
+        let ids: Vec<u64> = self.extra.keys().copied().collect();
+        for id in ids {
+            for _ in 0..MAX_READS_PER_POLL {
+                let Some(x) = self.extra.get(&id) else { break };
+                let (n, from) = match x.sock.recv_from(&mut self.buf[..]) {
+                    Ok(r) => r,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => continue,
+                };
+                let from = SocketAddr::new(from.ip().to_canonical(), from.port());
+                if peerwire_core::stun::is_stun(&self.buf[..n]) {
+                    continue; // STUN is asked on the main socket only
+                }
+                let open = |r: &u64| self.extra.get(r).is_some_and(|x| x.open(now));
+                let route = self.routes.get(&from).copied().filter(open).unwrap_or(id);
+                self.routes.insert(from, route);
+                if route == id {
+                    if let Some(x) = self.extra.get_mut(&id) {
+                        x.last_recv = Some(now);
+                    }
+                }
+                self.ep.handle_datagram(now, from, &self.buf[..n]);
+            }
+        }
+    }
+
+    /// Closes the extra sockets that are no route by their `until`, and routes
+    /// that have heard nothing for [`ROUTE_IDLE`].
+    fn close_extra(&mut self, now: peerwire_core::Instant) {
+        if self.extra.is_empty() {
+            return;
+        }
+        self.extra.retain(|_, x| x.open(now));
+        let extra = &self.extra;
+        self.routes.retain(|_, id| extra.contains_key(id));
+    }
+
+    /// The local addresses of the open extra sockets, and how many are routes.
+    #[cfg(test)]
+    fn extra_sockets(&self) -> (Vec<SocketAddr>, usize) {
+        let addrs = self.extra.values().filter_map(|x| x.sock.local_addr().ok()).collect();
+        (addrs, self.extra.values().filter(|x| x.last_recv.is_some()).count())
     }
 
     fn track(&mut self, e: &Event) {
@@ -857,6 +968,52 @@ mod tests {
         assert_eq!(bound.addresses(), vec![bound.local_addr()]);
         assert_eq!((bound.public_addr(), bound.nat_type()), (None, NatType::Unknown));
         assert_eq!(bound.next_timeout(), None, "no STUN on loopback, no signaling: nothing to wake for");
+    }
+
+    /// NB-044: a birthday punch's extra sockets. A peer that reaches one (as a
+    /// spray probe would) links through it, every reply leaves from it, so the peer
+    /// never sees the main port, and the others close at `until`.
+    #[test]
+    fn birthday_sockets_carry_the_link_they_hear() {
+        let (mut a, mut b) = (quiet("127.0.0.1:0"), quiet("127.0.0.1:0"));
+        let until = a.now() + Duration::from_millis(300);
+        let opened = Birthday { peer: b.peer_id(), dst: b.local_addr(), sockets: 4, payload: b"x".to_vec(), until };
+        a.open_extra(&opened);
+        let (socks, _) = a.extra_sockets();
+        assert_eq!(socks.len(), 4);
+        assert!(socks.iter().all(|s| s.port() != a.local_addr().port()));
+        let hit = socks[2];
+        let now = b.now();
+        b.ep.connect(now, hit, a.peer_id()).unwrap();
+        let t0 = Instant::now();
+        while !(a.status(&b.peer_id()) == Status::Connected && b.status(&a.peer_id()) == Status::Connected) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "no link");
+            b.poll();
+            a.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(b.path(&a.peer_id()), Some(&Path::Direct(hit)));
+        a.send(&b.peer_id(), Lane::Reliable, b"from the extra socket").unwrap();
+        let mut got = Vec::new();
+        while t0.elapsed() < Duration::from_secs(5) && got.is_empty() {
+            a.poll();
+            b.poll();
+            while let Some(e) = b.try_recv_event() {
+                if let Event::Message { data, .. } = e {
+                    got.push(data);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(got, vec![b"from the extra socket".to_vec()]);
+        assert_eq!(b.path(&a.peer_id()), Some(&Path::Direct(hit)), "A's replies came from the extra socket");
+        assert!(a.next_timeout().is_some_and(|t| t <= EXTRA_POLL), "wakes to read the extra sockets");
+        while t0.elapsed() < Duration::from_millis(400) {
+            a.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (socks, routes) = a.extra_sockets();
+        assert_eq!((socks, routes), (vec![hit], 1), "only the route is left");
     }
 
     /// NB-042: any interface lists IPv6 only on a dual-stack socket.

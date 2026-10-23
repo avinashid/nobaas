@@ -94,6 +94,46 @@ const GUESS_AFTER: i32 = 27;
 /// Starts the port prediction entry in an offer's address list. Decoders that
 /// predate it skip it, as an address they can't read.
 const PREDICTION_TAG: [u8; 2] = [0xfe, 1];
+/// Birthday punching, for a symmetric NAT with random ports against a cone: the
+/// symmetric side opens `BIRTHDAY_SOCKETS` sockets towards the cone's address, each
+/// with its own mapping, and the cone side probes `BIRTHDAY_PROBES` ports of the
+/// symmetric side's IP, each once, and stops at the first that links. One of them
+/// hits a mapping with probability 1 - (1 - 256/64512)^2048, about 99.97%
+/// (theoretical); on average the hit comes after 64512/256 = 252 probes.
+pub const BIRTHDAY_SOCKETS: u16 = 256;
+pub const BIRTHDAY_PROBES: u16 = 2048;
+/// After the offer, an ordinary punch gets this long first. The cone side starts
+/// later, so the sockets are open when its probes arrive, though offers reach the
+/// two sides a signaling delay apart.
+const BIRTHDAY_OPEN_AFTER: Duration = Duration::from_millis(1000);
+const BIRTHDAY_SPRAY_AFTER: Duration = Duration::from_millis(1500);
+/// How long the extra sockets wait for a probe.
+const BIRTHDAY_OPEN_FOR: Duration = Duration::from_secs(10);
+/// One attempt per peer per `BIRTHDAY_COOLDOWN`; per node, a burst of
+/// `BIRTHDAY_BURST`, then one per `BIRTHDAY_REFILL`.
+const BIRTHDAY_COOLDOWN: Duration = Duration::from_secs(300);
+const BIRTHDAY_BURST: u32 = 4;
+const BIRTHDAY_REFILL: Duration = Duration::from_secs(30);
+/// Per destination IP across all peers (NB44-1): at most `BIRTHDAY_IP_MAX` punches per
+/// `BIRTHDAY_IP_WINDOW`, and only one running at a time (another to the same IP waits
+/// `BIRTHDAY_IP_BUSY`, longer than a punch runs). The per-peer cooldown alone doesn't
+/// bound traffic at one victim, because a room-key holder can mint any number of
+/// PeerIds and aim them all at that IP; this caps what lands on any one address.
+const BIRTHDAY_IP_MAX: usize = 2;
+const BIRTHDAY_IP_WINDOW: Duration = Duration::from_secs(300);
+const BIRTHDAY_IP_BUSY: Duration = Duration::from_secs(20);
+/// Two-sided prediction, for two sequential symmetric NATs: both probe the other's
+/// predicted ports in order, the side with the lower PeerId at `next + k·step`, the
+/// other at `next + 2k·step`. Every probe goes to a new address, so each costs the
+/// sender's NAT its next port. If the lower side's NAT handed out `dl` ports since
+/// its prediction and the other's `dh`, the lower side's probe `dl + 2·dh` and the
+/// other's probe `dl + dh` go from each other's destination to each other's
+/// source: their mappings line up and one of the two gets through. The counts
+/// cover `dl + 2·dh < 96` (and so `dl + dh < 64`): up to 31 ports on each side,
+/// whichever has the lower PeerId. Same limits as a birthday punch.
+pub const LOCKSTEP_LOW: u16 = 96;
+pub const LOCKSTEP_HIGH: u16 = 64;
+const LOCKSTEP_AFTER: Duration = Duration::from_millis(1000);
 
 /// What STUN says about this node's NAT.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -183,6 +223,41 @@ impl std::fmt::Display for Failure {
     }
 }
 
+/// Extra sockets for birthday punching, which the host opens: see
+/// [`Traversal::poll_birthday`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Birthday<A> {
+    /// The peer the sockets are for.
+    pub peer: PeerId,
+    /// Where each socket sends `payload` once: the peer's public address.
+    pub dst: A,
+    pub sockets: u16,
+    pub payload: Vec<u8>,
+    /// Sockets that have heard nothing by then are closed.
+    pub until: Instant,
+}
+
+/// A punch planned from the two NAT types, past an ordinary one.
+#[derive(Clone, Debug)]
+enum Plan<A> {
+    /// Birthday punch, behind the symmetric NAT: open sockets towards the peer's address.
+    Open(A),
+    /// Birthday punch, behind the cone: spray ports of the peer's IP (this address's).
+    Spray(A),
+    /// Two sequential symmetric NATs: probe these, in order ([`LOCKSTEP_LOW`]).
+    Sweep(Vec<A>),
+}
+
+/// The destination IP a planned punch aims at (all its targets share one IP), for the
+/// NB44-1 per-IP cap. `None` for an address that isn't an IP.
+fn plan_ip<A: Address>(side: &Plan<A>) -> Option<std::net::IpAddr> {
+    let a = match side {
+        Plan::Open(a) | Plan::Spray(a) => Some(a),
+        Plan::Sweep(v) => v.first(),
+    };
+    a.and_then(|a| a.to_socket_addr()).map(|s| s.ip().to_canonical())
+}
+
 /// Something the host must do on its signaling carrier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Signal {
@@ -227,8 +302,7 @@ impl Bucket {
     }
 }
 
-#[derive(Default)]
-struct Remote {
+struct Remote<A> {
     offered_at: Option<Instant>,
     /// We received an offer from it.
     heard: bool,
@@ -246,6 +320,28 @@ struct Remote {
     seen_at: Instant,
     /// Its offers acted on.
     offers: Bucket,
+    /// A punch to start then (birthday or lockstep), and when the last one started.
+    plan: Option<(Instant, Plan<A>)>,
+    plan_at: Option<Instant>,
+}
+
+impl<A> Default for Remote<A> {
+    fn default() -> Self {
+        Remote {
+            offered_at: None,
+            heard: false,
+            invited: false,
+            key: None,
+            member: None,
+            nat: NatType::Unknown,
+            failure: None,
+            relays: Vec::new(),
+            seen_at: Instant::ZERO,
+            offers: Bucket::default(),
+            plan: None,
+            plan_at: None,
+        }
+    }
 }
 
 struct Room {
@@ -278,7 +374,7 @@ pub struct Traversal<A: Address> {
     mapped: Option<A>,
     observed: Vec<A>,
     room: Option<Room>,
-    remotes: BTreeMap<PeerId, Remote>,
+    remotes: BTreeMap<PeerId, Remote<A>>,
     nonces: HashMap<(PeerId, u64), Instant>,
     hellos: Bucket,
     offers: Bucket,
@@ -290,6 +386,11 @@ pub struct Traversal<A: Address> {
     invite_key: [u8; 32],
     /// Always-on peers kept linked as relays: named first in offers, tried first as vias.
     relay_peers: Vec<PeerId>,
+    /// Planned punches started, node-wide.
+    planned: Bucket,
+    /// Recent birthday-punch starts per destination IP, for the NB44-1 per-IP cap.
+    punch_ips: HashMap<std::net::IpAddr, VecDeque<Instant>>,
+    sockets: VecDeque<Birthday<A>>,
     transmits: VecDeque<Transmit<A>>,
     signals: VecDeque<Signal>,
 }
@@ -334,6 +435,9 @@ impl<A: Address> Traversal<A> {
             picked: None,
             invite_key,
             relay_peers: Vec::new(),
+            planned: Bucket::default(),
+            punch_ips: HashMap::new(),
+            sockets: VecDeque::new(),
             transmits: VecDeque::new(),
             signals: VecDeque::from([Signal::Subscribe(inbox)]),
         }
@@ -648,8 +752,15 @@ impl<A: Address> Traversal<A> {
             let h = hello(&r.key, &self.id, r.role, self.unix_ms + now.as_micros() / 1000);
             self.signals.push_back(Signal::Publish(r.topic, h));
         }
+        self.start_plans(now, ep);
         self.remotes.retain(|p, r| now - r.seen_at < FORGET || ep.is_connected(p));
         self.nonces.retain(|_, t| now - *t < Duration::from_millis(2 * FRESH_MS));
+        self.punch_ips.retain(|_, times| {
+            while times.front().is_some_and(|t| now - *t >= BIRTHDAY_IP_WINDOW) {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
     }
 
     /// When [`handle_timeout`](Traversal::handle_timeout) is next due.
@@ -657,7 +768,110 @@ impl<A: Address> Traversal<A> {
         let stun = (!self.servers.is_empty()).then_some(self.next_round);
         let retry = self.servers.iter().filter(|s| s.pending).map(|s| s.sent_at + STUN_RTO * (1 << (s.tries - 1)));
         let hello = self.room.as_ref().map(|r| r.next_hello);
-        stun.into_iter().chain(retry).chain(hello).min()
+        let plans = self.remotes.values().filter_map(|r| r.plan.as_ref().map(|b| b.0));
+        stun.into_iter().chain(retry).chain(hello).chain(plans).min()
+    }
+
+    /// Extra sockets to open for birthday punching. A peer behind a symmetric NAT
+    /// with random ports, which a cone peer can't punch to, gets this when an
+    /// ordinary punch hasn't linked within a second. The host then:
+    /// - opens `sockets` UDP sockets on the main socket's address family, and sends
+    ///   `payload` from each, once, to `dst`, so each gets a NAT mapping towards it;
+    /// - hands the endpoint what each one receives, as from the main socket;
+    /// - sends the endpoint's datagrams to an address one of them heard from out of
+    ///   the first one that heard it (its route), and everything else from the main
+    ///   socket;
+    /// - closes, at `until`, the ones that are no address's route, and a route
+    ///   once it has heard nothing for a minute (the link is dead by then).
+    ///
+    /// Meanwhile the peer sprays ports of this node's IP ([`Endpoint::spray`]); one
+    /// that hits a socket's mapping links the two through it. [`Node`](crate::Node)
+    /// does all this.
+    pub fn poll_birthday(&mut self) -> Option<Birthday<A>> {
+        self.sockets.pop_front()
+    }
+
+    /// Starts the planned punches that are due, unless the peer linked directly meanwhile.
+    fn start_plans(&mut self, now: Instant, ep: &mut Endpoint<A>) {
+        let relay_only = matches!(self.privacy, Privacy::RelayOnly { .. });
+        let due = |r: &Remote<A>| r.plan.as_ref().is_some_and(|b| b.0 <= now);
+        let due: Vec<PeerId> = self.remotes.iter().filter(|(_, r)| due(r)).map(|(p, _)| *p).collect();
+        for peer in due {
+            let Some((_, side)) = self.remotes.get_mut(&peer).and_then(|r| r.plan.take()) else { continue };
+            let direct = matches!(ep.path(&peer), Some(Path::Direct(_)));
+            if direct || relay_only {
+                continue;
+            }
+            // NB44-1: one punch per destination IP at a time, and at most BIRTHDAY_IP_MAX
+            // per window, across all peers, so offers from many PeerIds naming one victim
+            // can't make the node spray it more than that. Checked before the node token.
+            let ip = plan_ip(&side);
+            if let Some(ip) = ip {
+                let times = self.punch_ips.entry(ip).or_default();
+                while times.front().is_some_and(|t| now - *t >= BIRTHDAY_IP_WINDOW) {
+                    times.pop_front();
+                }
+                let busy = times.back().is_some_and(|t| now - *t < BIRTHDAY_IP_BUSY);
+                if busy || times.len() >= BIRTHDAY_IP_MAX {
+                    continue;
+                }
+            }
+            if !self.planned.take(now, BIRTHDAY_BURST, BIRTHDAY_REFILL) {
+                continue;
+            }
+            if let Some(ip) = ip {
+                self.punch_ips.entry(ip).or_default().push_back(now);
+            }
+            if let Some(r) = self.remotes.get_mut(&peer) {
+                r.plan_at = Some(now);
+            }
+            match side {
+                Plan::Open(dst) => {
+                    if let Some(payload) = ep.opener(now, &peer) {
+                        let until = now + BIRTHDAY_OPEN_FOR;
+                        self.sockets.push_back(Birthday { peer, dst, sockets: BIRTHDAY_SOCKETS, payload, until });
+                    }
+                }
+                Plan::Spray(addr) => ep.spray(now, &peer, &addr, BIRTHDAY_PROBES),
+                Plan::Sweep(addrs) => ep.sweep(now, &peer, &addrs),
+            }
+        }
+    }
+
+    /// Plans a punch with `from` after its offer, if its NAT and ours are a pair an
+    /// ordinary punch can't link: a birthday punch for ours symmetric with random
+    /// ports and its a cone, or the other way round; a lockstep sweep for two
+    /// sequential symmetric NATs. Aimed at the offer's first address, which is
+    /// public when the sender's STUN answered (and which its prediction is for).
+    fn plan_punch(&mut self, now: Instant, ep: &Endpoint<A>, from: PeerId, o: &Offer<A>) {
+        let (loopback, relay_only) = (self.loopback, matches!(self.privacy, Privacy::RelayOnly { .. }));
+        let v4 = |a: &A| a.to_socket_addr().is_some_and(|s| s.is_ipv4());
+        let Some(base) = o.addrs.first().filter(|a| is_public(*a) && v4(a) && dialable(*a, loopback)) else { return };
+        let side = match (self.nat, o.nat) {
+            (NatType::Symmetric, NatType::Cone) if self.prediction.is_none() => Plan::Open(base.clone()),
+            (NatType::Cone, NatType::Symmetric) if o.predict.is_none() => Plan::Spray(base.clone()),
+            (NatType::Symmetric, NatType::Symmetric) => match (self.prediction, o.predict) {
+                (Some(_), Some(theirs)) => {
+                    let (stride, count) = if self.id < from { (1, LOCKSTEP_LOW) } else { (2, LOCKSTEP_HIGH) };
+                    Plan::Sweep(theirs.sweep(base, stride, count))
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        if relay_only || matches!(ep.path(&from), Some(Path::Direct(_))) {
+            return;
+        }
+        let Some(r) = self.remotes.get_mut(&from) else { return };
+        if r.plan.is_some() || r.plan_at.is_some_and(|t| now - t < BIRTHDAY_COOLDOWN) {
+            return;
+        }
+        let wait = match side {
+            Plan::Open(_) => BIRTHDAY_OPEN_AFTER,
+            Plan::Spray(_) => BIRTHDAY_SPRAY_AFTER,
+            Plan::Sweep(_) => LOCKSTEP_AFTER,
+        };
+        r.plan = Some((now + wait, side));
     }
 
     /// The next STUN datagram to send from the endpoint's socket.
@@ -744,6 +958,7 @@ impl<A: Address> Traversal<A> {
         if room {
             r.member = Some(o.role);
         }
+        self.plan_punch(now, ep, from, &o);
         let loopback = self.loopback;
         // A sequential symmetric NAT maps the sender's packets to us at a port
         // near its prediction: probe those too (pointless from an open or
@@ -1039,6 +1254,13 @@ impl Prediction {
         let Some(port) = base.to_socket_addr().map(|s| i32::from(s.port())) else { return Vec::new() };
         let at = |k: i32| base.port_offset(i32::from(self.next) + k * i32::from(self.step) - port);
         (-GUESS_BEFORE..=GUESS_AFTER).filter_map(at).collect()
+    }
+
+    /// `count` addresses at `base`'s IP for a lockstep sweep: ports `next + k·stride·step`.
+    fn sweep<A: Address>(&self, base: &A, stride: i32, count: u16) -> Vec<A> {
+        let Some(port) = base.to_socket_addr().map(|s| i32::from(s.port())) else { return Vec::new() };
+        let at = |k: i32| base.port_offset(i32::from(self.next) + k * stride * i32::from(self.step) - port);
+        (0..i32::from(count)).filter_map(at).collect()
     }
 
     // [tag: fe 01] [step u8] [next u16 le]
@@ -2206,6 +2428,165 @@ mod tests {
         assert_eq!(sent_to(public, 4), attempts + 31 * 3);
         // A private first address gets no guesses: only the candidate itself.
         assert_eq!(sent_to("192.168.1.50:20000".parse().unwrap(), 4), attempts);
+    }
+
+    /// The ports two STUN servers see this node at: a cone, a symmetric NAT with
+    /// random ports, and a sequential one with step 2 (next: 5004).
+    const CONE: [u16; 2] = [5000, 5000];
+    const SYM: [u16; 2] = [5000, 41000];
+    const SEQ: [u16; 2] = [5000, 5002];
+
+    /// What a node's offers from `peers` peers (each sent at every time in
+    /// `offers_ms`) start: the extra sockets it asks for, every datagram its
+    /// endpoint sends to the offered IP over 6 s, and the first of them. `mine`:
+    /// what STUN sees of this node's NAT ([`CONE`], [`SYM`], [`SEQ`]); `their`:
+    /// the offers' NAT type; `predict`: theirs is sequential with step 1.
+    fn birthday_case(
+        mine: [u16; 2],
+        their: NatType,
+        predict: bool,
+        there: &str,
+        privacy: Privacy,
+        peers: u8,
+        offers_ms: &[u64],
+    ) -> (Vec<Birthday<SocketAddr>>, usize, Option<Vec<u8>>) {
+        let (births, sent) = punch_case(mine, their, predict, there, privacy, (10, peers), offers_ms);
+        (births, sent.len(), sent.first().map(|t| t.payload.clone()))
+    }
+
+    /// [`birthday_case`], with every datagram to the offered IP, in order, and
+    /// `peers.1` peers `id(peers.0)`, `id(peers.0 + 1)`, ...
+    fn punch_case(
+        mine: [u16; 2],
+        their: NatType,
+        predict: bool,
+        there: &str,
+        privacy: Privacy,
+        peers: (u8, u8),
+        offers_ms: &[u64],
+    ) -> (Vec<Birthday<SocketAddr>>, Vec<Transmit<SocketAddr>>) {
+        let me = id(1).peer_id();
+        let there: SocketAddr = there.parse().unwrap();
+        let servers: [SocketAddr; 2] = ["192.0.2.1:3478".parse().unwrap(), "192.0.2.2:3478".parse().unwrap()];
+        let mut t = Traversal::new(&id(1), [3; 32], 0, vec!["10.0.0.2:7000".parse().unwrap()], servers.to_vec());
+        let mut ep = Endpoint::new(&id(1), Config::default(), [1; 32]);
+        t.set_privacy(&mut ep, privacy);
+        t.handle_timeout(Instant::ZERO, &mut ep);
+        for (i, r) in std::iter::from_fn(|| t.poll_transmit()).collect::<Vec<_>>().into_iter().enumerate() {
+            let tx = stun::parse_binding_request(&r.payload).unwrap();
+            t.handle_stun(&r.dst, &stun::binding_response(&tx, SocketAddr::from(([203, 0, 113, 9], mine[i]))));
+        }
+        let sym = mine[0] != mine[1];
+        assert_eq!(t.nat_type(), if sym { NatType::Symmetric } else { NatType::Cone });
+        assert_eq!(t.predicted_addr().is_some(), mine == SEQ);
+        let ids: Vec<Identity> = (0..peers.1).map(|n| id(peers.0 + n)).collect();
+        for p in &ids {
+            t.introduce(Instant::ZERO, &ep, p.peer_id(), None);
+        }
+        let (mut births, mut sent, mut nonce) = (Vec::new(), Vec::new(), 0);
+        for ms in (0..6000).step_by(10) {
+            let now = Instant::from_millis(ms);
+            for p in ids.iter().filter(|_| offers_ms.contains(&ms)) {
+                nonce += 1;
+                let o = Offer {
+                    kind: Proof::None,
+                    reply: false,
+                    role: Role::Peer,
+                    nat: their,
+                    ts: ms,
+                    nonce,
+                    addrs: vec![there],
+                    predict: predict.then_some(Prediction { next: there.port() + 2, step: 1 }),
+                    relays: vec![],
+                };
+                let sealed = sealed::seal(p, &me, [7; 32], &o.encode()).unwrap();
+                t.handle_signal(now, &mut ep, Topic::peer(&me), &sealed);
+            }
+            ep.handle_timeout(now);
+            if t.poll_timeout().is_some_and(|at| at <= now) {
+                t.handle_timeout(now, &mut ep);
+            }
+            births.extend(std::iter::from_fn(|| t.poll_birthday()));
+            sent.extend(std::iter::from_fn(|| ep.poll_transmit(now)).filter(|d| d.dst.ip() == there.ip()));
+        }
+        (births, sent)
+    }
+
+    /// NB-044: a birthday punch is planned only between a random-port symmetric
+    /// NAT and a cone, towards a public IPv4 address, once per peer, within the
+    /// node's budget, and never under `RelayOnly`.
+    #[test]
+    fn birthday_punches_follow_the_nat_types() {
+        let (public, private) = ("198.51.100.9:20000", "192.168.1.50:20000");
+        let direct = Privacy::Direct;
+        // Handshake sends in 6 s: at 0, 0.5, 1.5 and 3.5 s.
+        let attempts = 4;
+        // Behind a cone, facing a random-port symmetric NAT: spray its IP, no sockets.
+        let (b, sent, _) = birthday_case(CONE, NatType::Symmetric, false, public, direct, 1, &[0]);
+        assert!(b.is_empty());
+        assert_eq!(sent, attempts + usize::from(BIRTHDAY_PROBES), "every probe, each port once");
+        // A predictable one is probed around its prediction instead.
+        let (b, sent, _) = birthday_case(CONE, NatType::Symmetric, true, public, direct, 1, &[0]);
+        assert!(b.is_empty() && sent < 200, "{sent}");
+        // Behind the symmetric NAT, facing a cone: sockets towards its address, with the dial's HS1.
+        let (b, sent, hs1) = birthday_case(SYM, NatType::Cone, false, public, direct, 1, &[0]);
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].dst, b[0].sockets), (public.parse().unwrap(), BIRTHDAY_SOCKETS));
+        assert_eq!(b[0].until, Instant::from_millis(1000) + BIRTHDAY_OPEN_FOR);
+        assert_eq!(Some(&b[0].payload), hs1.as_ref());
+        assert_eq!(sent, attempts, "no spray from the symmetric side");
+        // Not for a private address, nor for open or symmetric peers, nor relay-only.
+        assert!(birthday_case(SYM, NatType::Cone, false, private, direct, 1, &[0]).0.is_empty());
+        assert_eq!(birthday_case(CONE, NatType::Symmetric, false, private, direct, 1, &[0]).1, attempts);
+        assert!(birthday_case(SYM, NatType::Open, false, public, direct, 1, &[0]).0.is_empty());
+        assert!(birthday_case(SYM, NatType::Symmetric, false, public, direct, 1, &[0]).0.is_empty());
+        let relay_only = Privacy::RelayOnly { via: None };
+        assert!(birthday_case(SYM, NatType::Cone, false, public, relay_only, 1, &[0]).0.is_empty());
+        // Offers again within the per-peer cooldown start nothing more.
+        assert_eq!(birthday_case(SYM, NatType::Cone, false, public, direct, 1, &[0, 2000, 4000]).0.len(), 1);
+        // NB44-1: many PeerIds (minted freely by a room-key holder) naming ONE victim IP
+        // start only one punch at it — the per-IP cap, not the node budget of 4. The open
+        // side opens one fleet, and the spray side sprays once.
+        assert_eq!(birthday_case(SYM, NatType::Cone, false, public, direct, 6, &[0]).0.len(), 1);
+        // The spray side: 4 PeerIds naming one IP send one spray's worth of probes, not
+        // four (before NB44-1 this was ~8,208 datagrams to the victim).
+        let four = birthday_case(CONE, NatType::Symmetric, false, public, direct, 4, &[0]).1;
+        let probes = usize::from(BIRTHDAY_PROBES);
+        assert!(
+            four >= probes && four < 2 * probes,
+            "NB44-1: 4 peers at one IP spray once ({four}), not 4x (~{})",
+            4 * probes
+        );
+    }
+
+    /// NB-045: two sequential symmetric NATs sweep each other's predicted ports in
+    /// order, the lower PeerId at `next + k·step` (96 of them), the other at
+    /// `next + 2k·step` (64); not unless both predict.
+    #[test]
+    fn lockstep_sweeps_the_peers_predicted_ports_in_order() {
+        let (there, direct) = ("198.51.100.9:20000", Privacy::Direct);
+        let me = id(1).peer_id();
+        let above = (10..60).find(|&n| id(n).peer_id() > me).unwrap();
+        let below = (10..60).find(|&n| id(n).peer_id() < me).unwrap();
+        for (base, stride, count) in [(above, 1, LOCKSTEP_LOW), (below, 2, LOCKSTEP_HIGH)] {
+            let (b, sent) = punch_case(SEQ, NatType::Symmetric, true, there, direct, (base, 1), &[0]);
+            assert!(b.is_empty());
+            // The peer predicted next = 20002, step 1; the dial's own sends go to 20000.
+            let swept: Vec<u16> = sent.iter().map(|t| t.dst.port()).filter(|&p| p != 20000).collect();
+            let want: Vec<u16> = (0..count).map(|k| 20002 + k * stride).collect();
+            assert_eq!(swept, want, "stride {stride}");
+        }
+        // A NAT stepping by 3: every sweep port is a whole step on, at the base's IP.
+        let p = Prediction { next: 40_000, step: 3 };
+        let base: SocketAddr = "203.0.113.4:39990".parse().unwrap();
+        let ports =
+            |stride| p.sweep(&base, stride, 3).iter().map(|a: &SocketAddr| (a.ip(), a.port())).collect::<Vec<_>>();
+        let ip = base.ip();
+        assert_eq!(ports(1), vec![(ip, 40_000), (ip, 40_003), (ip, 40_006)]);
+        assert_eq!(ports(2), vec![(ip, 40_000), (ip, 40_006), (ip, 40_012)]);
+        // Without our prediction, or the peer's, nothing but the dial's 4 sends.
+        assert_eq!(punch_case(SYM, NatType::Symmetric, true, there, direct, (10, 1), &[0]).1.len(), 4);
+        assert_eq!(punch_case(SEQ, NatType::Symmetric, false, there, direct, (10, 1), &[0]).1.len(), 4);
     }
 
     /// NB-035: a failure reads as a sentence that names the symmetric side.
