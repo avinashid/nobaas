@@ -24,14 +24,23 @@ const ok = (cond, what) => {
   console.log(`${cond ? 'ok  ' : 'FAIL'} ${what}`);
   if (!cond) failed++;
 };
+const pages = [];
+const errors = [];
 const logHas = (page, re, timeout = 15000) => page.waitForFunction((src) => [...document.querySelectorAll('#log div')].some((d) => new RegExp(src).test(d.textContent)), re.source, { timeout });
 try {
   await new Promise((r) => setTimeout(r, 600));
-  browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  // Both tabs' log ticks must run while the other has focus (as arena.mjs): a throttled
+  // background tab can miss the gate's timeouts on a loaded host.
+  browser = await chromium.launch({
+    args: [
+      '--disable-features=WebRtcHideLocalIpsWithMdns',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding',
+      '--disable-backgrounding-occluded-windows',
+    ],
+  });
   const ctx = await browser.newContext({ viewport: { width: 1360, height: 900 } });
   const key = `carry${port}abcdefgh`;
-  const pages = [];
-  const errors = [];
   for (let i = 0; i < 2; i++) {
     const p = await ctx.newPage();
     p.on('pageerror', (e) => errors.push(`tab ${i}: ${e.message}`));
@@ -77,6 +86,10 @@ try {
   ok(true, 'chat arrives over the channel');
   if (shot) await pages[0].screenshot({ path: `${shot}-carry.png`, fullPage: true });
 
+  // The route ticks (every 250 ms) log the move; wait for them, so the close is a change they see.
+  await Promise.all(pages.map((p) => logHas(p, /(→|reached) direct \(birthday-punch channel\)/)));
+  ok(true, "both tabs' route logs show the move to the birthday-punch channel");
+
   // The channel closes: back on signalling, still linked, and chat still works.
   await pages[0].evaluate(() => window.chan.pc.close());
   await all(() => window.netlab.peers()[0]?.route === 'signaling', null, 10000);
@@ -89,6 +102,12 @@ try {
   if (errors.length) throw new Error(`page errors: ${errors.join('; ')}`);
 } catch (e) {
   ok(false, e.stack ?? String(e));
+  if (errors.length) console.log(`page errors: ${errors.join('; ')}`);
+  // Each tab's route and channel log lines, newest first, to see what it did.
+  for (const [i, p] of pages.entries()) {
+    const lines = await p.evaluate(() => [...document.querySelectorAll('#log div')].map((d) => d.textContent).filter((t) => /route|channel|reached|error|ERROR/.test(t)).slice(0, 8)).catch(() => []);
+    console.log(`tab ${i} log:\n  ${lines.join('\n  ')}`);
+  }
 } finally {
   await browser?.close();
   server.kill();
