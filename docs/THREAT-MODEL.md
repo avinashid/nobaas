@@ -70,8 +70,9 @@ that needs a change is tracked as an NB card.
 | NPM-2 (Low) | **Fixed** in `docs/GODOT.md` (`9be92d5`); the flood risk itself is SEC-4 |
 | NPM-3 (Low) | **Fixed** by `6f947f3`: a map request in flight at stop gets one delete |
 | NB44-1 (Medium) | **Fixed** by `40e42db` (per-IP punch cap), re-checked 2026-10-23 ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
-| NB48-1 (Medium) | Open: the Net Lab fleet, same section |
-| NB44-2, NB44-3, NB48-2, NB46-1 (Low) | Open, same section |
+| NB48-1 (Medium) | **Fixed** by `d1b2d25` (fleet checks one public address; Net Lab consent and cooldown), re-checked 2026-10-23 |
+| NB48-2 (Low) | Fixed in part by `d1b2d25` (public spray IP); the rest is NB48b-1 |
+| NB44-2, NB44-3, NB46-1, NB48b-1, NB48b-2 (Low) | Open, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
@@ -449,6 +450,45 @@ runs ICE checks to every candidate in that offer.
     one per peer per 5 min, and `abort` doesn't reset the wait.
   - Test: an offer with N candidates leaves at most one remote candidate on each
     fleet connection.
+- **Status: fixed** by `d1b2d25` (NB-048b).
+  - `openFleet` strips the offer's candidates, caps `size` at 256, and adds the
+    easy side's `addr` only if it is public IPv4.
+  - A remote `start` only sets `invited`; `tryBirthday` runs on a local click only.
+  - The cooldown is one punch per peer per 5 min, kept in merged state so a remote
+    `start` can't reset it.
+- Re-check probe (Chromium, loopback, scratch):
+
+  | Hostile offer | Result |
+  |---|---|
+  | 20 injected candidates plus `c=`/`m=` at a listener | 0 remote candidates and 0 checks per connection |
+  | A last candidate line without its CRLF | Chrome rejects the SDP |
+  | `a=CANDIDATE:` in upper case | Not parsed as a candidate |
+
+- Residual (accepted): once the visitor accepts, a peer still chooses the one public
+  `ip:port` the fleet checks. Measured with one candidate per connection: 474
+  checks/s from 32 connections, 1,912/s from 128 and 2,705/s from 256; 39,288
+  checks in 30 s from 256. That is one click per peer per 5 min, public IPv4 only.
+
+**NB48b-1 — The easy side still checks the candidates in the peer's answer (Low).**
+`openSpray().applyAnswer` passes the answer SDP to `setRemoteDescription` without
+`stripCandidates`, so a peer playing the hard side can list any addresses, LAN and
+loopback included.
+- Repro (re-check probe): an answer with 20 loopback candidates gave the easy
+  connection 20 remote candidates. It sent 127 checks in 8 s and hit all 20 ports.
+- This needs the visitor's click to accept, and it is one connection.
+- Fix: `setRemoteDescription({ type: 'answer', sdp: stripCandidates(answerSdp) })`.
+  Our own fleet's answer carries no candidates, so nothing else changes.
+- Test: an answer with N candidates leaves only the spray candidates.
+
+**NB48b-2 — "One fleet at a time" is cleared by its own refusal (Low).**
+- The bug: `closeBday` always sets `bdayBusy = false`. Both the busy refusal and the
+  cooldown refusal in `tryBirthday` go through `bdayFail` → `closeBday`, so refusing
+  a second punch frees the slot, and the next click starts it.
+- Repro (Net Lab, three tabs, scratch): `punch(0)`, then `punch(1)` twice, left two
+  punches running at once in one tab. Every two clicks on another peer add one more.
+- Fix: track the busy peer (`bdayPeer`) and clear it only in that peer's
+  `closeBday`. Or reset it only when a `ctx` was closed.
+- Test: the third click leaves one punch running.
 
 **NB48-2 — The easy side sprays whatever IPv4 address the peer names (Low).** In Net
 Lab's `answer` step, `data.ip` goes to `applyAnswer` after `sprayCandidates` checks
@@ -457,6 +497,13 @@ ports 1024 and up of any IPv4 address, including the visitor's own router or LAN
 hosts, or loopback. Fix: accept only a public IPv4 address (not RFC 1918, loopback,
 100.64/10, link-local or multicast) that matches a server-reflexive address in the
 peer's own signalling.
+- **Status: fixed in part** by `d1b2d25`.
+  - Fixed: `isPublicV4` refuses non-public spray IPs, and the spray needs the
+    visitor's click.
+  - Left as is: the IP isn't matched to anything the peer proved, since the peer
+    writes all of that signalling anyway.
+  - Still open: the LAN reach this finding was about remains through the answer's
+    own candidates, NB48b-1.
 
 **NB46-1 — A peer can keep the dialling side publishing offers (Low).** A `restart`
 signal makes the dialling side create and publish an ICE-restart offer, resent up to
