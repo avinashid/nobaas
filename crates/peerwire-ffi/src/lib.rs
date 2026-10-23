@@ -164,8 +164,9 @@ pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr:
 }
 
 /// Relay-only (`on` != 0): relayed links stay relayed (no punching, no direct
-/// path), relays are asked not to tag our packets with our address, and a direct
-/// handshake is answered only from a peer this endpoint is dialling directly.
+/// path), dials through a relay, also one under way, send nothing direct, relays
+/// are asked not to tag our packets with our address, and a direct handshake is
+/// answered only from a peer this endpoint is dialling directly.
 #[no_mangle]
 pub unsafe extern "C" fn pw_set_relay_only(h: *mut PwEndpoint, on: u32) {
     (*h).ep.set_relay_only(on != 0);

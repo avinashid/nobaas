@@ -241,8 +241,9 @@ export declare class Endpoint {
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
    * (reason 'closed') now rather than after its idle timeout. No local event; does nothing after `close()`. */
   disconnect(peer: PeerId | Uint8Array): void;
-  /** Relayed links never punch to a direct path, relays forward without our address, and a
-   * direct handshake is answered only from a peer we are dialling directly. */
+  /** Relayed links never punch to a direct path, dials through a relay (also one under way) send nothing
+   * direct, relays forward without our address, and a direct handshake is answered only from a peer we are
+   * dialling directly. */
   setRelayOnly(on: boolean): void;
   /** After `close()`, the counters as they were when it closed. */
   stats(): EndpointStats;
