@@ -235,15 +235,16 @@ export declare class Endpoint {
   /** Throws `Error('connectVia: endpoint closed')` after `close()`. */
   connectVia(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): number;
   /** A direct address for a relayed (or dialling) peer: punches to it and moves the link there once the peer
-   * answers from it. Does nothing for a peer linked directly or unknown, while relay-only for one linked or
-   * being dialled through a relay (nothing is sent to `addr`), or after `close()`. */
+   * answers from it. Does nothing for a peer linked directly or unknown, while relay-only for one linked
+   * through a relay or being dialled with one (nothing is sent to `addr`), or after `close()`. */
   addCandidate(addr: number, peer: PeerId | Uint8Array): void;
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
    * (reason 'closed') now rather than after its idle timeout. No local event; does nothing after `close()`. */
   disconnect(peer: PeerId | Uint8Array): void;
-  /** Relayed links never punch to a direct path, dials through a relay (also one under way) send nothing
-   * direct, relays forward without our address, and a direct handshake is answered only from a peer we are
-   * dialling directly. */
+  /** Relayed links never punch to a direct path, dials through a relay alone (given the relay before any
+   * direct address of their own, or with a relay when this is turned on) send nothing direct, relays forward
+   * without our address, and a direct handshake is answered only from a peer we are dialling directly. A direct
+   * dial later given a relay keeps its direct addresses and may complete direct. */
   setRelayOnly(on: boolean): void;
   /** After `close()`, the counters as they were when it closed. */
   stats(): EndpointStats;

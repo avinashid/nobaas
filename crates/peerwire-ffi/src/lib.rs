@@ -130,8 +130,8 @@ pub unsafe extern "C" fn pw_secret(h: *const PwEndpoint, out: *mut u8) {
 }
 
 /// Dials `peer_id` at `addr`. A no-op if already linked, or while relay-only if
-/// dialling it through a relay (the dial stays relayed); otherwise a dial already
-/// running takes `addr` as one more path.
+/// its dial has a relay (the dial takes no new direct path); otherwise a dial
+/// already running takes `addr` as one more path.
 #[no_mangle]
 pub unsafe extern "C" fn pw_connect(h: *mut PwEndpoint, now_us: u64, addr: u32, peer_id: *const u8) -> i32 {
     let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
@@ -154,8 +154,8 @@ pub unsafe extern "C" fn pw_connect_via(h: *mut PwEndpoint, now_us: u64, relay: 
 /// Adds `addr` as a direct address of `peer_id`, a relayed or dialling peer: the
 /// endpoint punches towards it and moves the link there once the peer answers
 /// from it. Does nothing for a peer linked directly, an unknown one, or, while
-/// relay-only, a peer linked or being dialled through a relay: nothing is sent to
-/// `addr`.
+/// relay-only, a peer linked through a relay or being dialled with one: nothing
+/// is sent to `addr`.
 #[no_mangle]
 pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr: u32, peer_id: *const u8) -> i32 {
     let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
@@ -164,9 +164,12 @@ pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr:
 }
 
 /// Relay-only (`on` != 0): relayed links stay relayed (no punching, no direct
-/// path), dials through a relay, also one under way, send nothing direct, relays
-/// are asked not to tag our packets with our address, and a direct handshake is
-/// answered only from a peer this endpoint is dialling directly.
+/// path), dials through a relay alone (given the relay before any direct address
+/// of their own, or with a relay when this is turned on) send nothing direct,
+/// relays are asked not to tag our packets with our address, and a direct
+/// handshake is answered only from a peer this endpoint is dialling directly. A
+/// direct dial later given a relay keeps its direct addresses and may complete
+/// direct.
 #[no_mangle]
 pub unsafe extern "C" fn pw_set_relay_only(h: *mut PwEndpoint, on: u32) {
     (*h).ep.set_relay_only(on != 0);
