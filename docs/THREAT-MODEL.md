@@ -80,7 +80,8 @@ that needs a change is tracked as an NB card.
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
 | NB48b-5, NB48b-6 (Info) | **Fixed** by `08425b8` (a stale link's close keeps the peer) and `2a00ecb` (CARRY replies bounded), re-checked 2026-10-24 |
 | MIC-1, MIC-3 (Low) | **Fixed** by `d78d046`, `877d02c` and `6303bd8` (Net Lab's global room and punch offers; `public-only` in `@peerwire/js` 0.1.1 and earlier), reviewed 2026-10-24; residual MIC-4 ([below](#bounds-and-residuals-from-reviews-nb-014nb-043)) |
-| MIC-4 (Low), MIC-2, MIC-5 (Info) | Open, same section |
+| MIC-2 (Info) | **Fixed** by `9282d36` (a punch that ended closes what it opened) and `691dec0` (one offer and one answer per punch, which also closes a Low NB48-1 bypass), reviewed 2026-10-24 |
+| MIC-4 (Low), MIC-5 (Info) | Open, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -907,8 +908,13 @@ and what it accepted. Values are from main `7b716a2`.
   - **MIC-2 (Info):** a birthday punch closed while its `openFleet`, `openSpray` or
     certificate is still pending (a rejoin, its timeout, the peer's abort) throws
     when that resolves. The connections it just opened are left open, and the
-    one-fleet slot is already free. Nothing is sent. Suggested: after each await,
-    check that the punch is still the current one, and close what was opened if not.
+    one-fleet slot is already free. Nothing is sent. **Fixed** by `9282d36`: after
+    each await of a punch's setup, a punch that has ended closes what it just opened
+    and returns. `691dec0` takes one offer per punch on the hard side and one answer
+    on the easy side, marked before the first await. Before, each further offer from
+    the peer in a punch the user had accepted opened another fleet of up to
+    `FLEET_SIZE` connections, and closing the punch closed only the last: a Low
+    bypass of NB48-1's one fleet at a time.
   - **MIC-4 (Low, privacy):** in the global room, the button re-tests the network
     after the grant (`reprobe()`: 2.5 s after the first STUN answer, at most 8 s) and
     only then rejoins with `public-only`; `guardGlobal` leaves it to the button. A
