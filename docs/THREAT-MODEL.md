@@ -78,7 +78,7 @@ that needs a change is tracked as an NB card.
 | NB48b-4, NB48b-7 (Low) | **Fixed** by `4b6c0f7` and `46a5da3` (relay-only dials through a relay stay relayed, also when switched on mid-dial), re-checked 2026-10-24 |
 | NB44c-1, NB44c-2, NB46-1 (Low) | Open, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
-| NB48b-5, NB48b-6 (Info) | Open (robustness and hardening of the carried channel), same section |
+| NB48b-5, NB48b-6 (Info) | **Fixed** by `08425b8` (a stale link's close keeps the peer) and `2a00ecb` (CARRY replies bounded), re-checked 2026-10-24 |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -669,11 +669,23 @@ peer, and the peer counts as a relay for others. Only the peer itself or the net
 can cause this.
 - Fix: `rtcClosed` drops the peer only if the closed link's handle is its current
   path, or ex-carrier handles stay marked until the path changes.
+- **Status: fixed** by `08425b8` (the first fix), re-checked 2026-10-24. The transport
+  passes the closed link's handle, and a close that isn't the peer's path now only
+  forgets the WebRTC link. The transport keeps one WebRTC link per peer and detaches
+  `onclose` from links it drops, so this never closes a live link. Probe: the peer's
+  current link closing still drops it.
+  - Residual (Info, accepted): in the same window `rtcFailed` can still pick the
+    peer as a relay for another member's fallback. That dial fails through it; the
+    other relays and the pipe still run.
 
 **NB48b-6 — CARRY replies are unbounded (Info).** Every CARRY is answered with a
 CARRIED, sent without the `MAX_BUFFERED` check. A peer can fill its own channel's send
 queue with one-byte replies (probe: 500 in, 500 out).
 - Fix: answer at most once per `CARRY_EVERY_MS`, through the congestion check.
+- **Status: fixed** by `2a00ecb`, re-checked 2026-10-24. Each adopted channel answers
+  at most one CARRY per `CARRY_EVERY_MS`, and every marker goes through `dcSend`.
+  Probes: 500 CARRY at once got 1 reply (none with the buffer full); 193 spread over
+  2 s got 10.
 
 **NB48-2 — The easy side sprays whatever IPv4 address the peer names (Low).** In Net
 Lab's `answer` step, `data.ip` goes to `applyAnswer` after `sprayCandidates` checks
