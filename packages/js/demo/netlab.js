@@ -349,7 +349,7 @@ function hook() {
   if (t && 'trace' in t) t.trace = onTrace;
   if (t?.onPeer) {
     const onPeer = t.onPeer;
-    t.onPeer = (peer, state) => {
+    t.onPeer = (peer, state, ...rest) => {
       const p = peerState(peer);
       if (state === 'open') {
         p.rtcOpenAt = now();
@@ -358,7 +358,7 @@ function hook() {
         p.rtcFailedAt = now();
         log('warn', `WebRTC to ${nameOf(peer)} failed (ICE found no working pair): trying a member relay, then the signalling relays`);
       } else if (state === 'closed') log('info', `WebRTC link to ${nameOf(peer)} closed`);
-      onPeer(peer, state);
+      onPeer(peer, state, ...rest);
     };
   }
   room.on('peer-join', (peer, pres) => {

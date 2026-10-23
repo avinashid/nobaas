@@ -51,6 +51,26 @@ try {
   await all(() => window.netlab?.peers().length === 1 && window.netlab.peers()[0].route === 'signaling');
   ok(true, 'two tabs linked over signalling (their room WebRTC fails)');
 
+  // Net Lab's hook on the transport's onPeer passes a closed link's handle on to the
+  // room, which keeps the peer when that link isn't its path (NB48b-5).
+  const handles = await pages[0].evaluate(async () => {
+    const { Room } = await import('/src/room.js');
+    const send = Room.prototype.send;
+    const room = await new Promise((resolve) => {
+      Room.prototype.send = function (...a) {
+        Room.prototype.send = send;
+        resolve(this);
+        return send.apply(this, a);
+      };
+    });
+    const seen = [];
+    room.rtcClosed = (peer, h) => seen.push(h);
+    room.transport.onPeer(room.peers[0], 'closed', 4242);
+    delete room.rtcClosed;
+    return seen;
+  });
+  ok(handles.length === 1 && handles[0] === 4242, `a closed link's handle reaches the room through Net Lab's hook (${handles})`);
+
   // A real DataChannel between the tabs, outside the room: the stand-in for a punch's winner.
   const open = (sdp) => {
     window.chan = { pc: new RTCPeerConnection() };
