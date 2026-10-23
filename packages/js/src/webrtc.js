@@ -161,8 +161,9 @@ export class WebRtcTransport {
   // `offerProof`: { sign(to), check(from, p) }, both async. Offers carry
   //   `p: await sign(to)`, and an offer is answered (with our addresses) only if
   //   check(from, p) holds. joinRoom passes a room-key proof (see proof.js).
-  // `onPeer(peer, state)`: 'open' and 'closed' for a DataChannel, and 'failed' once
-  //   when one isn't open `fallbackMs` after its offer or answer (or ICE failed).
+  // `onPeer(peer, state, handle)`: 'open' and 'closed' for a DataChannel (with its
+  //   link's endpoint handle), and 'failed' once when one isn't open `fallbackMs`
+  //   after its offer or answer (or ICE failed).
   // `pipes`: carry datagrams over signalling for peers allowed with allowPipe().
   // `trace(peer, what, detail)`, settable later: diagnostics of each link's
   //   signalling ('offer-sent', 'offer-received', 'answer-sent', 'answer-received',
@@ -250,7 +251,7 @@ export class WebRtcTransport {
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed') this.failed(l);
     };
-    dc.onclose = () => this.onPeer(peer, 'closed');
+    dc.onclose = () => this.onPeer(peer, 'closed', h);
     // Binary datagrams only: a string message would become a length in new Uint8Array(string).
     dc.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer && e.data.byteLength <= MAX_DATAGRAM) this.ep.receive(h, new Uint8Array(e.data));
