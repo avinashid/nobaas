@@ -302,8 +302,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/netlab_mic.mjs [shot-prefix]`: Net Lab's "Use microphone" button, with fake
   media and the browser's mDNS hiding on. Before, the local addresses are `.local`; after a grant the
   report says `granted`, the network test lists real local addresses and reads the same NAT, the room
-  is joined again, and the other tab sees `mic` and real local addresses and links direct. A refused
-  prompt reports `denied` and doesn't rejoin.
+  is joined again, and the other tab sees `mic` and real local addresses and links direct. The global
+  room, with the grant stored before the tabs open or given while they're in it, gives the other tab
+  no local address and still links. A refused prompt reports `denied` and doesn't rejoin.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

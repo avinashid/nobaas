@@ -6,6 +6,8 @@
 //   same NAT, though each interface now has its own public port), the room is joined
 //   again (a new id, so new connections), and the other tab sees mic allowed and this
 //   tab's real local addresses on the new link; nothing throws;
+// - the global room (MIC-1): with the grant stored before the tabs open, or given while
+//   they are in it, the other tab gets no local address, and the pair still links;
 // - a refused prompt (a browser whose fake UI says no): 'denied', a warning, and the
 //   room is not joined again;
 // - a candidate pair whose local address is hidden takes its family from the remote.
@@ -100,6 +102,47 @@ try {
   ]);
   ok(labels[0] === 'host/v6 ↔ host/v6 2001:db8::1:5000' && labels[1] === 'host/v6 ↔ srflx/v6 2001:db8::2:6000'
     && labels[2] === 'host/v4 ↔ host/v6 2001:db8::3:7000' && labels[3] === 'host/v4 ↔ prflx/v4 198.51.100.4:8000', `pair labels: ${labels.join(' | ')}`);
+
+  // The global room, which anyone can open, never gets the local addresses (MIC-1).
+  // G: the grant was stored on an earlier visit, so both tabs join without them.
+  // H: the grant comes while both tabs are in the global room: they join it again
+  // without them. Each pair still links (over signalling here: no STUN on loopback).
+  const globalUrl = (name) => `${origin}/demo/netlab.html?signal=local&name=${name}&auto=global`;
+  const linkedTo = (p, id) => wait(p, (x) => window.netlab.peers().some((q) => q.id === x), id, 60000);
+  // Net Lab notes a link's local addresses 500 ms after the offer or answer: read them after that.
+  const hostsOf = async (p, id) => (await p.waitForTimeout(1500), (await report(p)).peers.find((q) => q.id === id)?.theirHosts);
+  const gctx = await browsers[0].newContext({ viewport: { width: 1360, height: 900 } });
+  const hctx = await browsers[0].newContext({ viewport: { width: 1360, height: 900 } });
+  await gctx.grantPermissions(['microphone'], { origin });
+  const [gSettled, hSettled] = await Promise.allSettled([
+    (async () => {
+      const [g1, g2] = [await open(gctx, globalUrl('golf')), await open(gctx, globalUrl('hotel'))];
+      const ids = await Promise.all([g1, g2].map((p) => wait(p, () => window.netlab.self).then(() => p.evaluate(() => window.netlab.self))));
+      await Promise.all([linkedTo(g1, ids[1]), linkedTo(g2, ids[0])]);
+      const r1 = await report(g1);
+      return { hosts: [await hostsOf(g1, ids[1]), await hostsOf(g2, ids[0])], mic: r1.me.mediaPermission,
+        joinLog: r1.log.find((e) => e.msg.startsWith('joining the global room'))?.msg, note: await g1.textContent('#micmsg'), page: g1 };
+    })(),
+    (async () => {
+      const [h1, h2] = [await open(hctx, globalUrl('india')), await open(hctx, globalUrl('juliet'))];
+      const old = await Promise.all([h1, h2].map((p) => wait(p, () => window.netlab.self).then(() => p.evaluate(() => window.netlab.self))));
+      await Promise.all([linkedTo(h1, old[1]), linkedTo(h2, old[0])]);
+      await hctx.grantPermissions(['microphone'], { origin });
+      const ids = await Promise.all([h1, h2].map((p, i) => wait(p, (o) => window.netlab.self && window.netlab.self !== o, old[i], 20000).then(() => p.evaluate(() => window.netlab.self))));
+      await Promise.all([linkedTo(h1, ids[1]), linkedTo(h2, ids[0])]);
+      return { hosts: [await hostsOf(h1, ids[1]), await hostsOf(h2, ids[0])], rejoinLog: (await report(h1)).log.some((e) => e.msg.startsWith('the microphone is allowed on this site: rejoining the global room')) };
+    })(),
+  ]);
+  const none = (hosts) => hosts.every((h) => Array.isArray(h) && !h.length);
+  if (gSettled.status === 'rejected') ok(false, `global room, grant stored before: ${gSettled.reason.message}`);
+  else {
+    const g = gSettled.value;
+    ok(g.mic === 'granted' && none(g.hosts), `global room, grant stored before: linked, local addresses given ${JSON.stringify(g.hosts)}`);
+    ok(/without local addresses/.test(g.joinLog) && /kept out of the global room/.test(g.note), `and it says so: "${g.joinLog}" · "${g.note.split(' · ')[1]}"`);
+    if (shot) await card(g.page).screenshot({ path: `${shot}-global.png` });
+  }
+  if (hSettled.status === 'rejected') ok(false, `global room, granted while in it: ${hSettled.reason.message}`);
+  else ok(hSettled.value.rejoinLog && none(hSettled.value.hosts), `global room, granted while in it: rejoined, linked, local addresses given ${JSON.stringify(hSettled.value.hosts)}`);
 
   // A refused prompt: 'denied', a warning, still the same member of the room.
   const dctx = await launch('--use-fake-ui-for-media-stream=deny');
