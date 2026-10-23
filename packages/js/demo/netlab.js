@@ -605,6 +605,10 @@ function bdayFail(peer, why) {
   bdayStatus(peer, 'failed', { why });
   log('warn', `birthday punch with ${nameOf(peer)}: ${why}`);
 }
+// Whether `b` is still `peer`'s punch in progress: not closed (a failure, the timeout,
+// the peer's abort) nor left behind by a rejoin. Checked after every await of a punch's
+// setup, so what it opened meanwhile is closed, not kept running (MIC-2).
+const current = (peer, b) => peers.get(peer)?.bday === b && !!b.ctx;
 function closeBday(peer) {
   if (bdayBusy === peer) bdayBusy = null; // NB48b-2: only the punch holding the slot frees it, not a refusal
   const b = peerState(peer).bday;
@@ -675,9 +679,14 @@ async function onBirthday(peer, data) {
     // The hard side: open the fleet answering the easy side's one offer, aimed only at the
     // one validated address it gave (openFleet strips the offer's candidates). Answer with our IP.
     const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+    if (!current(peer, b)) return;
     const creds = randomCredentials();
     const size = Number(params.get('fleet')) || FLEET_SIZE;
     const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size, easyAddr: data.addr });
+    if (!current(peer, b)) {
+      for (const c of hard.conns) c.pc.close();
+      return;
+    }
     b.ctx.hard = hard;
     log('info', `birthday punch with ${nameOf(peer)}: opened ${hard.conns.length} sockets, answering`);
     room.send({ t: 'bday', step: 'answer', sdp: hard.answerSdp, ip: myProbedV4() }, { to: peer });
@@ -687,7 +696,11 @@ async function onBirthday(peer, data) {
     if (!isPublicV4(ip)) return bdayFail(peer, 'the peer named no public IPv4 to spray'); // NB48-2
     const ports = sprayPorts(SPRAY_PORTS);
     log('info', `birthday punch with ${nameOf(peer)}: spraying ${ports.length} ports at ${ip}`);
-    await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
+    try {
+      await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
+    } catch (e) {
+      if (current(peer, b)) throw e; // else the punch ended meanwhile, and its end closed the connection
+    }
   } else if (data.step === 'abort') {
     bdayFail(peer, `the peer stopped: ${clip(data.why, 80)}`);
   }
@@ -697,6 +710,7 @@ async function onBirthday(peer, data) {
 async function beEasy(peer) {
   const b = peerState(peer).bday;
   const easy = await openSpray({ RTCPeerConnection, iceServers: bdayIce() });
+  if (!current(peer, b)) return void easy.pc.close();
   b.ctx.easy = easy;
   room.send({ t: 'bday', step: 'offer', sdp: easy.offerSdp, addr: srflxAddr(easy.offerSdp) }, { to: peer });
   easy.done.then((c) => bdayWon(peer, c)).catch(() => {});
