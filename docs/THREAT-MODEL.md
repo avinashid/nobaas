@@ -71,9 +71,11 @@ that needs a change is tracked as an NB card.
 | NPM-3 (Low) | **Fixed** by `6f947f3`: a map request in flight at stop gets one delete |
 | NB44-1 (Medium) | **Fixed** by `40e42db` (per-IP punch cap), re-checked 2026-10-23 ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
 | NB48-1 (Medium) | **Fixed** by `d1b2d25` (fleet checks one public address; Net Lab consent and cooldown), re-checked 2026-10-23 |
-| NB48-2 (Low) | Fixed in part by `d1b2d25` (public spray IP); the rest is NB48b-1 |
+| NB48-2 (Low) | Fixed in part by `d1b2d25` (public spray IP); the rest is NB48b-3 |
 | NB44-2, NB44-3 (Low) | **Fixed** by `a16072e` (NB-044b: authenticated routes, fd reserve), re-checked 2026-10-23; residuals NB44c-1, NB44c-2 |
-| NB44c-1, NB44c-2, NB46-1, NB48b-1, NB48b-2 (Low) | Open, same section |
+| NB48b-2 (Low) | **Fixed** by `de9efea` (the busy slot is held per peer), re-checked 2026-10-24 |
+| NB48b-1 (Low) | Fix applied by `de9efea` (the answer is stripped), but bypassed: NB48b-3 |
+| NB44c-1, NB44c-2, NB46-1, NB48b-3 (Low) | Open, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
@@ -546,6 +548,9 @@ loopback included.
 - Fix: `setRemoteDescription({ type: 'answer', sdp: stripCandidates(answerSdp) })`.
   Our own fleet's answer carries no candidates, so nothing else changes.
 - Test: an answer with N candidates leaves only the spray candidates.
+- **Status: fix applied** by `de9efea`, re-checked 2026-10-24. Answers with CRLF,
+  LF-only, upper-case or tab-separated candidates drew 0 remote candidates and 0
+  checks in Chromium. The strip itself can be bypassed, though: NB48b-3.
 
 **NB48b-2 — "One fleet at a time" is cleared by its own refusal (Low).**
 - The bug: `closeBday` always sets `bdayBusy = false`. Both the busy refusal and the
@@ -556,6 +561,31 @@ loopback included.
 - Fix: track the busy peer (`bdayPeer`) and clear it only in that peer's
   `closeBday`. Or reset it only when a `ctx` was closed.
 - Test: the third click leaves one punch running.
+- **Status: fixed** by `de9efea`, re-checked 2026-10-24. `bdayBusy` holds the peer
+  whose punch has the slot, and only that peer's `closeBday` frees it. Every way a
+  punch ends reaches that call: the timer, `abort`, an answer with no public IP, an
+  error, a win. The 70 s timer is armed with the slot, so the slot can't stick.
+
+**NB48b-3 — `stripCandidates` misses some candidate lines Chrome parses (Low).**
+`stripCandidates` finds candidate lines with a regex whose idea of a line isn't
+Chrome's: Chrome's SDP parser splits only on `\n`. Some line-ending variants
+survive the strip and are still parsed as candidates.
+- Repro (re-check probe, loopback listeners): a hostile answer with 5 loopback
+  candidates written that way, through `applyAnswer`, gave the easy connection 5
+  remote candidates and 129 checks in 8 s.
+- Reach:
+  - the answer path, which leaves NB48b-1 open;
+  - by code reading, the offer path into `openFleet`, which brings NB48-1's LAN
+    reach back across the fleet.
+  - Both still need the visitor's click, at most once per peer per 5 min, so the
+    no-click NB48-1 stays fixed.
+- Fix: strip on Chrome's line model,
+  `sdp.split('\n').filter((l) => !/^\s*a=candidate:/i.test(l)).join('\n')`.
+  After `setRemoteDescription`, fail if `pc.remoteDescription.sdp` (Chrome's own
+  re-serialisation) still lists a candidate.
+- Test: stripping SDPs with every line ending, and a stray `\r` or U+2028 inside a
+  candidate line, leaves no `\n`-delimited candidate line. In Chromium, the fleet
+  has 0 remote candidates and the easy side only the sprayed ones.
 
 **NB48-2 — The easy side sprays whatever IPv4 address the peer names (Low).** In Net
 Lab's `answer` step, `data.ip` goes to `applyAnswer` after `sprayCandidates` checks
@@ -570,7 +600,7 @@ peer's own signalling.
   - Left as is: the IP isn't matched to anything the peer proved, since the peer
     writes all of that signalling anyway.
   - Still open: the LAN reach this finding was about remains through the answer's
-    own candidates, NB48b-1.
+    own candidates: NB48b-1, now NB48b-3.
 
 **NB46-1 — A peer can keep the dialling side publishing offers (Low).** A `restart`
 signal makes the dialling side create and publish an ICE-restart offer, resent up to
