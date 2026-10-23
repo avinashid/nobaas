@@ -71,10 +71,13 @@ that needs a change is tracked as an NB card.
 | NPM-3 (Low) | **Fixed** by `6f947f3`: a map request in flight at stop gets one delete |
 | NB44-1 (Medium) | **Fixed** by `40e42db` (per-IP punch cap), re-checked 2026-10-23 ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
 | NB48-1 (Medium) | **Fixed** by `d1b2d25` (fleet checks one public address; Net Lab consent and cooldown), re-checked 2026-10-23 |
-| NB48-2 (Low) | Fixed in part by `d1b2d25` (public spray IP); the rest is NB48b-1 |
+| NB48-2 (Low) | Fixed in part by `d1b2d25` (public spray IP); the rest is NB48b-3 |
 | NB44-2, NB44-3 (Low) | **Fixed** by `a16072e` (NB-044b: authenticated routes, fd reserve), re-checked 2026-10-23; residuals NB44c-1, NB44c-2 |
-| NB44c-1, NB44c-2, NB46-1, NB48b-1, NB48b-2 (Low) | Open, same section |
+| NB48b-2 (Low) | **Fixed** by `de9efea` (the busy slot is held per peer), re-checked 2026-10-24 |
+| NB48b-1 (Low) | Fix applied by `de9efea` (the answer is stripped), but bypassed: NB48b-3 |
+| NB44c-1, NB44c-2, NB46-1, NB48b-3, NB48b-4 (Low) | Open, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
+| NB48b-5, NB48b-6 (Info) | Open (robustness and hardening of the carried channel), same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -546,6 +549,9 @@ loopback included.
 - Fix: `setRemoteDescription({ type: 'answer', sdp: stripCandidates(answerSdp) })`.
   Our own fleet's answer carries no candidates, so nothing else changes.
 - Test: an answer with N candidates leaves only the spray candidates.
+- **Status: fix applied** by `de9efea`, re-checked 2026-10-24. Answers with CRLF,
+  LF-only, upper-case or tab-separated candidates drew 0 remote candidates and 0
+  checks in Chromium. The strip itself can be bypassed, though: NB48b-3.
 
 **NB48b-2 — "One fleet at a time" is cleared by its own refusal (Low).**
 - The bug: `closeBday` always sets `bdayBusy = false`. Both the busy refusal and the
@@ -556,6 +562,78 @@ loopback included.
 - Fix: track the busy peer (`bdayPeer`) and clear it only in that peer's
   `closeBday`. Or reset it only when a `ctx` was closed.
 - Test: the third click leaves one punch running.
+- **Status: fixed** by `de9efea`, re-checked 2026-10-24. `bdayBusy` holds the peer
+  whose punch has the slot, and only that peer's `closeBday` frees it. Every way a
+  punch ends reaches that call: the timer, `abort`, an answer with no public IP, an
+  error, a win. The 70 s timer is armed with the slot, so the slot can't stick.
+
+**NB48b-3 — `stripCandidates` misses some candidate lines Chrome parses (Low).**
+`stripCandidates` finds candidate lines with a regex whose idea of a line isn't
+Chrome's: Chrome's SDP parser splits only on `\n`. Some line-ending variants
+survive the strip and are still parsed as candidates.
+- Repro (re-check probe, loopback listeners): a hostile answer with 5 loopback
+  candidates written that way, through `applyAnswer`, gave the easy connection 5
+  remote candidates and 129 checks in 8 s.
+- Reach:
+  - the answer path, which leaves NB48b-1 open;
+  - by code reading, the offer path into `openFleet`, which brings NB48-1's LAN
+    reach back across the fleet.
+  - Both still need the visitor's click, at most once per peer per 5 min, so the
+    no-click NB48-1 stays fixed.
+- Fix: strip on Chrome's line model,
+  `sdp.split('\n').filter((l) => !/^\s*a=candidate:/i.test(l)).join('\n')`.
+  After `setRemoteDescription`, fail if `pc.remoteDescription.sdp` (Chrome's own
+  re-serialisation) still lists a candidate.
+- Test: stripping SDPs with every line ending, and a stray `\r` or U+2028 inside a
+  candidate line, leaves no `\n`-delimited candidate line. In Chromium, the fleet
+  has 0 remote candidates and the easy side only the sprayed ones.
+
+**A punched channel carries the room link (`fd660de`, `cf49f72`; reviewed
+2026-10-24).** A birthday punch that works hands its DataChannel to the room
+(`room.adoptChannel`). A link over signalling then sends its pipe datagrams over the
+channel, and the core sees no new address. A link relayed by a member gets a new
+handle, and `pw_add_candidate` lets the core punch to it and move there. The review
+found nothing that weakens the session:
+- The channel's far end is bound by DTLS to the SDP that came over the authenticated
+  room link. Everything it sends goes to `ep.receive` and must authenticate. Probe:
+  101 junk datagrams over a carried channel were all rejected (99 malformed, 2 unknown
+  session), and the link kept delivering.
+- The one-byte CARRY/CARRIED agreement settles only on a binary message of at most
+  `MAX_DATAGRAM` bytes. A string, an oversized or an empty buffer doesn't settle it,
+  and a one-sided adopt is refused after 5 s. A CARRY gets one reply on the same
+  channel, so there is no amplification (but see NB48b-6).
+- There is one carrier per peer, and a newer adopt ends the old one. It ends with the
+  peer (`lost` → `drop`) and with the room (`close`), which closes its connection.
+- No address is shared beyond what the punch already exchanged, and both visitors
+  clicked to punch.
+
+**NB48b-4 — Relay-only: a pending relayed dial sends its handshake direct (Low).**
+With relay-only on and a dial through a relay still pending, `pw_add_candidate` (or
+`pw_connect`) for that peer sends the handshake straight to the new address. That
+reveals our address to whoever is there, which relay-only promises not to do.
+- Cause: `connect_with` keeps only Via targets when the *current call* names one.
+  A Direct-only call made while dialling is added to the existing relayed dial.
+- Repro (FFI, scratch): a and b link to r, `pw_set_relay_only(a, 1)`, then
+  `pw_connect_via(a, r, b)`, then `pw_add_candidate(a, 11, b)` before routing. a sent
+  3 HS1 to handle 11. With the link live first, it sent 0.
+- Reach: the host only. Native traversal under `RelayOnly` dials others only through
+  the relay, and JS rooms refuse relay-only.
+- Fix: while dialling, skip Direct targets when relay-only and the dial has a relay.
+- Test: the repro sends 0 datagrams to the candidate in both states.
+
+**NB48b-5 — A route reads `direct` while a relayed link waits to fall back (Info).**
+After a carried channel that replaced a relayed link closes, the core keeps the dead
+handle until its 15 s direct timeout, and `room.route` reports plain `direct` (probe:
+from 50 ms to 15 035 ms). In that window, an old WebRTC link's `closed` event drops the
+peer, and the peer counts as a relay for others. Only the peer itself or the network
+can cause this.
+- Fix: `rtcClosed` drops the peer only if the closed link's handle is its current
+  path, or ex-carrier handles stay marked until the path changes.
+
+**NB48b-6 — CARRY replies are unbounded (Info).** Every CARRY is answered with a
+CARRIED, sent without the `MAX_BUFFERED` check. A peer can fill its own channel's send
+queue with one-byte replies (probe: 500 in, 500 out).
+- Fix: answer at most once per `CARRY_EVERY_MS`, through the congestion check.
 
 **NB48-2 — The easy side sprays whatever IPv4 address the peer names (Low).** In Net
 Lab's `answer` step, `data.ip` goes to `applyAnswer` after `sprayCandidates` checks
@@ -570,7 +648,7 @@ peer's own signalling.
   - Left as is: the IP isn't matched to anything the peer proved, since the peer
     writes all of that signalling anyway.
   - Still open: the LAN reach this finding was about remains through the answer's
-    own candidates, NB48b-1.
+    own candidates: NB48b-1, now NB48b-3.
 
 **NB46-1 — A peer can keep the dialling side publishing offers (Low).** A `restart`
 signal makes the dialling side create and publish an ICE-restart offer, resent up to
