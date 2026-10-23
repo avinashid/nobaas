@@ -73,6 +73,21 @@ try {
   ok(await pages[0].evaluate(() => /Punching|running/.test(document.querySelector('#peers .bdayrow')?.textContent ?? '')), 'the peer card shows the punch running');
   if (shot) await pages[0].screenshot({ path: `${shot}-birthday.png`, fullPage: true });
 
+  // NB48b-2: one punch at a time per tab. With tab 0's punch still running, a third
+  // member joins and tab 0 tries to punch it twice: both are refused, and the refusal
+  // must not free the slot for the second try.
+  const third = await ctx.newPage();
+  third.on('pageerror', (e) => errors.push(`tab 2: ${e.message}`));
+  await third.goto(`http://127.0.0.1:${port}/demo/netlab.html?signal=local&name=n2&fleet=8#key=${key}`);
+  await pages[0].waitForFunction(() => window.netlab.peers().length === 2, null, { timeout: 40000 });
+  const running = await pages[0].evaluate(async () => {
+    const other = window.netlab.birthday().findIndex((b) => b.status !== 'running');
+    await window.netlab.punch(other);
+    await window.netlab.punch(other);
+    return window.netlab.birthday().filter((b) => b.status === 'running').length;
+  });
+  ok(running === 1, `a refused punch keeps the one slot: ${running} running (NB48b-2)`);
+
   if (errors.length) throw new Error(`page errors: ${errors.join('; ')}`);
 } catch (e) {
   ok(false, e.stack ?? String(e));

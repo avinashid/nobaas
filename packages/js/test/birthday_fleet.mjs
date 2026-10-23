@@ -111,6 +111,17 @@ try {
       await sleep(300);
       ok((await remoteCands(bad.conns)) === 0 && bad.conns.length === 2, 'a non-public easyAddr adds no candidate; size honoured');
       bad.conns.forEach((c) => c.pc.close());
+
+      // NB48b-1: the easy side never checks the candidates in the peer's answer either —
+      // a hostile answer with 20 loopback candidates leaves only the sprayed guesses.
+      const easy = await openSpray({ RTCPeerConnection, advertise: false });
+      const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: easy.offerSdp, size: 1 });
+      const loop = Array.from({ length: 20 }, (_, i) => `a=candidate:inj${i} 1 udp 1 127.0.0.1 ${21000 + i} typ host`).join('\r\n') + '\r\n';
+      await easy.applyAnswer(hard.answerSdp + loop, '127.0.0.1', [1500, 1501]);
+      await sleep(300);
+      ok(!/a=candidate:inj/.test(easy.pc.remoteDescription.sdp), "the answer's 20 injected candidates are stripped");
+      ok((await remoteCands([easy])) === 2, 'the easy side checks only its 2 sprayed guesses');
+      easy.pc.close(); hard.conns.forEach((c) => c.pc.close());
     }
 
     // The miss case: no real port in the spray → nothing opens.

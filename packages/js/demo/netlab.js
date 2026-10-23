@@ -447,7 +447,7 @@ function onMessage(data, peer, info) {
 
 const BDAY_TIMEOUT_MS = 70000;
 const BDAY_COOLDOWN_MS = 300000; // one punch per peer per 5 min (NB48-1); reload to reset
-let bdayBusy = false; // one fleet at a time, this tab (NB48-1)
+let bdayBusy = null; // the peer whose punch holds this tab's one slot (NB48-1: one fleet at a time)
 const rtcAvailable = () => params.get('rtc') !== 'off' && typeof RTCPeerConnection === 'function';
 const bdayIce = () => (params.get('signal') === 'local' ? [] : PROBE_STUN);
 // This device's own public IPv4 (from the network probe), for the hard side's answer.
@@ -492,7 +492,7 @@ function bdayFail(peer, why) {
   log('warn', `birthday punch with ${nameOf(peer)}: ${why}`);
 }
 function closeBday(peer) {
-  bdayBusy = false; // the slot is free again (NB48-1: one fleet at a time)
+  if (bdayBusy === peer) bdayBusy = null; // NB48b-2: only the punch holding the slot frees it, not a refusal
   const b = peerState(peer).bday;
   if (!b?.ctx) return;
   try { b.ctx.easy?.pc.close(); } catch { /* already closed */ }
@@ -528,7 +528,7 @@ async function tryBirthday(peer) {
   }
   const role = iAmHard ? 'hard' : 'easy';
   const pending = prev?.pendingOffer; // a buffered offer from the easy initiator
-  bdayBusy = true;
+  bdayBusy = peer;
   bdayStatus(peer, 'running', { role, startedAt: now(), lastRun: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
   log('info', `birthday punch with ${nameOf(peer)}: starting as the ${role} side (${why})`);
   if (initiated) room.send({ t: 'bday', step: 'start', yourRole: iAmHard ? 'easy' : 'hard' }, { to: peer });
