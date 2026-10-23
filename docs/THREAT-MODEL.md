@@ -72,8 +72,9 @@ that needs a change is tracked as an NB card.
 | NB44-1 (Medium) | **Fixed** by `40e42db` (per-IP punch cap), re-checked 2026-10-23 ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
 | NB48-1 (Medium) | **Fixed** by `d1b2d25` (fleet checks one public address; Net Lab consent and cooldown), re-checked 2026-10-23 |
 | NB48-2 (Low) | Fixed in part by `d1b2d25` (public spray IP); the rest is NB48b-1 |
-| NB44-2, NB44-3, NB46-1, NB48b-1, NB48b-2 (Low) | Open, same section |
-| NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section |
+| NB44-2, NB44-3 (Low) | **Fixed** by `a16072e` (NB-044b: authenticated routes, fd reserve), re-checked 2026-10-23; residuals NB44c-1, NB44c-2 |
+| NB44c-1, NB44c-2, NB46-1, NB48b-1, NB48b-2 (Low) | Open, same section |
+| NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -402,6 +403,48 @@ does this before `Endpoint::handle_datagram` has authenticated anything.
   path or dial target equal to `from` after `handle_datagram`. Refresh `last_recv`
   only from that address, and cap `routes` at `MAX_EXTRA_SOCKETS`. Test: junk from N
   ports leaves `routes` empty, and the sockets close at `until`.
+- **Status: fixed** by `a16072e` (NB-044b). `read_extra` adopts a route, and refreshes
+  `last_recv`, only when `Endpoint::handle_datagram_direct` reports that the datagram
+  reached a session whose direct path is `from`; `routes` is capped at `MAX_ROUTES`
+  (512). Re-check: junk, a bad-tag Data packet, or anything from another address
+  makes no route (test `birthday_sockets_ignore_unauthenticated_floods`), and a
+  punched link still adopts its route. Residuals: NB44c-1 and NB44c-2 below.
+
+**NB44c-1 — Two unauthenticated packets still count as "authenticated on this
+path" (Low).** `on_packet` returns the session index from two early returns that
+run no crypto: an HS1 matching `half_open` by (sender, ephemeral), and an HS2 for a
+link that is already live. So `handle_datagram_direct` reports true for either one
+when it comes from the peer's current direct address.
+
+- Repro (two in-memory endpoints, linked): an HS2 of `0x12`, any sender, our receiver
+  index and 48 junk bytes, from the peer's address, gives true, and `rx_auth_failed`
+  does not move. Replaying the peer's HS1 from its address while the link is
+  half-open also gives true. The wrong index or another address gives false.
+- It needs the peer's exact address and either our receiver index (in clear in every
+  Data packet to us) or a captured HS1: an on-path observer, or a spoofer who has
+  seen one packet. If such a packet reaches an extra socket, the peer's address
+  becomes a route there (our egress to it moves) and the socket is held another
+  `ROUTE_IDLE` each time.
+- Fix: report true only when this datagram passed crypto (set a flag after
+  `read_message` in `on_hs1`, `on_hs2` and `on_data`; the duplicate returns leave it
+  unset). Test: both packets above give false.
+
+**NB44c-2 — Any linked identity can hold extra sockets open (Low).** `open_extra`
+does not record `Birthday.peer`, so a valid handshake from any identity that knows
+our PeerId and can reach an extra socket makes a route, and the socket stays open
+while that session sends once a minute. `on_data` also moves a session's path on
+every authenticated packet from a new source port, so one linked peer cycling
+through N source ports holds N sockets (up to 512) and the 5 ms poll (NB44-I2).
+
+- Repro (loopback node test): node A opens 4 extra sockets for a punch to T, and an
+  unrelated node C links to one. One route, and the socket is still open after
+  `until`.
+- The NB44-3 reserve keeps the process 64 fds clear, so the cost is held fds and
+  wake-ups, not `EMFILE`.
+- Fix: keep the punch's peer in `Extra`, have `handle_datagram_direct` return the
+  authenticated session's `PeerId`, adopt a route only for that peer, and keep one
+  route per peer. Fold NB44-I2 in: drop the 5 ms poll once every open extra socket
+  is a route. Card NB-044c.
 
 **NB44-3 — Local resources a remote peer can spend (Low).**
 - **File descriptors.** An offer saying `Cone` makes a random-port symmetric node
@@ -426,6 +469,14 @@ does this before `Endpoint::handle_datagram` has authenticated anything.
   - Document in GODOT.md that macOS hosts (and mobile ones, check the limit) should
     raise `RLIMIT_NOFILE`.
 - Found by reading the code; no probe was run.
+- **Status: fixed** (file descriptors) by `a16072e` (NB-044b). A failed bind closes up
+  to `FD_RESERVE` (64) of the sockets that punch opened, and GODOT.md has the
+  `RLIMIT_NOFILE` note. Re-check under `ulimit -n 256`: a punch opened 188 sockets
+  and left 64 fds free, a second punch at the same time still left 64, the main
+  socket kept working, and every extra socket closed at `until` with nothing leaked
+  (the same at 128: 60 opened, 64 free). At 256 a punch gets fewer sockets, so it
+  may not link. Ports and connection tracking stay bounded by `MAX_EXTRA_SOCKETS`,
+  the NB44-1 per-IP cap and the node's punch bucket (accepted).
 
 **NB45-I1 — Sweep ports can be below 1024 (Info).** The sender's prediction (`next`,
 `step`) chooses the ports of a lockstep sweep and of port guesses. Unlike the spray,
