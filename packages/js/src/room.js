@@ -149,6 +149,7 @@ export class Room {
     this.proof = proof;
     this.proven = new Set(); // linked peers that proved the room key
     this.proving = new Map(); // peer -> frames held while its proof is checked
+    this.proofSent = new Map(); // linked peer -> resolves once our link proof is written
     this.deadlines = new Map(); // peer -> timer that drops it unless it proves the key
     this.transport = makeTransport((peer, state) => {
       if (state === 'closed') this.lost(peer, 'closed');
@@ -266,6 +267,7 @@ export class Room {
     this.linked.clear();
     this.proven.clear();
     this.proving.clear();
+    this.proofSent.clear();
     for (const t of this.deadlines.values()) clearTimeout(t);
     this.deadlines.clear();
   }
@@ -297,9 +299,9 @@ export class Room {
       const peer = e.peer;
       this.linked.add(peer);
       // Prove the room key first; presence follows once the peer has proved it too.
-      this.proof.pair('pw-link', this.self, peer).then((p) => {
+      this.proofSent.set(peer, this.proof.pair('pw-link', this.self, peer).then((p) => {
         if (this.linked.has(peer)) this.write(peer, frame(T.Proof, fromHex(p)), Lane.Reliable);
-      });
+      }));
       clearTimeout(this.deadlines.get(peer));
       this.deadlines.set(peer, setTimeout(() => {
         if (!this.proven.has(peer)) this.lost(peer, 'unproven');
@@ -366,7 +368,12 @@ export class Room {
       clearTimeout(this.deadlines.get(peer));
       this.deadlines.delete(peer);
       this.proven.add(peer);
-      this.write(peer, frame(T.Presence, enc.encode(JSON.stringify(this.me))), Lane.Reliable);
+      // Our presence goes after our own proof, or the peer drops it as unproven and never
+      // lists us: signing that proof can finish after this check (WebCrypto keeps no order).
+      const sent = this.proofSent.get(peer);
+      sent.then(() => {
+        if (this.proven.has(peer) && this.proofSent.get(peer) === sent) this.write(peer, frame(T.Presence, enc.encode(JSON.stringify(this.me))), Lane.Reliable);
+      });
       for (const [d, l] of rest) this.onMessage(peer, d, l);
     });
   }
@@ -376,6 +383,7 @@ export class Room {
     this.linked.delete(peer);
     this.proven.delete(peer);
     this.proving.delete(peer);
+    this.proofSent.delete(peer);
     clearTimeout(this.deadlines.get(peer));
     this.deadlines.delete(peer);
     this.outbox.delete(peer);

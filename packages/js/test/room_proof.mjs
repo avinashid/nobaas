@@ -7,7 +7,8 @@
 //   presence or messages; frames before a proof are ignored, a wrong proof drops
 //   the link at once and no proof drops it after Room.proofMs.
 // Also checks the hello proof against an independent HMAC built the way
-// traversal.rs builds Rust's, so the two stay compatible.
+// traversal.rs builds Rust's, so the two stay compatible, and that a room whose
+// own link proof is signed late still joins on both sides.
 //
 //   node packages/js/test/room_proof.mjs
 import { createHash, createHmac } from 'node:crypto';
@@ -144,9 +145,31 @@ await sleep(300);
 if (pcs || answers.length) fail(`unproven offers: ${pcs} RTCPeerConnections, answers ${answers}`);
 console.log('WebRTC offers without the room proof: no RTCPeerConnection, no answer');
 
+// 4. A room can finish checking the peer's link proof before signing its own (WebCrypto
+//    keeps no order between the two; under load the check can win). Its presence must
+//    still follow its proof, or the peer drops it as unproven and never lists it: a
+//    one-sided join for good (the node fuzz flake).
+const raceOpts = { appId: 'peerwire-test', roomId: `proof-race-${process.pid}` };
+const c = await joinRoom({ ...raceOpts, presence: { name: 'cy' } });
+const sign = c.proof.pair.bind(c.proof);
+c.proof.pair = async (label, ...rest) => {
+  if (label === 'pw-link') await sleep(20);
+  return sign(label, ...rest);
+};
+const d = await joinRoom({ ...raceOpts, presence: { name: 'di' } });
+await until('both sides of a late-proof link to join', () => c.peers.length === 1 && d.peers.length === 1, 3000);
+const heard = [];
+c.on('message', (m) => heard.push(m));
+d.on('message', (m) => heard.push(m));
+c.send('c to d');
+d.send('d to c');
+await until('messages both ways', () => heard.length === 2, 3000);
+if (d.getPresence(c.self)?.name !== 'cy' || c.getPresence(d.self)?.name !== 'di') fail('presence after a late link proof');
+console.log("a link proof signed after the peer's is checked: presence still follows it, both sides join and talk");
+
 sig2.close();
 lt.close();
 ep.close();
-await Promise.all([a.leave(), b.leave(), victim.leave()]);
+await Promise.all([a.leave(), b.leave(), victim.leave(), c.leave(), d.leave()]);
 console.log('room_proof: ok');
 process.exit(0);
