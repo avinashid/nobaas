@@ -3,7 +3,7 @@
 // Pure functions: no browser, no network.
 //
 //   node packages/js/test/birthday.mjs
-import { randomCredentials, shareCredentials, sprayPorts, sprayCandidates, isPublicV4, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
+import { randomCredentials, shareCredentials, sprayPorts, sprayCandidates, isPublicV4, stripCandidates, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
 
 let failed = 0;
 const ok = (cond, what) => {
@@ -69,6 +69,31 @@ for (const bad of ['10.0.0.1', '192.168.1.5', '172.16.0.1', '172.31.255.1', '127
 }
 // 172.15 and 172.32 are public (only 172.16–31 is private); 100.63 and 100.128 too.
 ok(isPublicV4('172.15.0.1') && isPublicV4('172.32.0.1') && isPublicV4('100.63.0.1') && isPublicV4('100.128.0.1'), 'private-range edges');
+
+// stripCandidates (NB48b-3): Chrome splits SDP on `\n` only, so after the strip no line
+// that split yields may be a candidate, whatever the line endings, and every other line
+// is kept as it was. (A regex line model kept the `\r\r\n`, stray `\r` and U+2028 cases.)
+const cand = (k) => `a=candidate:inj${k} 1 udp 1 127.0.0.1 ${22000 + k} typ host`;
+const endings = {
+  'CRLF': (k) => `${cand(k)}\r\n`,
+  'LF': (k) => `${cand(k)}\n`,
+  'CR CR LF': (k) => `${cand(k)}\r\r\n`,
+  'stray CR at the end': (k) => `${cand(k)} generation 0\r\r\n`,
+  'stray CR inside': (k) => `${cand(k).replace(' typ', '\r typ')}\r\n`,
+  'U+2028 inside': (k) => `${cand(k)}\u2028x\r\n`,
+  'U+2028 then another candidate': (k) => `${cand(k)}\u2028${cand(k + 10)}\r\n`,
+  'upper case, leading space': (k) => ` A=CANDIDATE:inj${k} 1 udp 1 127.0.0.1 ${22000 + k} typ host\r\n`,
+};
+const isCand = (l) => /^\s*a=candidate:/i.test(l);
+for (const [name, line] of Object.entries(endings)) {
+  for (const eol of ['\r\n', '\n']) {
+    const lines = sdp.split('\r\n');
+    const hostile = lines.slice(0, 4).join(eol) + eol + line(1) + lines.slice(4).join(eol) + eol + line(2);
+    const out = stripCandidates(hostile);
+    const left = out.split('\n').filter(isCand).length;
+    ok(left === 0 && out === lines.join(eol) + eol, `strip, ${name} (SDP lines end ${JSON.stringify(eol)}): ${left} candidate lines left, the rest unchanged`);
+  }
+}
 
 console.log(failed ? `${failed} FAILED` : 'all passed');
 process.exit(failed ? 1 : 0);
