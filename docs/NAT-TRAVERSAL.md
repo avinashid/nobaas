@@ -391,7 +391,9 @@ gives out. Changing it affects the next invites and offers; links already up kee
   - `Node` closes, unseen, a new direct link from anyone but the relay.
   - The endpoint is relay-only (`Endpoint::set_relay_only`). Its relayed links take no candidates (from offers,
     direct packets or the relay's origin tags), never punch, never answer a punch and never move to a direct
-    path. Dials that name a relay drop their direct targets. A direct handshake is answered only from a peer it
+    path. A dial through a relay alone (given the relay before any direct address of its own, or with a relay
+    when relay-only is turned on) drops its direct targets and ignores an answer at the endpoint's own address. A
+    direct dial later given a relay keeps its direct targets. A direct handshake is answered only from a peer it
     is itself dialling directly or already has a direct link with. It sends no OBSERVED frames or origin tags.
   - It sends its relayed packets in `FWD_QUIET` frames: the relay forwards them in `RELAYED` frames with no
     origin address. (`FWD` asks the relay to say where it sees the sender, so that the far end can punch.) A

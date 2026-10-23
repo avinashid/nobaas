@@ -215,8 +215,10 @@ export class Endpoint {
     return r;
   }
   // Relay-only: links made through a relay (connectVia) stay relayed and never
-  // punch to a direct path, relays forward our packets without our address, and
-  // a direct handshake is answered only from a peer we are dialling directly.
+  // punch to a direct path, dials through a relay alone send nothing direct (a
+  // direct dial later given a relay may still complete direct), relays forward
+  // our packets without our address, and a direct handshake is answered only
+  // from a peer we are dialling directly.
   setRelayOnly(on) {
     if (this.closed) return;
     this.pw.x.pw_set_relay_only(this.h, on ? 1 : 0);

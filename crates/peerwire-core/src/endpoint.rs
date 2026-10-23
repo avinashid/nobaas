@@ -506,16 +506,20 @@ impl<A: Address> Endpoint<A> {
 
     /// Keeps relayed links relayed, so peers reached through a relay never learn
     /// this endpoint's address from it: they are asked to forward without the
-    /// origin tag (FWD_QUIET), dials that name a relay go through it alone
-    /// (their direct targets, port guesses and sprays are dropped, also those of
-    /// a dial already under way, and an answer to it at this endpoint's own
-    /// address is ignored), and relayed links take no direct candidates, never
-    /// punch, never answer a punch and never move to a direct path. This
-    /// endpoint also stops sharing the addresses it sees (OBSERVED frames,
-    /// origin tags), as with `share_addresses` off, and answers a handshake at
-    /// its own address only from a peer it is dialling directly or already has
-    /// a direct link with. Direct links and dials, such as those to the relay,
-    /// are unaffected; links already up keep their path.
+    /// origin tag (FWD_QUIET), dials through a relay alone go through it, and
+    /// relayed links take no direct candidates, never punch, never answer a punch
+    /// and never move to a direct path. A dial is through a relay alone if it is
+    /// given the relay before any direct address of its own, or already has a
+    /// relay when relay-only is turned on: its direct targets (also those given
+    /// with the relay or later), port guesses and sprays are dropped, and an
+    /// answer to it at this endpoint's own address is ignored. This endpoint also
+    /// stops sharing the addresses it sees (OBSERVED frames, origin tags), as with
+    /// `share_addresses` off, and answers a handshake at its own address only from
+    /// a peer it is dialling directly or already has a direct link with. Direct
+    /// links and dials, such as those to the relay, are unaffected, and so is a
+    /// direct dial later given a relay: it keeps its direct addresses and may
+    /// complete direct, though it takes no new ones. Links already up keep their
+    /// path.
     pub fn set_relay_only(&mut self, on: bool) {
         self.relay_only = on;
         if !on {
@@ -676,8 +680,8 @@ impl<A: Address> Endpoint<A> {
     /// Sends the handshake along every path in `targets` at once (all of a
     /// peer's known addresses, a relay, or both). If both peers do this at the
     /// same time towards each other's public addresses, the handshakes punch
-    /// through cone NATs. Calling it again while dialling adds paths, except
-    /// direct ones to a dial through a relay while relay-only.
+    /// through cone NATs. Calling it again while dialling adds paths, except,
+    /// while relay-only, direct ones given with a relay or to a dial that has one.
     pub fn connect_with(&mut self, now: Instant, peer: PeerId, targets: &[Path<A>]) -> Result<(), ConnectError> {
         if peer == self.me {
             return Err(ConnectError::SelfConnect);
@@ -686,7 +690,7 @@ impl<A: Address> Endpoint<A> {
         if targets.is_empty() {
             return Err(ConnectError::NoPath);
         }
-        // Relay-only: a dial that names a relay goes through it alone.
+        // Relay-only: direct targets given with a relay are dropped (a new dial goes through it alone).
         let relayed: Vec<Path<A>>;
         let targets = if self.relay_only && targets.iter().any(|t| matches!(t, Path::Via(_))) {
             relayed = targets.iter().filter(|t| matches!(t, Path::Via(_))).cloned().collect();
@@ -702,7 +706,7 @@ impl<A: Address> Endpoint<A> {
             let State::Dialing(d) = &mut sess.state else { return Ok(()) };
             let mut new = Vec::new();
             for t in targets {
-                // Relay-only: a dial through a relay takes no direct paths later either.
+                // Relay-only: a dial with a relay takes no new direct paths (a direct one keeps its own).
                 if self.relay_only && sess.relay.is_some() && matches!(t, Path::Direct(_)) {
                     continue;
                 }
