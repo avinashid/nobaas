@@ -272,10 +272,12 @@ async function useMic() {
   }
   renderMic();
   $('mic').disabled = true; // until the room is joined again
-  log('info', `microphone allowed (closed again at once): new links in named and private rooms offer this device's local addresses (never the global room's); re-testing the network${room ? ' and rejoining the room' : ''}`);
+  log('info', `microphone allowed (closed again at once): new links in named and private rooms offer this device's local addresses (never the global room's); ${room ? 'rejoining the room and ' : ''}re-testing the network`);
   try {
-    await reprobe();
+    // Rejoin first: until then the global room is still joined with the local addresses,
+    // and the re-test takes seconds (MIC-4). reprobe() sends the new reading as presence.
     await rejoin();
+    await reprobe();
   } finally {
     askingMic = false;
     renderMic();

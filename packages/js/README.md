@@ -307,8 +307,9 @@ Run these with Node and the Playwright install on this host:
   report says `granted`, the network test lists real local addresses and reads the same NAT, the room
   is joined again, and the other tab sees `mic` and real local addresses and links direct. The global
   room, with the grant stored before the tabs open or given while they're in it, gives the other tab
-  no local address and still links, and a birthday punch's offer carries no candidate. A refused
-  prompt reports `denied` and doesn't rejoin.
+  no local address and still links, and a birthday punch's offer carries no candidate. Pressed in the
+  global room, the button rejoins before it re-tests the network, so a tab joining meanwhile hears no
+  local address. A refused prompt reports `denied` and doesn't rejoin.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
