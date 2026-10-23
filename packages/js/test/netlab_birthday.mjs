@@ -48,11 +48,16 @@ try {
   // The network probe must finish (roles and the hard side's IP come from it).
   await all(() => window.netlab.report().me.network);
 
-  // Tab 0 triggers the punch via its button (the real control path).
+  // Tab 0 initiates via its button (the real control path).
   await pages[0].click('#peers [data-bday]');
   ok(true, 'birthday punch triggered from the peer card');
+  // NB48-1: tab 1 does NOT auto-run — a remote request only invites; it needs a local click.
+  await pages[1].waitForFunction(() => window.netlab.birthday()[0]?.status === 'invited', null, { timeout: 20000 });
+  ok(await pages[1].evaluate(() => !window.netlab.birthday()[0].ctx && window.netlab.birthday()[0].status === 'invited'), 'a remote request only invites — no fleet without a local click');
+  await pages[1].click('#peers [data-bday]'); // the user accepts
+  ok(true, 'tab 1 accepted with a local click');
   // Both tabs take a role; one hard, one easy.
-  const roles = await Promise.all(pages.map((p) => p.waitForFunction(() => window.netlab.birthday()[0]?.role, null, { timeout: 20000 }).then((h) => h.jsonValue())));
+  const roles = await Promise.all(pages.map((p) => p.waitForFunction(() => window.netlab.birthday()[0]?.status === 'running' && window.netlab.birthday()[0]?.role, null, { timeout: 20000 }).then(() => p.evaluate(() => window.netlab.birthday()[0].role))));
   console.log(`  roles: tab0 ${roles[0]}, tab1 ${roles[1]}`);
   ok(roles.includes('hard') && roles.includes('easy'), 'one side is hard, the other easy');
 

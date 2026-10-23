@@ -81,6 +81,38 @@ try {
       easy.pc.close(); hard.conns.forEach((c) => c.pc.close());
     }
 
+    // NB48-1: openFleet never checks the candidates in the peer's offer — a hostile offer
+    // with many candidates leaves each connection with at most the one validated address
+    // we chose, not the attacker's N.
+    {
+      const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+      const creds = randomCredentials();
+      const probe = new RTCPeerConnection();
+      probe.createDataChannel('x');
+      await probe.setLocalDescription(await probe.createOffer());
+      const inject = Array.from({ length: 20 }, (_, i) => `a=candidate:inj${i} 1 udp 1 ${10 + i}.0.0.${i} ${20000 + i} typ host`).join('\r\n') + '\r\n';
+      const sdp = probe.localDescription.sdp.replace(/\r\n$/, '\r\n') + inject;
+      probe.close();
+      const remoteCands = async (conns) => {
+        let max = 0;
+        for (const c of conns) {
+          let n = 0;
+          (await c.pc.getStats()).forEach((r) => { if (r.type === 'remote-candidate') n++; });
+          max = Math.max(max, n);
+        }
+        return max;
+      };
+      const good = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: sdp, size: 4, easyAddr: '203.0.113.9:40000' });
+      await sleep(400);
+      ok(good.conns.every((c) => !/a=candidate:inj/.test(c.pc.remoteDescription.sdp)), "the offer's 20 injected candidates are stripped from every fleet connection");
+      ok((await remoteCands(good.conns)) <= 1, 'each connection has at most one remote candidate (the one validated address)');
+      good.conns.forEach((c) => c.pc.close());
+      const bad = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: sdp, size: 2, easyAddr: '192.168.1.5:40000' });
+      await sleep(300);
+      ok((await remoteCands(bad.conns)) === 0 && bad.conns.length === 2, 'a non-public easyAddr adds no candidate; size honoured');
+      bad.conns.forEach((c) => c.pc.close());
+    }
+
     // The miss case: no real port in the spray → nothing opens.
     {
       const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });

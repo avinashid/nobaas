@@ -3,7 +3,7 @@
 // Pure functions: no browser, no network.
 //
 //   node packages/js/test/birthday.mjs
-import { randomCredentials, shareCredentials, sprayPorts, sprayCandidates, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
+import { randomCredentials, shareCredentials, sprayPorts, sprayCandidates, isPublicV4, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
 
 let failed = 0;
 const ok = (cond, what) => {
@@ -60,6 +60,15 @@ for (const bad of ['203.0.113.9 9 typ host', '203.0.113.9\r\na=evil', '2001:db8:
 }
 
 ok(FLEET_SIZE === 256 && SPRAY_PORTS === 1024, `fleet ${FLEET_SIZE}, spray ${SPRAY_PORTS}`);
+
+// isPublicV4 (NB48-1/NB48-2): only a routable public IPv4 passes, so a punch can't be
+// aimed at the victim's own LAN, router, loopback or carrier-NAT range.
+for (const good of ['203.0.113.9', '8.8.8.8', '157.49.45.3', '1.1.1.1']) ok(isPublicV4(good), `public: ${good}`);
+for (const bad of ['10.0.0.1', '192.168.1.5', '172.16.0.1', '172.31.255.1', '127.0.0.1', '0.0.0.0', '169.254.1.1', '100.64.0.1', '100.127.0.1', '224.0.0.1', '255.255.255.255', '2001:db8::1', 'nope', '', null]) {
+  ok(!isPublicV4(bad), `not public: ${JSON.stringify(bad)}`);
+}
+// 172.15 and 172.32 are public (only 172.16–31 is private); 100.63 and 100.128 too.
+ok(isPublicV4('172.15.0.1') && isPublicV4('172.32.0.1') && isPublicV4('100.63.0.1') && isPublicV4('100.128.0.1'), 'private-range edges');
 
 console.log(failed ? `${failed} FAILED` : 'all passed');
 process.exit(failed ? 1 : 0);

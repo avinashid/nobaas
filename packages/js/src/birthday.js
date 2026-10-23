@@ -26,6 +26,28 @@ const PORT_LOW = 1024;
 const PORT_RANGE = 65536 - PORT_LOW; // 64512 = 2^10 * 3^2 * 7
 const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
 
+// Whether `ip` is a public IPv4 address: not private (RFC 1918), loopback, CGNAT
+// (100.64/10), link-local, broadcast, "this network" or multicast. So a sprayed or
+// fleet-targeted address can't be aimed at the victim's own LAN, router or loopback.
+export function isPublicV4(ip) {
+  if (!IPV4.test(ip ?? '')) return false;
+  const [a, b] = ip.split('.').map(Number);
+  if (a === 10 || a === 127 || a === 0 || a >= 224) return false; // 10/8, loopback, 0/8, multicast+reserved
+  if (a === 172 && b >= 16 && b <= 31) return false; // 172.16/12
+  if (a === 192 && b === 168) return false; // 192.168/16
+  if (a === 169 && b === 254) return false; // link-local
+  if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT 100.64/10
+  return true;
+}
+
+// One remote candidate for the easy side's `ip:port`, if public IPv4; else null. The
+// fleet adds exactly this, instead of trusting the candidate list in the peer's offer.
+function easyCandidate(addr) {
+  const m = /^(\d+\.\d+\.\d+\.\d+):(\d+)$/.exec(addr ?? '');
+  if (!m || !isPublicV4(m[1]) || +m[2] < 1 || +m[2] > 65535) return null;
+  return { candidate: `candidate:pwe0 1 udp 1 ${m[1]} ${m[2]} typ srflx raddr 0.0.0.0 rport 0`, sdpMid: '0', sdpMLineIndex: 0 };
+}
+
 // A random value in [0, 1). Injected in tests; real code uses crypto.
 function rand() {
   const a = new Uint32Array(1);
@@ -103,17 +125,25 @@ function hostPort(pc) {
 // side's spray must hit; in the real world they are the NAT's mappings, discovered by
 // the punch, not shared), and `done`: the first connection whose channel opens, with
 // the losers closed. `size` connections is heavy — the caller decides when to run it.
-export async function openFleet({ RTCPeerConnection, cert, creds, offerSdp, size = FLEET_SIZE }) {
+export async function openFleet({ RTCPeerConnection, cert, creds, offerSdp, size = FLEET_SIZE, easyAddr = null }) {
+  // NB48-1: never check the candidates in the peer's offer — a hostile offer could
+  // list many addresses (the victim's LAN, router, anywhere) and make every connection
+  // in the fleet check all of them (256 × N). Strip them, cap the fleet, and check only
+  // the one validated public address the easy side is known to be at, as native open does.
+  size = Math.max(1, Math.min(size | 0, FLEET_SIZE));
+  const offer = stripCandidates(offerSdp);
+  const cand = easyCandidate(easyAddr);
   const conns = Array.from({ length: size }, () => {
     const pc = new RTCPeerConnection({ certificates: [cert] });
     return { pc, dc: dataChannel(pc) };
   });
   let answer = null;
   await Promise.all(conns.map(async ({ pc }) => {
-    await pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+    await pc.setRemoteDescription({ type: 'offer', sdp: offer });
     const ans = await pc.createAnswer();
     const munged = shareCredentials(ans.sdp, creds); // same ufrag/pwd on every connection
     await pc.setLocalDescription({ type: 'answer', sdp: munged });
+    if (cand) await pc.addIceCandidate(cand).catch(() => {});
     answer ??= munged;
   }));
   let settled = false;

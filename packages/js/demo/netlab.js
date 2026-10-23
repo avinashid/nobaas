@@ -21,7 +21,7 @@
 //   #key=…             joins that private room
 
 import { joinRoom, randomRoomId, DEFAULT_RELAYS } from '../src/index.js';
-import { openFleet, openSpray, randomCredentials, sprayPorts, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
+import { openFleet, openSpray, randomCredentials, sprayPorts, isPublicV4, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
 
 const APP_ID = 'peerwire-netlab';
 const GLOBAL_ROOM = 'global-v1';
@@ -446,10 +446,20 @@ function onMessage(data, peer, info) {
 // connections sharing one certificate and credentials; the cone side sprays its IP.
 
 const BDAY_TIMEOUT_MS = 70000;
+const BDAY_COOLDOWN_MS = 300000; // one punch per peer per 5 min (NB48-1); reload to reset
+let bdayBusy = false; // one fleet at a time, this tab (NB48-1)
 const rtcAvailable = () => params.get('rtc') !== 'off' && typeof RTCPeerConnection === 'function';
 const bdayIce = () => (params.get('signal') === 'local' ? [] : PROBE_STUN);
 // This device's own public IPv4 (from the network probe), for the hard side's answer.
-const myProbedV4 = () => (myNet?.srflx ?? []).map((c) => c.address).find((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a)) ?? null;
+const myProbedV4 = () => (myNet?.srflx ?? []).map((c) => c.address).find((a) => isPublicV4(a)) ?? null;
+// The easy side's own public ip:port (its first server-reflexive candidate in `sdp`),
+// which the hard fleet is told to target — instead of trusting the offer's candidate list.
+function srflxAddr(sdp) {
+  for (const m of (sdp ?? '').matchAll(/^a=candidate:\S+ \d+ udp \d+ (\d+\.\d+\.\d+\.\d+) (\d+) typ srflx/gim)) {
+    if (isPublicV4(m[1])) return `${m[1]}:${m[2]}`;
+  }
+  return null;
+}
 
 // Which side each peer plays: the symmetric NAT is "hard" (opens the fleet), the
 // cone is "easy" (sprays). The STUN "cone-like" reading is only about mapping, not
@@ -482,6 +492,7 @@ function bdayFail(peer, why) {
   log('warn', `birthday punch with ${nameOf(peer)}: ${why}`);
 }
 function closeBday(peer) {
+  bdayBusy = false; // the slot is free again (NB48-1: one fleet at a time)
   const b = peerState(peer).bday;
   if (!b?.ctx) return;
   try { b.ctx.easy?.pc.close(); } catch { /* already closed */ }
@@ -490,49 +501,73 @@ function closeBday(peer) {
   b.ctx = null;
 }
 
-// Start a punch with `peer` (the button, or an automatic try on a fallback route).
-// After a failed attempt, the button retries with the roles swapped, since the first
-// guess may have been backwards (mobile CGNAT reads cone-like but is often symmetric).
+// Run a punch with `peer` — ONLY from a local click (the button), never from a signal.
+// Accepts a peer's invite with the role it proposed, otherwise decides the role (and
+// retries with it swapped after a failure, since mobile CGNAT reads cone-like but is
+// often symmetric). One fleet at a time, one per peer per 5 min (NB48-1).
 async function tryBirthday(peer) {
   if (!room || !rtcAvailable()) return;
   const prev = peerState(peer).bday;
   if (prev?.status === 'running') return;
-  const want = prev?.status === 'failed' && prev.role ? (prev.role === 'hard' ? 'easy' : 'hard') : undefined;
-  const roles = punchRoles(peer, want);
-  if (roles.bad) return bdayFail(peer, roles.bad);
-  const role = roles.iAmHard ? 'hard' : 'easy';
-  bdayStatus(peer, 'running', { role, startedAt: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
-  log('info', `birthday punch with ${nameOf(peer)}: starting as the ${role} side (${roles.why})`);
-  room.send({ t: 'bday', step: 'start', yourRole: roles.iAmHard ? 'easy' : 'hard' }, { to: peer });
-  if (!roles.iAmHard) await beEasy(peer); // the hard side waits for the easy side's offer
+  if (bdayBusy) return bdayFail(peer, 'another birthday punch is running — one at a time');
+  if (prev?.lastRun && now() - prev.lastRun < BDAY_COOLDOWN_MS) {
+    return bdayFail(peer, `one punch per peer per 5 min — wait ${Math.ceil((BDAY_COOLDOWN_MS - (now() - prev.lastRun)) / 1000)} s (or reload)`);
+  }
+  let iAmHard, why, initiated;
+  if (prev?.status === 'invited' && prev.role) {
+    iAmHard = prev.role === 'hard';
+    why = "accepted the peer's request";
+    initiated = false;
+  } else {
+    const want = prev?.status === 'failed' && prev.role ? (prev.role === 'hard' ? 'easy' : 'hard') : undefined;
+    const roles = punchRoles(peer, want);
+    if (roles.bad) return bdayFail(peer, roles.bad);
+    iAmHard = roles.iAmHard;
+    why = roles.why;
+    initiated = true;
+  }
+  const role = iAmHard ? 'hard' : 'easy';
+  const pending = prev?.pendingOffer; // a buffered offer from the easy initiator
+  bdayBusy = true;
+  bdayStatus(peer, 'running', { role, startedAt: now(), lastRun: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
+  log('info', `birthday punch with ${nameOf(peer)}: starting as the ${role} side (${why})`);
+  if (initiated) room.send({ t: 'bday', step: 'start', yourRole: iAmHard ? 'easy' : 'hard' }, { to: peer });
+  if (!iAmHard) await beEasy(peer); // the hard side waits for the easy side's offer
+  else if (pending) await onBirthday(peer, pending);
 }
 
 async function onBirthday(peer, data) {
   const p = peerState(peer);
+  if (!rtcAvailable()) return;
   if (data.step === 'start') {
-    if (p.bday?.status === 'running') return; // we also started: our own role stands
-    if (!rtcAvailable()) return;
+    // NB48-1: a remote request never opens a fleet on its own — it only invites, and the
+    // local user must press the button to accept. (If we already started, our role stands.)
+    if (p.bday?.status === 'running') return;
     const role = data.yourRole === 'hard' ? 'hard' : 'easy';
-    bdayStatus(peer, 'running', { role, startedAt: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
-    log('info', `birthday punch with ${nameOf(peer)}: ${nameOf(peer)} asked, we are the ${role} side`);
-    if (role === 'easy') await beEasy(peer);
+    bdayStatus(peer, 'invited', { role });
+    log('info', `${nameOf(peer)} wants a birthday punch (you would be the ${role} side) — press Birthday punch to accept`);
     return;
   }
   const b = p.bday;
-  if (!b || b.status !== 'running' || !b.ctx) return;
+  if (!b || b.status !== 'running' || !b.ctx) {
+    // Before the local user accepts, keep the one offer so it isn't lost; ignore the rest.
+    if (data.step === 'offer' && typeof data.sdp === 'string' && b?.status === 'invited') b.pendingOffer = data;
+    return;
+  }
   if (data.step === 'offer' && b.role === 'hard' && typeof data.sdp === 'string') {
-    // The hard side: open the fleet answering the easy side's one offer, send back one answer + our IP.
+    // The hard side: open the fleet answering the easy side's one offer, aimed only at the
+    // one validated address it gave (openFleet strips the offer's candidates). Answer with our IP.
     const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
     const creds = randomCredentials();
     const size = Number(params.get('fleet')) || FLEET_SIZE;
-    const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size });
+    const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size, easyAddr: data.addr });
     b.ctx.hard = hard;
     log('info', `birthday punch with ${nameOf(peer)}: opened ${hard.conns.length} sockets, answering`);
     room.send({ t: 'bday', step: 'answer', sdp: hard.answerSdp, ip: myProbedV4() }, { to: peer });
     hard.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
   } else if (data.step === 'answer' && b.role === 'easy' && typeof data.sdp === 'string') {
     const ip = typeof data.ip === 'string' ? data.ip : null;
-    if (!ip) return bdayFail(peer, 'the peer gave no public IPv4 to spray');
+    if (!isPublicV4(ip)) return bdayFail(peer, 'the peer named no public IPv4 to spray'); // NB48-2
     const ports = sprayPorts(SPRAY_PORTS);
     log('info', `birthday punch with ${nameOf(peer)}: spraying ${ports.length} ports at ${ip}`);
     await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
@@ -541,12 +576,12 @@ async function onBirthday(peer, data) {
   }
 }
 
-// The easy side: one connection, offer to the hard side, spray on its answer.
+// The easy side: one connection, offer to the hard side with our own public address, spray on its answer.
 async function beEasy(peer) {
   const b = peerState(peer).bday;
   const easy = await openSpray({ RTCPeerConnection, iceServers: bdayIce() });
   b.ctx.easy = easy;
-  room.send({ t: 'bday', step: 'offer', sdp: easy.offerSdp }, { to: peer });
+  room.send({ t: 'bday', step: 'offer', sdp: easy.offerSdp, addr: srflxAddr(easy.offerSdp) }, { to: peer });
   easy.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
 }
 
@@ -573,6 +608,7 @@ function bdayRow(p) {
   const roles = myNet ? punchRoles(p.id) : null;
   let label = 'Birthday punch', note = 'test a direct link across NATs', cls = 'faint';
   if (b?.status === 'running') { label = 'Punching…'; note = `running as the ${b.role} side…`; cls = 'warn'; }
+  else if (b?.status === 'invited') { label = 'Accept punch'; note = `${nameOf(p.id)} asked — you'd be the ${b.role} side`; cls = 'warn'; }
   else if (b?.status === 'linked') { label = 'Punch again'; note = `direct channel in ${secs(b.ms)}${b.path ? ` · ${esc(b.path)}` : ''}`; cls = 'ok'; }
   else if (b?.status === 'failed') { label = 'Try again'; note = b.why; cls = 'bad'; }
   else if (roles?.bad) { note = roles.bad; }
