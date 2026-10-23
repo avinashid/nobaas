@@ -567,6 +567,22 @@ impl Node {
         self.ep.path(peer)
     }
 
+    /// Whether the direct link to `peer` goes out of one of this node's birthday
+    /// punch sockets ([`Traversal::poll_birthday`]): the peer reached one, so the
+    /// punch made the link. On the peer's side, which probed for it from its main
+    /// socket, this is false.
+    pub fn via_birthday(&self, peer: &PeerId) -> bool {
+        match self.path(peer) {
+            Some(crate::Path::Direct(a)) => self.routes.get(a).is_some_and(|id| self.extra.contains_key(id)),
+            _ => false,
+        }
+    }
+
+    /// How many sockets this node has opened for birthday punching.
+    pub fn birthday_sockets_opened(&self) -> u64 {
+        self.next_extra
+    }
+
     /// Node-wide counters (packets, drops, relaying, hole punching).
     pub fn stats(&self) -> peerwire_core::Stats {
         self.ep.stats()
@@ -1028,6 +1044,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(b.path(&a.peer_id()), Some(&Path::Direct(hit)));
+        assert!(a.via_birthday(&b.peer_id()), "the opener sees the link on its extra socket");
+        assert!(!b.via_birthday(&a.peer_id()), "the prober's link is on its main socket");
+        assert_eq!((a.birthday_sockets_opened(), b.birthday_sockets_opened()), (4, 0));
         a.send(&b.peer_id(), Lane::Reliable, b"from the extra socket").unwrap();
         let mut got = Vec::new();
         while t0.elapsed() < Duration::from_secs(5) && got.is_empty() {
@@ -1049,6 +1068,7 @@ mod tests {
         }
         let (socks, routes) = a.extra_sockets();
         assert_eq!((socks, routes), (vec![hit], 1), "only the route is left");
+        assert!(a.via_birthday(&b.peer_id()), "and the link stays on it");
     }
 
     /// NB44-2: an unauthenticated flood to an extra socket makes no route and does

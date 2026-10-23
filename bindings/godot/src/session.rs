@@ -509,6 +509,28 @@ impl Session {
         self.node.path(&self.ids.peer(id)?).map(|p| matches!(p, peerwire::Path::Via(_)))
     }
 
+    /// The address the direct link to Godot peer `id` goes to: `None` if it goes
+    /// through another peer or isn't linked.
+    pub fn direct_address(&self, id: i32) -> Option<SocketAddr> {
+        match self.node.path(&self.ids.peer(id)?)? {
+            peerwire::Path::Direct(a) => Some(*a),
+            peerwire::Path::Via(_) => None,
+        }
+    }
+
+    /// Whether the direct link to Godot peer `id` goes out of a birthday punch
+    /// socket this side opened (see `Node::via_birthday`).
+    pub fn via_birthday(&self, id: i32) -> bool {
+        self.ids.peer(id).is_some_and(|p| self.node.via_birthday(&p))
+    }
+
+    /// Hole-punching counters: punches sent, links moved from relayed to direct,
+    /// punch rounds that failed, birthday sockets opened, birthday probes sent.
+    pub fn punch_stats(&self) -> [u64; 5] {
+        let s = self.node.stats();
+        [s.punches_sent, s.punch_succeeded, s.punch_failed, self.node.birthday_sockets_opened(), s.spray_probes]
+    }
+
     /// Joiner: why the dial to the host failed, once it has.
     pub fn connect_failure(&self) -> Option<Failure> {
         self.node.failure(&self.host_peer?)
@@ -1140,6 +1162,10 @@ mod tests {
             (joiner.is_relayed(HOST_ID), host.is_relayed(id), host.is_relayed(12345)),
             (Some(false), Some(false), None)
         );
+        assert!(joiner.direct_address(HOST_ID).is_some_and(|a| a.ip().is_loopback()));
+        assert_eq!(host.direct_address(12345), None);
+        assert!(!joiner.via_birthday(HOST_ID) && !host.via_birthday(id), "no birthday punch on loopback");
+        assert_eq!(joiner.punch_stats()[3..], [0, 0]);
         assert!(joiner.set_relay_peers(&["pw:nope".into()]).is_err());
         joiner.set_relay_peers(&[]).unwrap();
         assert_eq!(joiner.relay_peers_linked(), 0);

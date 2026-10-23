@@ -73,6 +73,9 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `set_relay_peers(PackedStringArray) -> Error` | Invites of always-on relay peers (`peerwire-peer`) to keep linked, from the next host/join and at once for a running session; empty: none (default). `ERR_INVALID_PARAMETER`, changing nothing, if one is not a `pw:` invite. See [Relay peers](#relay-peers) |
 | `get_relay_peers_linked() -> int` | How many of them are linked now |
 | `get_peer_route(id) -> String` | `direct`, `relay` (through another peer, such as a relay peer) or `""` if `id` isn't linked (on a joiner, only the host is) |
+| `get_peer_address(id) -> String` | The `ip:port` (`[…]:port` for IPv6) a direct link to peer `id` goes to; `""` if it goes through a relay or `id` isn't linked. This is the peer's IP address, which is personal data: don't show it to other players or put it in logs you upload |
+| `is_peer_via_birthday(id) -> bool` | Whether the direct link to `id` goes out of one of the sockets this side opened for a [birthday punch](#through-nats) (step 5). Only the symmetric side, which opened them, sees `true`; the cone side, which probed, sees `false` and its probes in `get_punch_stats()` |
+| `get_punch_stats() -> Dictionary` | Hole-punching counts since `host*()` / `join*()`: `punches_sent`, `punch_succeeded` (relayed links moved to direct), `punch_failed`, `birthday_sockets` (sockets this side opened for a birthday punch) and `birthday_probes` (probes this side sent to a peer's ports for one) |
 | `get_peer_key(id) -> PackedByteArray` | The 32-byte Ed25519 key that authenticated peer `id`'s link (empty if not directly connected) |
 | `set_max_peers(max: int)` / `get_max_peers()` | Host: the most joiners it keeps (default 32). Past it, a newcomer is disconnected before `peer_connected`, as with `refuse_new_connections`. Applies at once; links already up stay |
 | `get_public_key() -> PackedByteArray` | This peer's own key |
@@ -144,8 +147,8 @@ peer.host_room("my-game", room)
 - The relay peer gets this peer's addresses as the privacy mode allows: under `PRIVACY_DIRECT`, its LAN addresses
   too (`PRIVACY_PUBLIC_ONLY` hides them). It is not told which players this peer links with.
 
-`examples/godot` takes `--relay-peer=pw:…` and logs `relay peers: 1 linked` and `route to peer N: direct` or
-`through a relay`.
+`examples/godot` takes `--relay-peer=pw:…` and logs `relay peers: 1 linked`. Its `route to peer N:` line (see
+[Demo](#demo)) then says `direct to ADDRESS` or `through a relay`.
 
 ### Router port mapping
 
@@ -292,6 +295,9 @@ player's own invite names the host as its relay, with the host's address.
 peer.set_privacy_mode(PeerwireMultiplayerPeer.PRIVACY_PUBLIC_ONLY)   # before host*() / join*(), or any time
 ```
 
+`get_peer_address(id)` hands the game the address a peer already sees: the host's on a joiner, each player's on
+the host. It is personal data. Keep it out of the UI other players see and out of logs players upload.
+
 ## Demo
 
 [`examples/godot/`](../examples/godot): two (or more) instances. One hosts, the others join by invite or by
@@ -308,7 +314,11 @@ GODOT=godot ./examples/godot/test.sh     # headless check on loopback: invite ru
 `test.sh` runs a host and a joiner headless, twice: by invite, then by room through a local Nostr relay
 (`examples/rust/nostr_relay.rs`). The joiner is `--privacy=public-only` in the first run and `relay-only` in the
 second. Each host prints its port-mapping state line (`port mapping: off`; `--port-mapping` turns it on), and
-the run fails without it. It passes `--stun=none` and a local or no relay, so it touches no public
+the run fails without it. Every instance logs each link's route as it changes: `route to peer N: direct to
+ADDRESS` or `through a relay`. A link a birthday punch made is marked `(birthday punch worked: …)` on the
+symmetric side and `(this side probed for a birthday punch)` on the cone side. Each run fails unless the
+joiner logs a direct route to the host. The line carries the peer's IP, on screen and in stdout, so field-test
+logs name players' public addresses. It passes `--stun=none` and a local or no relay, so it touches no public
 service. The instances move by themselves and chat. Each passes once it has seen the other peer's square move and
 received its chat line:
 
