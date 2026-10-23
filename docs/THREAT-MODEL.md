@@ -69,9 +69,10 @@ that needs a change is tracked as an NB card.
 | NPM-1 (Low) | **Fixed** by `4cffbf9` (merged `14f463a`): no port mapping under `RelayOnly` |
 | NPM-2 (Low) | **Fixed** in `docs/GODOT.md` (`9be92d5`); the flood risk itself is SEC-4 |
 | NPM-3 (Low) | **Fixed** by `6f947f3`: a map request in flight at stop gets one delete |
-| NB44-1, NB48-1 (Medium) | Open: reflection bounds of the hard-NAT punches ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
+| NB44-1 (Medium) | **Fixed** by `40e42db` (per-IP punch cap), re-checked 2026-10-23 ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
+| NB48-1 (Medium) | Open: the Net Lab fleet, same section |
 | NB44-2, NB44-3, NB48-2, NB46-1 (Low) | Open, same section |
-| NB45-I1, NB44-I2, NB46-I1 (Info) | Optional hardening, same section |
+| NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -342,6 +343,23 @@ the sender wishes.
   punch per IP at a time and at most 2 per 5 min), so all four sprays can't land on
   one victim. Correct the "no amplification beyond the count" line in
   NAT-TRAVERSAL.md. Test: 4 PeerIds offering one IP start 1 spray.
+- **Status: fixed** by `40e42db` (NB-044b). `start_plans` allows one punch per
+  destination IP at a time (20 s) and at most 2 per 5 min across all PeerIds. The
+  check runs before the node token, and covers spray, sweep and open. Re-check probe:
+  4 or 30 PeerIds offering one IP every 1 s or every 20 s for 15 min. Per 5-min
+  window, that IP got at most 4,096 spray probes (2 sprays, 545,832 B) from a cone
+  node, or 2 fleets (512 HS1s) from a symmetric one. Before the fix it was about 14
+  sprays (3.8 MB) per 5 min.
+- Residual: the cap is per node. The first spray is still about 270× the offer, and
+  N room members recruited with one offer each still reflect N times the
+  per-node bound at one victim. Recruiting needs the room key or an invite.
+
+**NB44b-I1 — The per-IP cap can be spent by a room member (Info, accepted).** A
+member can name a real peer's public IP in offers from minted PeerIds, which uses
+up that IP's 2 slots. Birthday punches towards it then stop for 5 min and fall back
+to the relay. Two genuine peers behind one carrier-NAT IP get at most 2 punches per
+5 min between them. A plan the cap blocks is dropped, not deferred, until that
+peer's next offer. These are availability costs only, and the cap is worth them.
 
 **NB44-2 — Extra sockets take any sender as a route, before authentication
 (Low).** `Node::read_extra` makes the first extra socket that hears from an address
@@ -359,6 +377,10 @@ does this before `Endpoint::handle_datagram` has authenticated anything.
 - A sender that can spoof the source address of a peer the node already talks to
   can move the node's egress to that peer onto the extra socket, which breaks the
   path through the peer's NAT.
+- The punch target alone gets an HS1 from every socket's NAT mapping. One datagram
+  per socket per minute (under `ROUTE_IDLE`) then keeps all of them open
+  indefinitely: up to 512 fds (NB44-3) and the 5 ms poll (NB44-I2) for as long as it
+  likes. This is why NB44-2 should land before native builds ship.
 - Fix: set a route only for an address the endpoint has accepted, that is a session
   path or dial target equal to `from` after `handle_datagram`. Refresh `last_recv`
   only from that address, and cap `routes` at `MAX_EXTRA_SOCKETS`. Test: junk from N
