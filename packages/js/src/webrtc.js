@@ -62,6 +62,15 @@ export const MAX_RESTARTS = 3;
 export const MAX_STEP = 8;
 export const GUESS_BEFORE = 4;
 export const GUESS_AFTER = 27;
+// adopt(): a DataChannel made outside the transport carries a link only once both
+// ends adopt it. Each end sends CARRY every CARRY_EVERY_MS until it hears from the
+// other, and answers every CARRY with CARRIED (which gets no answer). These are
+// one-byte messages, which no Peerwire datagram is. Without a word from the far end
+// in CARRY_WAIT_MS, the channel is left to the caller.
+export const CARRY = 1;
+export const CARRIED = 2;
+export const CARRY_EVERY_MS = 200;
+export const CARRY_WAIT_MS = 5000;
 
 const CANDIDATE = /^(?:a=)?candidate:\S+ \d+ udp \d+ (\S+) (\d+) typ (\w+)/i;
 const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
@@ -190,27 +199,34 @@ export class WebRtcTransport {
     this.pipeTokens = PIPE_BURST; // the rate budget all pipes share
     this.pipeRefilled = Date.now();
     this.piped = { sent: 0, received: 0, dropped: 0 }; // batches sent; datagrams received and dropped
+    this.carriers = new Map(); // peer hex -> adopted channel (see adopt())
+    this.carried = new Map(); // endpoint handle -> the adopted channel carrying it now
     endpoint.onTransmit = (handle, bytes) => {
       if (loss && Math.random() < loss) {
         this.dropped++;
         return;
       }
+      const c = this.carried.get(handle);
+      if (c && c.dc.readyState === 'open') return this.dcSend(c.dc, bytes);
       const pipe = this.pipes.get(handle);
       if (pipe) return this.pipeSend(pipe, bytes);
       const l = this.links.get(handle);
-      if (!l || l.dc.readyState !== 'open') return;
-      // A full SCTP buffer means the path is congested: drop like UDP would, and
-      // let the core's congestion control back off. dc.send throws when it's full.
-      if (l.dc.bufferedAmount > MAX_BUFFERED) return void this.congested++;
-      try {
-        l.dc.send(bytes);
-      } catch {
-        this.congested++;
-      }
+      if (l && l.dc.readyState === 'open') this.dcSend(l.dc, bytes);
     };
     // Signals are untrusted: one that fails must not become an unhandled rejection
     // (which ends a Node process).
     signaling.onMessage((from, msg) => void this.onSignal(from, msg).catch(() => void this.badSignals++));
+  }
+
+  dcSend(dc, bytes) {
+    // A full SCTP buffer means the path is congested: drop like UDP would, and
+    // let the core's congestion control back off. dc.send throws when it's full.
+    if (dc.bufferedAmount > MAX_BUFFERED) return void this.congested++;
+    try {
+      dc.send(bytes);
+    } catch {
+      this.congested++;
+    }
   }
 
   link(peer) {
@@ -666,6 +682,96 @@ export class WebRtcTransport {
     }
   }
 
+  // Carries `peer`'s link over `dc`, an open DataChannel to `peer` made outside this
+  // transport (`pc` its connection; a birthday punch's, see birthday.js), once the far
+  // end adopts its end too (see CARRY), so a link never moves onto a channel only one
+  // side reads. With `pipe`, the datagrams of `peer`'s pipe go over `dc` instead of
+  // signalling, and the endpoint sees no new address; otherwise `dc` gets a handle of
+  // its own, for endpoint.addCandidate. Resolves to that handle, or -1 (the channel
+  // left to the caller) if the far end didn't adopt within CARRY_WAIT_MS or `dc`
+  // closed first. Once carrying, `dc` closing or `pc` failing ends it, as do
+  // drop(peer), close() and a newer adopt(peer); ending it closes `pc`. onPeer(peer,
+  // 'carrier') fires when carrying starts and when it ends.
+  adopt(peer, pc, dc, { pipe = false } = {}) {
+    const ph = pipe ? this.pipeByPeer.get(peer) : undefined;
+    if (!isPeerId(peer) || dc?.readyState !== 'open' || (pipe && ph === undefined)) return Promise.resolve(-1);
+    this.dropCarrier(peer);
+    const handle = this.nextHandle++;
+    const c = { peer, pc, dc, handle, addr: pipe ? ph : handle, live: false, end: null };
+    this.carriers.set(peer, c);
+    dc.binaryType = 'arraybuffer';
+    const say = (b) => {
+      try {
+        dc.send(Uint8Array.of(b));
+      } catch {
+        // closing: onclose follows
+      }
+    };
+    return new Promise((resolve) => {
+      const every = setInterval(() => say(CARRY), CARRY_EVERY_MS);
+      const wait = setTimeout(() => c.end(), CARRY_WAIT_MS);
+      // Stops waiting: carrying from now on, or (no `live`) given back to the caller.
+      const settle = (live) => {
+        clearInterval(every);
+        clearTimeout(wait);
+        c.end = null;
+        if (!live) {
+          dc.onmessage = dc.onclose = null;
+          if (this.carriers.get(peer) === c) this.carriers.delete(peer);
+          return resolve(-1);
+        }
+        c.live = true;
+        this.carried.set(c.addr, c);
+        dc.onclose = () => this.dropCarrier(peer, c);
+        pc.onconnectionstatechange = () => ['failed', 'closed'].includes(pc.connectionState) && this.dropCarrier(peer, c);
+        resolve(handle);
+        this.onPeer(peer, 'carrier');
+      };
+      c.end = () => settle(false);
+      dc.onclose = c.end;
+      dc.onmessage = (e) => {
+        if (!(e.data instanceof ArrayBuffer) || e.data.byteLength > MAX_DATAGRAM || this.carriers.get(peer) !== c) return;
+        const b = new Uint8Array(e.data);
+        // Anything from the far end means it adopted its end too.
+        if (!c.live) settle(true);
+        if (b.length !== 1) return this.ep.receive(c.addr, b);
+        if (b[0] === CARRY) say(CARRIED);
+      };
+      say(CARRY);
+    });
+  }
+
+  // Whether endpoint handle `h` goes over an adopted channel now.
+  carries(h) {
+    return this.carried.has(h);
+  }
+
+  // The adopted channel carrying `peer`'s link now, { pc, dc }, or null.
+  carrier(peer) {
+    const c = this.carriers.get(peer);
+    return c?.live ? { pc: c.pc, dc: c.dc } : null;
+  }
+
+  // Ends `peer`'s adopted channel (only if it is still `c`): one still waiting is
+  // given back to its caller; one carrying is closed, and its link goes back to the
+  // route it had (a pipe at once; a relayed link once the endpoint sees the direct
+  // path gone). `quiet`: no onPeer.
+  dropCarrier(peer, c = this.carriers.get(peer), quiet = false) {
+    if (!c || this.carriers.get(peer) !== c) return;
+    if (c.end) return c.end();
+    this.carriers.delete(peer);
+    this.carried.delete(c.addr);
+    c.live = false;
+    c.dc.onmessage = c.dc.onclose = null;
+    c.pc.onconnectionstatechange = null;
+    try {
+      c.pc.close();
+    } catch {
+      // already closed
+    }
+    if (!quiet) this.onPeer(peer, 'carrier');
+  }
+
   // Forgets the WebRTC link to `peer`, so a later dial or offer starts afresh.
   dropRtc(peer) {
     const h = this.byPeer.get(peer);
@@ -686,10 +792,11 @@ export class WebRtcTransport {
     l.pc.close();
   }
 
-  // Forgets every path to `peer`: its WebRTC link and its pipe.
+  // Forgets every path to `peer`: its WebRTC link, its pipe and an adopted channel.
   drop(peer) {
     this.dropRtc(peer);
     this.dropPipe(peer);
+    this.dropCarrier(peer, undefined, true);
   }
 
   dropPipe(peer) {
@@ -702,6 +809,7 @@ export class WebRtcTransport {
 
   close() {
     this.checking.clear();
+    for (const peer of [...this.carriers.keys()]) this.dropCarrier(peer, undefined, true);
     for (const p of this.pipes.values()) clearTimeout(p.timer);
     this.pipes.clear();
     this.pipeByPeer.clear();

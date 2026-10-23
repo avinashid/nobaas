@@ -55,7 +55,7 @@ room.send({ x: 1, y: 2 }, { lane: 'unreliable' }); // latest-wins, one datagram 
 room.send(bytes, { to: peer });                 // one peer, or an array of them
 room.setPresence({ name: 'Ana', typing: true });
 room.peers; room.self; room.getPresence(peer); room.rtt(peer);
-room.route(peer);                               // { kind: 'direct' | 'peer' (via) | 'signaling' }
+room.route(peer);                               // { kind: 'direct' (adopted?) | 'peer' (via) | 'signaling' }
 await room.leave();                             // peers see 'peer-leave' at once
 ```
 
@@ -201,6 +201,18 @@ presence and messages run unchanged on it. A pipe opens only for a peer whose he
 proved the room key. `fallback: 'peers'` skips step 3; `'off'` keeps WebRTC only.
 TURN in `iceServers` still works and is faster than step 3 when you have a server.
 
+**A direct channel found later.** A DataChannel to the peer opened outside the room (a
+browser birthday punch's, `src/birthday.js`, as Net Lab runs one) can take a fallback
+link over. Both sides call `room.adoptChannel(peer, pc, dc)`. Before anything moves, the
+two ends agree over the channel: each sends a one-byte marker until it hears the
+other's, so a link never moves onto a channel only one side reads. A link over
+signalling then sends its datagrams over the channel at once. A relayed link moves once
+the endpoint's punch over the channel is answered (`endpoint.addCandidate`).
+`room.route(peer)` then says `{ kind: 'direct', adopted: true }`. It resolves `false`,
+and leaves the channel to the caller, if the link is direct already or the peer didn't
+adopt within 5 s. When the channel closes, a link over signalling goes back at once.
+A relayed one goes back to its member after the endpoint's 15 s direct timeout.
+
 What the fallback reveals:
 - **To the other members.** Every member the dialler is linked to learns that the two
   peers couldn't link directly. The member that relays sees the timing and volume of
@@ -277,6 +289,16 @@ Run these with Node and the Playwright install on this host:
   pairs. A blocked pair links through a third member, or over signalling when there is
   none (a 100 KB message arrives whole), and stays apart with `fallback: 'peers'`/`'off'`.
   1,000 proven peers that each send one datagram over signalling leave at most 256 pipes.
+- `node packages/js/test/room_adopt.mjs`: `room.adoptChannel` with the same fake. A link
+  over signalling, or relayed by a member, moves onto a channel both ends adopt: 100 KB
+  arrives with nothing over signalling, or the member relays nothing more. When the
+  channel closes, the link goes back to its fallback route and carries on. A channel
+  only one end adopts is refused after 5 s, and a direct link isn't moved.
+- `node packages/js/test/netlab_carry.mjs [shot-prefix]`: Net Lab in two tabs that
+  link over signalling (`?rtc=off`). A real loopback channel between them, handed in as
+  a birthday punch's winner, carries the room link: the route goes direct, the log
+  gives the channel's address, and chat goes over it. When it closes, the link goes back
+  to signalling.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

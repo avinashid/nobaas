@@ -186,7 +186,7 @@ export class Endpoint {
     this.transmitErrors = 0; // datagrams lost because onTransmit threw
   }
   // close() frees the wasm handle and buffers, so nothing may reach them afterwards:
-  // send and connect* throw, receive and setRelayOnly do nothing, queries return null or false
+  // send and connect* throw, receive, addCandidate and setRelayOnly do nothing, queries return null or false
   // (stats() returns the counters as they were at close).
   live(what) {
     if (this.closed) throw new Error(`${what}: endpoint closed`);
@@ -230,6 +230,14 @@ export class Endpoint {
     this.pw.free(rp, 32);
     this.pump();
     return r;
+  }
+  // A direct address `addr` for a relayed (or dialling) `peer`: the endpoint punches
+  // to it and moves the link there once the peer answers from it. Does nothing for a
+  // peer linked directly or unknown, or after close().
+  addCandidate(addr, peer) {
+    if (this.closed) return;
+    this.pw.x.pw_add_candidate(this.h, nowUs(), addr, this.setPeer(peer));
+    this.pump();
   }
   // Ends the session with `peer` and sends it a sealed close at once (this pumps), so it
   // sees 'disconnected' now rather than after its idle timeout. No local event; does
