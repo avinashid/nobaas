@@ -130,7 +130,7 @@ Types are in `src/index.d.ts`.
 | `demo/index.html` | Mesh chat on the low-level API: every tab links to every other. |
 | `demo/poll.html` | Pull-style room: `poll()` and `sendTo()` once a frame, dots you move with the arrow keys. |
 | `demo/arena.html` | Super-peer lockstep arena: `?role=super` in one tab, players in others; arrow keys move. |
-| `demo/netlab.html` | Net Lab, a connection diagnostics page (not a game), mobile-friendly: join the global room or a private one shared as a `#key=` link, and every member links to every other. Per peer: ping measured on the route in use (min/avg/max, jitter, loss), the route (direct, relayed by a member, or over signalling), the ICE candidate pair (IPv4/IPv6, UDP/TCP), the offer/answer exchange (times, resends, the addresses each carried), ICE connectivity checks sent, answered and received with a verdict on which way packets are blocked, time to link and the other side's NAT. Also this device's public addresses, IPv6 and a NAT mapping estimate, the signalling relays' state, chat, an event log with warnings and errors, and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it at `/`. |
+| `demo/netlab.html` | Net Lab, a connection diagnostics page (not a game), mobile-friendly: join a room by any name you type (`office test` is the room `office-test`, shared as a `#room=` link, with recent rooms and a "make private" suffix), the global room, or a private one shared as a `#key=` link, and every member links to every other. An overview row sums up the room (peers, average and worst ping, packet loss, routes, WebRTC traffic, packets). Per peer: ping measured on the route in use (latest, min/avg/max, jitter, loss, with a sparkline), core and ICE round trips, WebRTC traffic, ICE restarts and port guesses, the route (direct, relayed by a member, or over signalling), the ICE candidate pair (IPv4/IPv6, UDP/TCP), the offer/answer exchange (times, resends, the addresses each carried), ICE connectivity checks sent, answered and received with a verdict on which way packets are blocked, time to link and the other side's NAT. Also this device's public addresses, IPv6 and a NAT mapping estimate, the signalling relays' state, chat, an event log with warnings and errors, and a JSON report. `?relays=` other Nostr relays; `?rtc=off` fails this tab's WebRTC links. `demo/crew-server.mjs` serves it at `/`. |
 | `demo/crew.html` | Crew, a small Among Us-like game: the host is authoritative and relays for every player, so a player needs a link to the host only. Network panel: per-peer RTT and route (ICE path, or the fallback). `?turn=turn:HOST:PORT&tu=USER&tp=PASS` adds a TURN server; `?rtc=off` fails this tab's WebRTC links (testing the fallback). `demo/crew-server.mjs` serves it for hosting. |
 
 Signalling is untrusted by design: whatever carries the offers, the Peerwire Noise
@@ -167,7 +167,22 @@ WebRTC can't link two peers that are both behind symmetric NAT (common on mobile
 hotspots and carrier NAT) unless a TURN server is configured. Rather than requiring
 one, `joinRoom` falls back per peer, on its own, with no setup on either side:
 
-1. **Direct WebRTC**, as always (`room.route(peer).kind === 'direct'`).
+1. **Direct WebRTC**, as always (`room.route(peer).kind === 'direct'`). Two things help
+   it through more NATs:
+   - **Port prediction.** A browser behind a NAT that hands out ports in sequence sees it
+     from its two STUN servers' answers (`natFromSdp`: one IPv4 address, two ports 1 to 8
+     apart). Its offer, answer or late candidates then carry `nat: { ip, next, step }`. A
+     peer that isn't behind a symmetric NAT itself adds 32 candidates at the ports around
+     `next` (`predictedCandidates`), so its checks open its NAT to the port the other's
+     will come from. Peers that don't know the field ignore it.
+   - **ICE restart.** When a link that was open loses ICE (a Wi-Fi to mobile switch, a
+     hotspot dropping), it isn't dropped: after 2 s of `disconnected`, or at once on
+     `failed`, the dialling side renegotiates with new ICE credentials, so ICE gathers the
+     new network's addresses and checks again; the other side asks it to. The DataChannel
+     and the Peerwire session over it carry on, so the app sees no leave. At most 3 tries
+     (2, 4, 8 s apart) until ICE connects again. `online` and `navigator.connection`
+     changes restart links whose ICE is down at once. Each restart is an offer and an
+     answer over signalling.
 2. **Through another member.** When a link isn't open `fallbackMs` (8 s) after its
    offer, or its ICE fails, the dialling side dials the peer again through every member
    it has a direct link to, including members that link later. The core forwards for
@@ -224,6 +239,14 @@ Run these with Node and the Playwright install on this host:
   `stats.rejected` counts refused events). Without trickle, a lost first offer or first
   answer still links two transports (in about 3.2 s), candidates that overtake their
   description are held, and gathering stops 300 ms after the first public candidate.
+- `node packages/js/test/nat_predict.mjs`: NAT type and prediction from server-reflexive
+  candidates, the 32 predicted candidates, and a peer's prediction refused unless it is an
+  IPv4 address and ports in range (nothing can be spliced into a candidate line).
+- `node packages/js/test/ice_restart.mjs` (Chromium, loopback): an ICE restart by either side
+  renews the ICE credentials while the DataChannel stays open and datagrams flow; ICE
+  `disconnected` restarts after 2 s, `failed` at once; at most 3 while ICE stays down;
+  `networkChanged()` touches only links whose ICE is down; an offer's prediction adds 32
+  candidates, a malformed one none.
 - `node packages/js/test/pump_rearm.mjs`: a transport that throws or refuses to send (a full
   DataChannel) costs datagrams, never the endpoint's timer: a reliable message sent during
   the outage still arrives after it, by retransmit.
@@ -243,6 +266,9 @@ Run these with Node and the Playwright install on this host:
   a report, a meeting with chat, the impostor voted out, then a second round won on tasks.
   `RTC_OFF=all` fails every WebRTC link, so the game runs over the signalling fallback;
   `RTC_OFF=1` fails tab 1's links only.
+- `node packages/js/test/netlab_rooms.mjs [shot-prefix]`: Net Lab's named rooms: a typed name opens the room id
+  it shows and goes in the address bar as `#room=`, the room link brings another tab into it (linked, pinging),
+  another name is another room, the room is listed under recent rooms, and the report never holds its name.
 - `node packages/js/test/netlab.mjs [tabs=3] [shot-prefix]`: opens `demo/netlab.html` in phone-sized tabs
   joined by one `#key=` link: every tab links to every other, pings come back, chat arrives, the
   report holds every peer and not the room key, and the page doesn't scroll sideways. `RTC_OFF=<i>`

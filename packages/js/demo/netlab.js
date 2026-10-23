@@ -1,6 +1,7 @@
-// Net Lab: a connection diagnostics page on Peerwire rooms, not a game. Join the
-// global room (everyone using Net Lab meets there) or a private room (a random
-// key, shared as a link), and every member links to every other one. For each
+// Net Lab: a connection diagnostics page on Peerwire rooms, not a game. Join a room
+// by any name you choose ("office test", shared as a #room= link), the global room
+// (everyone using Net Lab meets there) or a private room (a random key, shared as a
+// #key= link), and every member links to every other one. For each
 // peer it shows the route (direct WebRTC, relayed by a member, or over the
 // signalling relays), how the WebRTC link was made (ICE candidate pair, IPv4 or
 // IPv6, UDP or TCP), the time it took, and a ping measured by the page itself on
@@ -16,9 +17,11 @@
 //                      under "phone hotspot"); ?synth=off turns that off
 //   ?relays=wss://a,…  other Nostr relays
 //   ?name=…            the name; ?auto=global joins the global room
-//   #key=…             joins that private room (a hash, so it never reaches the server)
+//   #room=…            joins the room of that name (a hash, so it never reaches the server)
+//   #key=…             joins that private room
 
 import { joinRoom, randomRoomId, DEFAULT_RELAYS } from '../src/index.js';
+import { openFleet, openSpray, randomCredentials, sprayPorts, isPublicV4, FLEET_SIZE, SPRAY_PORTS } from '../src/birthday.js';
 
 const APP_ID = 'peerwire-netlab';
 const GLOBAL_ROOM = 'global-v1';
@@ -31,6 +34,7 @@ const PING_LOST_MS = 10000;
 const SAMPLES = 60;
 const HEARD_WARN_MS = 20000;
 const SLOW_MS = 400;
+const RECENT = 'netlab-rooms', MAX_RECENT = 6;
 
 const params = new URLSearchParams(location.search);
 // Hotspot gateways that don't change: older Android (192.168.43.1) and iPhone
@@ -52,8 +56,9 @@ const clip = (s, n) => String(s ?? '').slice(0, n);
 const t0 = Date.now();
 
 let room = null;
-let roomKind = null; // 'global' | 'private'
-let roomKey = null;
+let roomKind = null; // 'global' | 'named' | 'private'
+let roomKey = null; // a private room's key
+let roomName = null; // a named room's name, as its id (office-test)
 let joinedAt = 0;
 let myNet = null; // the result of probeNetwork()
 const peers = new Map(); // peer id -> P (see peerState)
@@ -79,6 +84,7 @@ function log(level, msg) {
   while ($('log').children.length > 300) $('log').lastChild.remove();
   $('h-warn').textContent = `${warnings} warning${warnings === 1 ? '' : 's'}`;
   $('h-warn').className = `pill ${warnings ? 'warn' : ''}`;
+  $('h-warn').title = 'see the event log';
 }
 window.addEventListener('error', (e) => log('error', `page error: ${e.message}`));
 window.addEventListener('unhandledrejection', (e) => log('error', `unhandled: ${e.reason?.message ?? e.reason}`));
@@ -209,19 +215,67 @@ class NoIcePc extends RTCPeerConnection {
 }
 const strip = (sdp) => sdp.split('\r\n').filter((l) => !l.startsWith('a=candidate:')).join('\r\n');
 
+// A room name as typed ("Office test!") as the room id it opens (office-test): lower
+// case, accents dropped, anything else between letters and digits a dash.
+function roomIdOf(s) {
+  return String(s ?? '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '');
+}
+function parseRoom(s) {
+  const m = String(s ?? '').match(/[#&?]room=([^&#]+)/);
+  return m ? roomIdOf(decodeURIComponent(m[1])) || null : null;
+}
+function randomSuffix(n = 5) {
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return [...a].map((b) => 'abcdefghjkmnpqrstuvwxyz23456789'[b % 31]).join('');
+}
+function roomHint() {
+  const id = roomIdOf($('roomname').value);
+  if (!id) return void ($('roomhint').innerHTML = 'Any name works: everyone who types the same name lands in the same room.');
+  const guessable = id.length < 12 && !/\d.*[a-z]|[a-z].*\d/.test(id.split('-').at(-1));
+  $('roomhint').innerHTML = `Room <b>${esc(id)}</b>${guessable ? ' · a short name anyone could guess: <i>Make private</i> adds a random part' : ' · share this name or the room link'}`;
+}
+function recentRooms() {
+  try { return JSON.parse(localStorage.getItem(RECENT) ?? '[]').filter((r) => typeof r === 'string').slice(0, MAX_RECENT); } catch { return []; }
+}
+function remember(id) {
+  try { localStorage.setItem(RECENT, JSON.stringify([id, ...recentRooms().filter((r) => r !== id)].slice(0, MAX_RECENT))); } catch { /* private mode */ }
+}
+function showRecent() {
+  const list = recentRooms();
+  $('recentwrap').classList.toggle('hidden', !list.length);
+  $('recent').innerHTML = list.map((r) => `<button type="button" class="chip" data-room="${esc(r)}">${esc(r)}</button>`).join('');
+}
+// The link that opens this room: a named room's name or a private room's key go in
+// the hash, which browsers never send to the server.
+function roomLink() {
+  // Keeps the signalling choice (local tabs, or other relays), so the link lands in the same place.
+  const q = new URLSearchParams([...params].filter(([k]) => k === 'signal' || k === 'relays'));
+  if (roomKind === 'global') q.set('auto', 'global');
+  const base = `${location.origin}${location.pathname}${q.size ? `?${q}` : ''}`;
+  if (roomKind === 'named') return `${base}#room=${encodeURIComponent(roomName)}`;
+  if (roomKind === 'private') return `${base}#key=${roomKey}`;
+  return base;
+}
+const roomLabel = () => (roomKind === 'global' ? 'global' : roomKind === 'named' ? roomName : `private ${roomKey.slice(0, 4)}…`);
+
 function parseKey(s) {
   s = String(s ?? '').trim();
   const m = s.match(/[#&?]key=([A-Za-z0-9_-]+)/);
   return m ? m[1] : /^[A-Za-z0-9_-]{8,64}$/.test(s) ? s : null;
 }
 
+// kind 'global'; 'named' with the room's id; 'private' with its key.
 async function enter(kind, key) {
   if (room) return;
-  for (const b of ['global', 'create', 'joinkey']) $(b).disabled = true;
-  localStorage.setItem('netlab-name', $('name').value.trim());
+  const JOIN = ['global', 'create', 'joinkey', 'joinname'];
+  for (const b of JOIN) $(b).disabled = true;
+  try { localStorage.setItem('netlab-name', $('name').value.trim()); } catch { /* private mode */ }
   saveGw();
   roomKind = kind;
   roomKey = kind === 'private' ? key : null;
+  roomName = kind === 'named' ? key : null;
   $('joinmsg').textContent = 'connecting to the signalling relays…';
   const relays = params.get('relays')?.split(',').filter(Boolean);
   const signaling = params.get('signal') === 'local' ? 'local' : 'nostr';
@@ -230,7 +284,8 @@ async function enter(kind, key) {
   try {
     room = await joinRoom({
       appId: APP_ID,
-      roomId: kind === 'global' ? GLOBAL_ROOM : key,
+      // Named rooms get a prefix, so no name opens the global room or a private one.
+      roomId: kind === 'global' ? GLOBAL_ROOM : kind === 'named' ? `named/${key}` : key,
       signaling,
       presence: { name: clip($('name').value.trim(), 20) || 'guest', dev: device(), conn: connInfo(), nat: myNet?.nat ?? 'testing', v6: !!myNet?.ipv6 },
       ...(relays?.length && { relays }),
@@ -239,7 +294,7 @@ async function enter(kind, key) {
   } catch (e) {
     log('error', `could not join: ${e.message}`);
     $('joinmsg').textContent = `could not join: ${e.message}`;
-    for (const b of ['global', 'create', 'joinkey']) $(b).disabled = false;
+    for (const b of JOIN) $(b).disabled = false;
     return;
   }
   joinedAt = now();
@@ -247,9 +302,15 @@ async function enter(kind, key) {
   log('info', `joined in ${ms(joinedAt - started)} as ${short(room.self)}; waiting for peers`);
   hook();
   if (kind === 'private') history.replaceState(null, '', `${location.pathname}${location.search}#key=${key}`);
+  if (kind === 'named') {
+    history.replaceState(null, '', `${location.pathname}${location.search}#room=${encodeURIComponent(key)}`);
+    remember(key);
+  }
   $('join').classList.add('hidden');
   $('roomcard').classList.remove('hidden');
-  $('share').classList.toggle('hidden', kind !== 'private');
+  $('sigcard').classList.remove('hidden');
+  $('roombar').classList.remove('hidden');
+  $('h-room').textContent = roomLabel();
   $('chatsend').disabled = false;
   $('joinmsg').textContent = '';
   render();
@@ -259,7 +320,7 @@ function peerState(peer) {
   let p = peers.get(peer);
   if (!p) {
     p = { id: peer, heardAt: null, rtcOpenAt: null, rtcFailedAt: null, joinedAt: null, leftAt: null, leaveReason: null, presence: null,
-      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set() };
+      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set(), bday: null };
     peers.set(peer, p);
   }
   return p;
@@ -325,9 +386,11 @@ function addrText(d) {
 }
 
 const SIG_TEXT = {
-  'offer-sent': (d) => d.resend ? 'no answer yet: offer sent again' : `offer sent (${addrText(d)})`,
-  'offer-received': (d) => `offer received (${addrText(d)})`,
+  'offer-sent': (d) => d.resend ? 'no answer yet: offer sent again' : `${d.restart ? 'ICE restart offer' : 'offer'} sent (${addrText(d)})`,
+  'offer-received': (d) => `${d.restart ? 'ICE restart offer' : 'offer'} received (${addrText(d)})`,
   'answer-sent': (d) => d.resend ? 'their offer came again (our answer lost?): answer sent again' : `answer sent (${addrText(d)})`,
+  'ice-restart': (d) => d.dialer ? `ICE lost (${d.reason}): restarting, try ${d.n}` : `ICE lost (${d.reason}): asked them to restart, try ${d.n}`,
+  guesses: (d) => `their NAT is sequential symmetric: trying ${d.n} ports around ${d.ip}:${d.next} (step ${d.step})`,
   'answer-received': (d) => `answer received (${addrText(d)})`,
   'ice-batch-sent': (d) => `late addresses sent (${addrText(d)})`,
   'ice-batch-received': (d) => `late addresses received (${addrText(d)})`,
@@ -350,7 +413,7 @@ function onTrace(peer, what, d) {
     tryHotspot(p, peer);
     setTimeout(() => { noteTheirHosts(p, peer); tryHotspot(p, peer); }, 500);
   }
-  const bad = d.resend || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'));
+  const bad = d.resend || what === 'ice-restart' || (what === 'ice-state' && (d.state === 'disconnected' || d.state === 'failed'));
   log(bad ? 'warn' : 'info', `WebRTC with ${nameOf(peer)}: ${text}${at != null ? ` (${secs(at)} after hearing it)` : ''}`);
 }
 
@@ -368,7 +431,189 @@ function onMessage(data, peer, info) {
     if (p.samples.length > SAMPLES) p.samples.shift();
   } else if (data.t === 'chat' && typeof data.text === 'string') {
     addChat(nameOf(peer), clip(data.text, 500), routeLabel(room.route(peer)));
+  } else if (data.t === 'bday' && typeof data.step === 'string') {
+    onBirthday(peer, data).catch((e) => bdayFail(peer, `error: ${e.message}`));
   }
+}
+
+// ---------- birthday punch (diagnostic) ----------
+//
+// Runs the browser birthday punch (src/birthday.js) between this tab and a peer, over
+// the room's own signalling, and reports whether a direct WebRTC data channel forms
+// across their real NATs. This is a measurement: the channel it makes is not used for
+// room traffic (that still needs the core's fallback→direct upgrade); it answers "can
+// these two browsers punch directly?". The symmetric-NAT side opens a fleet of
+// connections sharing one certificate and credentials; the cone side sprays its IP.
+
+const BDAY_TIMEOUT_MS = 70000;
+const BDAY_COOLDOWN_MS = 300000; // one punch per peer per 5 min (NB48-1); reload to reset
+let bdayBusy = false; // one fleet at a time, this tab (NB48-1)
+const rtcAvailable = () => params.get('rtc') !== 'off' && typeof RTCPeerConnection === 'function';
+const bdayIce = () => (params.get('signal') === 'local' ? [] : PROBE_STUN);
+// This device's own public IPv4 (from the network probe), for the hard side's answer.
+const myProbedV4 = () => (myNet?.srflx ?? []).map((c) => c.address).find((a) => isPublicV4(a)) ?? null;
+// The easy side's own public ip:port (its first server-reflexive candidate in `sdp`),
+// which the hard fleet is told to target — instead of trusting the offer's candidate list.
+function srflxAddr(sdp) {
+  for (const m of (sdp ?? '').matchAll(/^a=candidate:\S+ \d+ udp \d+ (\d+\.\d+\.\d+\.\d+) (\d+) typ srflx/gim)) {
+    if (isPublicV4(m[1])) return `${m[1]}:${m[2]}`;
+  }
+  return null;
+}
+
+// Which side each peer plays: the symmetric NAT is "hard" (opens the fleet), the
+// cone is "easy" (sprays). The STUN "cone-like" reading is only about mapping, not
+// filtering, and mobile CGNAT often reads cone-like but is really symmetric, so when
+// neither is reported symmetric we fall back to hints: the cellular side is the likely
+// symmetric one; else the larger id (so both sides agree). `want` ('hard'|'easy') from
+// a retry overrides the guess, since the first roles may have been backwards.
+function punchRoles(peer, want) {
+  const sym = (n) => n === 'symmetric';
+  const cell = (c) => /cellular/i.test(c ?? '');
+  const them = peerState(peer).presence ?? {};
+  const mine = myNet?.nat;
+  if (sym(mine) && sym(them.nat)) return { bad: 'both sides are behind a symmetric NAT: a browser birthday punch needs one cone side' };
+  let iAmHard, why;
+  if (want) { iAmHard = want === 'hard'; why = 'you chose this role'; }
+  else if (sym(mine) !== sym(them.nat)) { iAmHard = sym(mine); why = 'the symmetric side opens the fleet'; }
+  else if (cell(connInfo()) !== cell(them.conn)) { iAmHard = cell(connInfo()); why = 'the cellular side is the likely symmetric one'; }
+  else { iAmHard = room.self > peer; why = "neither NAT looks symmetric: a guess (press again to swap sides)"; }
+  return { iAmHard, why, forced: !sym(mine) && !sym(them.nat) };
+}
+
+function bdayStatus(peer, status, extra = {}) {
+  const p = peerState(peer);
+  p.bday = { ...(p.bday ?? {}), status, at: now(), ...extra };
+  render();
+}
+function bdayFail(peer, why) {
+  closeBday(peer);
+  bdayStatus(peer, 'failed', { why });
+  log('warn', `birthday punch with ${nameOf(peer)}: ${why}`);
+}
+function closeBday(peer) {
+  bdayBusy = false; // the slot is free again (NB48-1: one fleet at a time)
+  const b = peerState(peer).bday;
+  if (!b?.ctx) return;
+  try { b.ctx.easy?.pc.close(); } catch { /* already closed */ }
+  for (const c of b.ctx.hard?.conns ?? []) try { c.pc.close(); } catch { /* already closed */ }
+  clearTimeout(b.ctx.timer);
+  b.ctx = null;
+}
+
+// Run a punch with `peer` — ONLY from a local click (the button), never from a signal.
+// Accepts a peer's invite with the role it proposed, otherwise decides the role (and
+// retries with it swapped after a failure, since mobile CGNAT reads cone-like but is
+// often symmetric). One fleet at a time, one per peer per 5 min (NB48-1).
+async function tryBirthday(peer) {
+  if (!room || !rtcAvailable()) return;
+  const prev = peerState(peer).bday;
+  if (prev?.status === 'running') return;
+  if (bdayBusy) return bdayFail(peer, 'another birthday punch is running — one at a time');
+  if (prev?.lastRun && now() - prev.lastRun < BDAY_COOLDOWN_MS) {
+    return bdayFail(peer, `one punch per peer per 5 min — wait ${Math.ceil((BDAY_COOLDOWN_MS - (now() - prev.lastRun)) / 1000)} s (or reload)`);
+  }
+  let iAmHard, why, initiated;
+  if (prev?.status === 'invited' && prev.role) {
+    iAmHard = prev.role === 'hard';
+    why = "accepted the peer's request";
+    initiated = false;
+  } else {
+    const want = prev?.status === 'failed' && prev.role ? (prev.role === 'hard' ? 'easy' : 'hard') : undefined;
+    const roles = punchRoles(peer, want);
+    if (roles.bad) return bdayFail(peer, roles.bad);
+    iAmHard = roles.iAmHard;
+    why = roles.why;
+    initiated = true;
+  }
+  const role = iAmHard ? 'hard' : 'easy';
+  const pending = prev?.pendingOffer; // a buffered offer from the easy initiator
+  bdayBusy = true;
+  bdayStatus(peer, 'running', { role, startedAt: now(), lastRun: now(), ctx: { timer: setTimeout(() => bdayFail(peer, 'timed out (no direct channel formed)'), BDAY_TIMEOUT_MS) } });
+  log('info', `birthday punch with ${nameOf(peer)}: starting as the ${role} side (${why})`);
+  if (initiated) room.send({ t: 'bday', step: 'start', yourRole: iAmHard ? 'easy' : 'hard' }, { to: peer });
+  if (!iAmHard) await beEasy(peer); // the hard side waits for the easy side's offer
+  else if (pending) await onBirthday(peer, pending);
+}
+
+async function onBirthday(peer, data) {
+  const p = peerState(peer);
+  if (!rtcAvailable()) return;
+  if (data.step === 'start') {
+    // NB48-1: a remote request never opens a fleet on its own — it only invites, and the
+    // local user must press the button to accept. (If we already started, our role stands.)
+    if (p.bday?.status === 'running') return;
+    const role = data.yourRole === 'hard' ? 'hard' : 'easy';
+    bdayStatus(peer, 'invited', { role });
+    log('info', `${nameOf(peer)} wants a birthday punch (you would be the ${role} side) — press Birthday punch to accept`);
+    return;
+  }
+  const b = p.bday;
+  if (!b || b.status !== 'running' || !b.ctx) {
+    // Before the local user accepts, keep the one offer so it isn't lost; ignore the rest.
+    if (data.step === 'offer' && typeof data.sdp === 'string' && b?.status === 'invited') b.pendingOffer = data;
+    return;
+  }
+  if (data.step === 'offer' && b.role === 'hard' && typeof data.sdp === 'string') {
+    // The hard side: open the fleet answering the easy side's one offer, aimed only at the
+    // one validated address it gave (openFleet strips the offer's candidates). Answer with our IP.
+    const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+    const creds = randomCredentials();
+    const size = Number(params.get('fleet')) || FLEET_SIZE;
+    const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size, easyAddr: data.addr });
+    b.ctx.hard = hard;
+    log('info', `birthday punch with ${nameOf(peer)}: opened ${hard.conns.length} sockets, answering`);
+    room.send({ t: 'bday', step: 'answer', sdp: hard.answerSdp, ip: myProbedV4() }, { to: peer });
+    hard.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
+  } else if (data.step === 'answer' && b.role === 'easy' && typeof data.sdp === 'string') {
+    const ip = typeof data.ip === 'string' ? data.ip : null;
+    if (!isPublicV4(ip)) return bdayFail(peer, 'the peer named no public IPv4 to spray'); // NB48-2
+    const ports = sprayPorts(SPRAY_PORTS);
+    log('info', `birthday punch with ${nameOf(peer)}: spraying ${ports.length} ports at ${ip}`);
+    await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
+  } else if (data.step === 'abort') {
+    bdayFail(peer, `the peer stopped: ${clip(data.why, 80)}`);
+  }
+}
+
+// The easy side: one connection, offer to the hard side with our own public address, spray on its answer.
+async function beEasy(peer) {
+  const b = peerState(peer).bday;
+  const easy = await openSpray({ RTCPeerConnection, iceServers: bdayIce() });
+  b.ctx.easy = easy;
+  room.send({ t: 'bday', step: 'offer', sdp: easy.offerSdp, addr: srflxAddr(easy.offerSdp) }, { to: peer });
+  easy.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
+}
+
+function bdayWon(peer, pc) {
+  const b = peerState(peer).bday;
+  if (!b || b.status !== 'running') return;
+  const ms = Math.round(now() - b.startedAt);
+  // Read the pair that won (candidate types, family) for the report.
+  pc.getStats().then((stats) => {
+    let pair = null;
+    stats.forEach((r) => { if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded')) pair = r; });
+    const l = pair && stats.get(pair.localCandidateId), r = pair && stats.get(pair.remoteCandidateId);
+    const path = l && r ? `${l.candidateType}↔${r.candidateType}` : '';
+    bdayStatus(peer, 'linked', { ms, path });
+  }).catch(() => bdayStatus(peer, 'linked', { ms }));
+  log('info', `birthday punch with ${nameOf(peer)}: direct channel formed in ${secs(ms)}`);
+  // It is a measurement, not a room link: close it after a moment so sockets don't linger.
+  setTimeout(() => closeBday(peer), 1500);
+}
+
+// The birthday-punch control + result in a peer card.
+function bdayRow(p) {
+  const b = p.bday;
+  const roles = myNet ? punchRoles(p.id) : null;
+  let label = 'Birthday punch', note = 'test a direct link across NATs', cls = 'faint';
+  if (b?.status === 'running') { label = 'Punching…'; note = `running as the ${b.role} side…`; cls = 'warn'; }
+  else if (b?.status === 'invited') { label = 'Accept punch'; note = `${nameOf(p.id)} asked — you'd be the ${b.role} side`; cls = 'warn'; }
+  else if (b?.status === 'linked') { label = 'Punch again'; note = `direct channel in ${secs(b.ms)}${b.path ? ` · ${esc(b.path)}` : ''}`; cls = 'ok'; }
+  else if (b?.status === 'failed') { label = 'Try again'; note = b.why; cls = 'bad'; }
+  else if (roles?.bad) { note = roles.bad; }
+  const disabled = b?.status === 'running' || (!b && roles?.bad);
+  return `<div class="bdayrow"><button class="small" data-bday="${esc(p.id)}"${disabled ? ' disabled' : ''}>${label}</button><span class="${cls}">${esc(note)}</span></div>`;
 }
 
 // ---------- pinging ----------
@@ -612,11 +857,17 @@ function pairHint(pres) {
 
 function spark(samples) {
   if (samples.length < 2) return '';
-  const w = 300, h = 34, max = Math.max(...samples, 50);
-  const pts = samples.map((v, i) => `${((i / (SAMPLES - 1)) * w).toFixed(1)},${(h - 2 - (v / max) * (h - 4)).toFixed(1)}`).join(' ');
-  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline fill="none" stroke="#3e63dd" stroke-width="1.5" points="${pts}"/></svg>`;
+  const w = 300, h = 40, max = Math.max(...samples, 50);
+  const pts = samples.map((v, i) => `${((i / (samples.length - 1)) * w).toFixed(1)},${(h - 2 - (v / max) * (h - 4)).toFixed(1)}`).join(' ');
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline fill="none" stroke="#6e8cff" stroke-width="1.5" vector-effect="non-scaling-stroke" points="${pts}"/></svg>`;
 }
 const pingCls = (v) => (v == null ? 'dim' : v < 150 ? 'ok' : v < SLOW_MS ? 'warn' : 'bad');
+
+const bytes = (n) => (n == null ? '–' : n < 1024 ? `${n} B` : n < 1 << 20 ? `${(n / 1024).toFixed(1)} KB` : `${(n / (1 << 20)).toFixed(2)} MB`);
+const hue = (id) => parseInt(String(id).slice(0, 4), 16) % 360 || 220;
+const tile = (k, v, sub = '', cls = '') => `<div class="tile"><div class="k">${k}</div><div class="v ${cls}">${v}</div><div class="s">${sub || '&nbsp;'}</div></div>`;
+const metric = (k, v, cls = '') => `<div class="metric"><span>${k}</span><b class="${cls}">${v}</b></div>`;
+const routeTone = (r) => (!r ? 'warn' : r.kind === 'direct' ? 'ok' : r.kind === 'peer' ? 'warn' : 'bad');
 
 let rendering = false;
 async function render() {
@@ -625,27 +876,40 @@ async function render() {
   try {
     const t = now();
     const linked = room.peers;
-    const avgs = linked.map((id) => pingStats(peerState(id)).avg).filter((v) => v != null);
+    const stats = linked.map((id) => [id, pingStats(peerState(id))]);
+    const avgs = stats.map(([, s]) => s.avg).filter((v) => v != null);
     const roomAvg = avgs.length ? avgs.reduce((a, b) => a + b, 0) / avgs.length : null;
+    const worst = stats.filter(([, s]) => s.avg != null).sort((a, b) => b[1].avg - a[1].avg)[0];
     const routes = { direct: 0, peer: 0, signaling: 0 };
     for (const id of linked) { const k = room.route(id)?.kind; if (k) routes[k]++; }
-    $('h-room').textContent = roomKind === 'global' ? 'global room' : `private ${roomKey.slice(0, 4)}…`;
+    $('h-room').textContent = roomLabel();
     $('h-peers').textContent = `${linked.length} linked`;
+    $('h-peers').className = `pill ${linked.length ? 'ok' : ''}`;
     $('h-ping').textContent = `ping ${ms(roomAvg)}`;
-    $('h-ping').className = `pill ${pingCls(roomAvg)}`;
+    $('h-ping').className = `pill ${roomAvg == null ? '' : roomAvg < 150 ? 'ok' : roomAvg < SLOW_MS ? 'warn' : 'bad'}`;
 
     const heardOnly = [...peers.values()].filter((p) => p.heardAt && !p.joinedAt && !p.leftAt).length;
     const core = room.stats();
+    let sent = 0, recv = 0, lost = 0, tx = 0, rx = 0;
+    for (const id of linked) {
+      const p = peerState(id);
+      sent += p.recv + p.lost;
+      lost += p.lost;
+      tx += p.ice?.pair?.bytesSent ?? 0;
+      rx += p.ice?.pair?.bytesReceived ?? 0;
+    }
+    recv = sent - lost;
+    const loss = sent ? (100 * lost) / sent : null;
     $('roomstats').innerHTML = [
-      ['room', roomKind === 'global' ? 'global (public)' : 'private'],
-      ['me', `${esc(myName())} <span class="mono dim">${short(room.self)}</span>`],
-      ['in room for', secs(t - joinedAt)],
-      ['linked / waiting', `${linked.length} / ${heardOnly}`],
-      ['routes', `${routes.direct} direct, ${routes.peer} relayed, ${routes.signaling} signalling`],
-      ['room ping avg', `<span class="${pingCls(roomAvg)}">${ms(roomAvg)}</span>`],
-      ['worst ping', ms(avgs.length ? Math.max(...avgs) : null)],
-      ['packets', `${core.txPackets} out / ${core.rxPackets} in, ${core.retransmits} resent`],
-    ].map(([k, v]) => `<div><span>${k}</span>${v}</div>`).join('');
+      tile('Peers linked', linked.length, heardOnly ? `${heardOnly} connecting` : roomKind === 'global' ? 'global room' : 'in this room', linked.length ? 'ok' : ''),
+      tile('Average ping', ms(roomAvg), `over ${avgs.length} peer${avgs.length === 1 ? '' : 's'}`, pingCls(roomAvg)),
+      tile('Worst ping', ms(worst?.[1].avg), worst ? esc(nameOf(worst[0])) : '', pingCls(worst?.[1].avg)),
+      tile('Packet loss', loss == null ? '–' : `${loss.toFixed(1)}%`, `${recv} of ${sent} pings back`, loss == null ? '' : loss < 2 ? 'ok' : loss < 10 ? 'warn' : 'bad'),
+      tile('Routes', `${routes.direct}<span class="dim" style="font-size:13px"> direct</span>`, `${routes.peer} relayed · ${routes.signaling} via signalling`, routes.peer + routes.signaling ? 'warn' : ''),
+      tile('WebRTC traffic', bytes(tx + rx), `${bytes(tx)} out · ${bytes(rx)} in`),
+      tile('Packets', core.txPackets + core.rxPackets, `${core.txPackets} out · ${core.rxPackets} in · ${core.retransmits} resent`),
+      tile('In room', secs(t - joinedAt), `as ${esc(myName())}`),
+    ].join('');
 
     const sig = room.signaling;
     let relayHtml = '';
@@ -670,11 +934,18 @@ async function render() {
       lastBackoffs = s.backoffs ?? 0;
       if ((s.reconnects ?? 0) > lastReconnects) log('info', `a signalling relay reconnected (${s.reconnects} so far): announcing us again`);
       lastReconnects = s.reconnects ?? 0;
-      relayHtml = `<b>Signalling relays</b> (${s.published} sent, ${s.received} received, ${s.rejected} refused${s.reconnects ? `, ${s.reconnects} reconnects` : ''})<br>`
-        + sig.sockets.map((ws) => { const x = st(ws); return `<span class="${x === 'open' ? 'ok' : x === 'connecting' ? 'dim' : 'bad'}">●</span> <span class="mono">${esc(ws.relayUrl)}</span> ${esc(x)}`; }).join('<br>');
+      relayHtml = sig.sockets.map((ws) => {
+        const x = st(ws);
+        return `<div class="relay"><span class="ldot ${x === 'open' ? 'ok' : x === 'connecting' ? '' : 'bad'}"></span><span class="mono">${esc(ws.relayUrl.replace(/^wss:\/\//, ''))}</span><span class="dim">${esc(x)}</span></div>`;
+      }).join('');
+      relayHtml += `<dl style="margin-top:8px"><dt>Events</dt><dd>${s.published} sent · ${s.received} received${s.rejected ? ` · <span class="warn">${s.rejected} refused</span>` : ''}</dd>
+        <dt>Reconnects</dt><dd>${s.reconnects ?? 0}${s.backoffs ? ` · <span class="warn">${s.backoffs} rate-limit pauses</span>` : ''}</dd>`;
       const piped = room.transport?.piped;
-      if (piped) relayHtml += `<br><span class="dim">signalling route: ${piped.sent} batches sent, ${piped.received} datagrams received, ${piped.dropped} dropped</span>`;
-    } else relayHtml = '<b>Signalling</b>: local (BroadcastChannel, this browser only)';
+      if (piped) relayHtml += `<dt>Fallback route</dt><dd>${piped.sent} batches sent · ${piped.received} datagrams received${piped.dropped ? ` · ${piped.dropped} dropped` : ''}</dd>`;
+      const tr = room.transport;
+      if (tr) relayHtml += `<dt>WebRTC signals</dt><dd>${tr.resent ?? 0} resent · ${tr.restarts ?? 0} ICE restarts${tr.badSignals ? ` · ${tr.badSignals} refused` : ''}</dd>`;
+      relayHtml += '</dl>';
+    } else relayHtml = '<p class="dim" style="margin:0">Local (BroadcastChannel): tabs of this browser only.</p>';
     $('relays').innerHTML = relayHtml;
 
     const list = [...peers.values()].filter((p) => !p.leftAt || t - p.leftAt < 60000).sort((a, b) => (b.joinedAt ? 1 : 0) - (a.joinedAt ? 1 : 0));
@@ -685,29 +956,49 @@ async function render() {
       if (isLinked || room.transport?.has?.(p.id)) p.ice = await iceOf(p.id);
       const st = pingStats(p);
       const pres = p.presence ?? {};
-      const state = p.leftAt ? `<span class="dim">left (${esc(p.leaveReason)})</span>`
-        : isLinked ? `<span class="${room.route(p.id)?.kind === 'direct' ? 'ok' : 'warn'}">${esc(routeLabel(room.route(p.id)))}</span>`
-          : `<span class="warn">connecting… heard ${secs(t - p.heardAt)} ago${p.rtcFailedAt ? ', WebRTC failed' : ''}</span>`;
+      const r = room.route(p.id);
+      const state = p.leftAt ? `<span class="pill">left: ${esc(p.leaveReason)}</span>`
+        : isLinked ? `<span class="pill ${routeTone(r)}">${esc(routeLabel(r))}</span>`
+          : `<span class="pill warn">connecting · heard ${secs(t - p.heardAt)} ago${p.rtcFailedAt ? ' · WebRTC failed' : ''}</span>`;
       const hint = pairHint(p.presence);
-      cards.push(`<div class="peer">
-        <div class="top"><span class="name">${esc(nameOf(p.id))}</span><span class="mono dim">${short(p.id)}</span>${state}
-          <span class="big ${pingCls(st.avg)}" style="margin-left:auto">${ms(st.last)}</span></div>
+      const pair = p.ice?.pair;
+      const restarts = p.sig.filter((e) => e.what === 'ice-restart').length;
+      const guess = p.sig.find((e) => e.what === 'guesses');
+      const name = nameOf(p.id);
+      cards.push(`<div class="peer${p.leftAt ? ' gone' : ''}">
+        <div class="phead">
+          <span class="avatar" style="background:hsl(${hue(p.id)} 45% 38%)">${esc(name.slice(0, 1).toUpperCase())}</span>
+          <div class="pname"><b>${esc(name)}</b><span class="mono">${short(p.id)} · ${esc(clip(pres.dev, 40) || 'device unknown')}</span></div>
+          ${state}
+          <div class="pbig"><span class="big ${pingCls(st.last)}">${ms(st.last)}</span><span class="dim">latest ping</span></div>
+        </div>
         ${isLinked ? spark(p.samples) : ''}
+        <div class="metrics">
+          ${metric('Avg', ms(st.avg), pingCls(st.avg))}${metric('Min', ms(st.min))}${metric('Max', ms(st.max))}${metric('Jitter', ms(st.jitter))}
+          ${metric('Loss', `${st.loss.toFixed(0)}%`, st.loss < 2 ? '' : st.loss < 10 ? 'warn' : 'bad')}${metric('Core RTT', ms(isLinked ? room.rtt(p.id) : null))}
+          ${metric('ICE RTT', pair?.iceRttMs != null ? `${pair.iceRttMs} ms` : '–')}${metric('Pings', `${p.recv}/${p.sent}`)}
+        </div>
         <dl>
-          <dt>Ping</dt><dd>avg <b class="${pingCls(st.avg)}">${ms(st.avg)}</b> · min ${ms(st.min)} · max ${ms(st.max)} · jitter ${ms(st.jitter)} · loss ${st.loss.toFixed(0)}% <span class="dim">(${p.recv}/${p.sent})</span></dd>
-          <dt>Core RTT</dt><dd>${ms(isLinked ? room.rtt(p.id) : null)}</dd>
-          <dt>WebRTC</dt><dd>${p.ice ? iceText(p.ice) : p.rtcFailedAt ? '<span class="bad">failed</span>' : '–'}${p.ice?.pair?.iceRttMs != null ? ` · ICE RTT ${p.ice.pair.iceRttMs} ms` : ''}</dd>
+          <dt>Path</dt><dd>${p.ice ? iceText(p.ice) : p.rtcFailedAt ? '<span class="bad">WebRTC failed</span>' : '–'}</dd>
+          ${pair ? `<dt>Traffic</dt><dd>${bytes(pair.bytesSent)} out · ${bytes(pair.bytesReceived)} in</dd>` : ''}
+          <dt>Timing</dt><dd>heard → WebRTC ${secs(p.heardAt && p.rtcOpenAt ? p.rtcOpenAt - p.heardAt : null)} · heard → joined ${secs(p.heardAt && p.joinedAt ? p.joinedAt - p.heardAt : null)}</dd>
           ${p.sig.length ? `<dt>Signalling</dt><dd>${sigText(p)}</dd>` : ''}
           ${p.pairs.size ? `<dt>ICE checks</dt><dd>${checksText(p)}</dd>` : ''}
-          <dt>Timing</dt><dd>heard→WebRTC ${secs(p.heardAt && p.rtcOpenAt ? p.rtcOpenAt - p.heardAt : null)} · heard→joined ${secs(p.heardAt && p.joinedAt ? p.joinedAt - p.heardAt : null)}</dd>
-          <dt>Their side</dt><dd>${esc(clip(pres.dev, 40) || '–')} · NAT <b>${esc(clip(pres.nat, 20) || '?')}</b> · IPv6 ${pres.v6 ? 'yes' : 'no'}${pres.conn && pres.conn !== 'unknown' ? ` · ${esc(clip(pres.conn, 40))}` : ''}</dd>
+          ${restarts ? `<dt>ICE restarts</dt><dd class="warn">${restarts}</dd>` : ''}
+          ${guess ? `<dt>Port guesses</dt><dd>${guess.n} ports around <span class="mono">${esc(guess.ip)}:${guess.next}</span> (step ${guess.step})</dd>` : ''}
+          <dt>Their network</dt><dd>NAT <b>${esc(clip(pres.nat, 20) || '?')}</b> · IPv6 ${pres.v6 ? 'yes' : 'no'}${pres.conn && pres.conn !== 'unknown' ? ` · ${esc(clip(pres.conn, 40))}` : ''}</dd>
         </dl>
-        ${hint ? `<div class="note dim">${esc(hint)}</div>` : ''}
-        ${p.pairs.size ? `<details><summary>candidate pairs</summary><div class="mono">${[...p.pairs.values()].map((q) => `${esc(q.pair)} ${esc(q.state)}: sent ${q.requestsSent}, answered ${q.responsesReceived}, received ${q.requestsReceived}`).join('<br>')}</div></details>` : ''}
-        ${p.routeLog.length > 1 ? `<details><summary>route history</summary><div class="mono">${p.routeLog.map((r) => `${secs(r.at)}: ${esc(r.route)}`).join('<br>')}</div></details>` : ''}
+        ${hint ? `<div class="hintbox">${esc(hint)}</div>` : ''}
+        ${isLinked && rtcAvailable() ? bdayRow(p) : ''}
+        ${p.pairs.size ? `<details data-d="pairs-${esc(p.id)}"><summary>Candidate pairs (${p.pairs.size})</summary><div class="mono">${[...p.pairs.values()].map((q) => `${esc(q.pair)} ${esc(q.state)}: sent ${q.requestsSent}, answered ${q.responsesReceived}, received ${q.requestsReceived}`).join('<br>')}</div></details>` : ''}
+        ${p.routeLog.length > 1 ? `<details data-d="routes-${esc(p.id)}"><summary>Route history (${p.routeLog.length})</summary><div class="mono">${p.routeLog.map((x) => `${secs(x.at)}: ${esc(x.route)}`).join('<br>')}</div></details>` : ''}
       </div>`);
     }
-    $('peers').innerHTML = cards.join('') || `<p class="dim">No peers yet. ${roomKind === 'global' ? 'Anyone who opens Net Lab and joins the global room shows up here.' : 'Share the link (button above) with someone.'}</p>`;
+    // render() rebuilds this block every second, which would collapse a <details>
+    // (candidate pairs, route history) the user opened: carry the open ones across.
+    const open = new Set([...$('peers').querySelectorAll('details[open]')].map((d) => d.dataset.d));
+    $('peers').innerHTML = cards.join('') || `<p class="dim">No peers yet. ${roomKind === 'global' ? 'Anyone who opens Net Lab and joins the global room shows up here.' : 'Send the room link (Copy link, at the top) to someone, or have them type the same room name.'}</p>`;
+    for (const d of $('peers').querySelectorAll('details')) if (open.has(d.dataset.d)) d.open = true;
   } finally {
     rendering = false;
   }
@@ -780,7 +1071,9 @@ function downloadReport() {
 
 // ---------- wiring ----------
 
-$('name').value = params.get('name') ?? localStorage.getItem('netlab-name') ?? '';
+let savedName = '';
+try { savedName = localStorage.getItem('netlab-name') ?? ''; } catch { /* private mode */ }
+$('name').value = params.get('name') ?? savedName;
 $('gw').value = localStorage.getItem('netlab-gw') ?? '';
 function saveGw() {
   const raw = $('gw').value.trim();
@@ -791,9 +1084,32 @@ function saveGw() {
   else localStorage.removeItem('netlab-gw');
 }
 $('gw').onchange = saveGw;
+$('nameform').onsubmit = (e) => {
+  e.preventDefault();
+  const id = roomIdOf($('roomname').value);
+  if (!id) return void ($('joinmsg').textContent = 'Type a room name, or pick a recent one.');
+  enter('named', id);
+};
+$('roomname').oninput = roomHint;
+$('private').onclick = () => {
+  const base = roomIdOf($('roomname').value) || 'room';
+  $('roomname').value = `${base.replace(/-[a-z0-9]{5}$/, '')}-${randomSuffix()}`;
+  roomHint();
+};
+$('recent').onclick = (e) => {
+  const r = e.target.dataset?.room;
+  if (r) enter('named', r);
+};
+$('onlywarn').onclick = () => {
+  const on = $('onlywarn').getAttribute('aria-pressed') !== 'true';
+  $('onlywarn').setAttribute('aria-pressed', String(on));
+  $('log').classList.toggle('only-warn', on);
+};
 $('global').onclick = () => enter('global');
 $('create').onclick = () => enter('private', randomRoomId());
 $('joinkey').onclick = () => {
+  const named = parseRoom($('key').value);
+  if (named) return enter('named', named);
   const key = parseKey($('key').value);
   if (!key) return ($('joinmsg').textContent = 'paste a room key or the full link');
   enter('private', key);
@@ -805,17 +1121,28 @@ $('leave').onclick = async () => {
   location.reload();
 };
 $('share').onclick = async () => {
-  const link = `${location.origin}${location.pathname}#key=${roomKey}`;
+  const link = roomLink();
   try {
-    if (navigator.share) await navigator.share({ title: 'Peerwire Net Lab room', url: link });
-    else { await navigator.clipboard.writeText(link); log('info', 'room link copied'); }
-  } catch {
-    prompt('Room link', link);
+    // A phone shares through its own sheet (messages, chat apps); elsewhere, copy.
+    if (navigator.share && matchMedia('(pointer: coarse)').matches) await navigator.share({ title: 'Net Lab room', url: link });
+    else {
+      await navigator.clipboard.writeText(link);
+      log('info', 'room link copied');
+      $('share').textContent = 'Copied';
+      setTimeout(() => ($('share').textContent = 'Copy link'), 1500);
+    }
+  } catch (e) {
+    if (e?.name !== 'AbortError') prompt('Room link', link);
   }
 };
 $('reprobe').onclick = reprobe;
 $('copy').onclick = copyReport;
 $('download').onclick = downloadReport;
+// The peer cards are rebuilt each second; one delegated listener on the container survives.
+$('peers').addEventListener('click', (e) => {
+  const id = e.target.closest('[data-bday]')?.dataset.bday;
+  if (id) tryBirthday(id);
+});
 addEventListener('pagehide', () => room?.leave());
 
 // For tests and the console.
@@ -828,6 +1155,11 @@ window.netlab = {
   report,
   hotspotCandidates,
   joinGlobal: () => enter('global'),
+  joinNamed: (name) => enter('named', roomIdOf(name)),
+  punch: (i = 0) => tryBirthday(room.peers[i]),
+  birthday: () => room?.peers.map((id) => ({ id, name: nameOf(id), ...(peerState(id).bday ?? { status: null }) })).map(({ ctx, ...b }) => b) ?? [],
+  get room() { return roomKind && { kind: roomKind, label: roomLabel(), link: roomLink() }; },
+  roomIdOf,
   joinPrivate: (key) => enter('private', key ?? randomRoomId()),
 };
 
@@ -835,7 +1167,12 @@ log('info', `Net Lab on ${device()}, connection ${connInfo()}`);
 setInterval(tickPings, 250);
 setInterval(render, 1000);
 const hashKey = parseKey(location.hash);
+const hashRoom = parseRoom(location.hash);
+$('roomname').value = hashRoom ?? params.get('room') ?? '';
+roomHint();
+showRecent();
 reprobe();
 if (hashKey) enter('private', hashKey);
+else if (hashRoom) enter('named', hashRoom);
 else if (params.get('auto') === 'global') enter('global');
 

@@ -35,15 +35,85 @@ const MAX_PIPE_ITEMS = 64; // datagrams accepted in one incoming batch
 export const MAX_PIPE_PEERS = 256; // peers allowed to open a pipe to us
 // Without trickle, an offer or answer goes once ICE gathering is complete, or
 // GATHER_SETTLE_MS after the first public (srflx/relay) candidate, or at
-// GATHER_MAX_MS. Candidates found later go in one 'ice-batch', LATE_ICE_MS after
-// the description at the latest.
+// GATHER_MAX_MS. Candidates found later go in an 'ice-batch', the first LATE_ICE_MS
+// after the description at the latest; a candidate found after that batch (a slow
+// public address on a device that gathered mDNS first) is sent in a further batch,
+// LATE_FLUSH_MS after it arrives, up to MAX_LATE candidates in all.
 export const GATHER_SETTLE_MS = 300;
 export const GATHER_MAX_MS = 2000;
 export const LATE_ICE_MS = 3000;
+export const LATE_FLUSH_MS = 400;
+const MAX_LATE = 64;
 // Signalling relays drop messages: an offer with no answer is sent again at these
 // times after the first; an offer seen twice is answered with the same answer.
 export const OFFER_RESEND_MS = [3000, 6000];
 const MAX_ICE_BATCH = 32; // candidates in one 'ice-batch', and held before a remote description
+// ICE restart, for a link whose DataChannel was open: once ICE has been
+// 'disconnected' for RESTART_AFTER_MS, or at once on 'failed', the dialling side
+// renegotiates with new ICE credentials (the other side asks it to, so offers never
+// cross). At most MAX_RESTARTS in a row, RESTART_AFTER_MS doubling between them,
+// counted afresh once ICE connects again. The Peerwire session keeps its handle.
+export const RESTART_AFTER_MS = 2000;
+export const MAX_RESTARTS = 3;
+// Port prediction (as the native traversal does): a NAT whose two STUN mappings share
+// an IP and are 1 to MAX_STEP ports apart hands ports out in sequence. A peer not
+// behind a symmetric NAT itself adds GUESS_BEFORE + GUESS_AFTER + 1 candidates around
+// the predicted port, so its checks open its NAT to the port the other's will come from.
+export const MAX_STEP = 8;
+export const GUESS_BEFORE = 4;
+export const GUESS_AFTER = 27;
+
+const CANDIDATE = /^(?:a=)?candidate:\S+ \d+ udp \d+ (\S+) (\d+) typ (\w+)/i;
+const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+
+// What the server-reflexive candidates in `sdp` (a description, or candidate lines)
+// say about the NAT: 'symmetric' if one IPv4 address comes with two ports (two STUN
+// servers saw two mappings), with { ip, next, step } when the ports are 1 to MAX_STEP
+// apart (a sequential NAT: `next` is its likely next port); 'cone' for one port (a
+// browser lists a mapping two servers agree on once, so one server answering looks
+// the same); 'unknown' with no server-reflexive IPv4 candidate.
+export function natFromSdp(sdp) {
+  const ports = new Map(); // IPv4 -> Set of ports
+  for (const l of typeof sdp === 'string' ? sdp.split(/\r?\n/) : []) {
+    const m = CANDIDATE.exec(l.trim());
+    if (!m || m[3] !== 'srflx' || !IPV4.test(m[1])) continue;
+    if (!ports.has(m[1])) ports.set(m[1], new Set());
+    ports.get(m[1]).add(Number(m[2]));
+  }
+  if (!ports.size) return { type: 'unknown' };
+  for (const [ip, set] of ports) {
+    if (set.size < 2) continue;
+    const [a, b] = [...set].sort((x, y) => x - y);
+    const step = b - a;
+    const out = { type: 'symmetric' };
+    if (set.size === 2 && step >= 1 && step <= MAX_STEP && b + step <= 65535) Object.assign(out, { ip, next: b + step, step });
+    return out;
+  }
+  return { type: 'cone' };
+}
+
+// A peer's prediction as sent in signalling, checked: { ip, next, step } or null.
+export function checkPrediction(nat) {
+  if (!nat || typeof nat !== 'object' || typeof nat.ip !== 'string' || !IPV4.test(nat.ip)) return null;
+  const { next, step } = nat;
+  if (!Number.isInteger(next) || !Number.isInteger(step) || step < 1 || step > MAX_STEP || next < 1 || next > 65535) return null;
+  return { ip: nat.ip, next, step };
+}
+
+// The ICE candidates to add for a peer's prediction: its IP at ports
+// next - GUESS_BEFORE·step to next + GUESS_AFTER·step, as low-priority srflx ones.
+export function predictedCandidates(nat, sdpMid = '0') {
+  const p = checkPrediction(nat);
+  if (!p) return [];
+  const out = [];
+  for (let k = -GUESS_BEFORE; k <= GUESS_AFTER; k++) {
+    const port = p.next + k * p.step;
+    if (port < 1 || port > 65535) continue;
+    const candidate = `candidate:pw${k + GUESS_BEFORE} 1 udp 1 ${p.ip} ${port} typ srflx raddr 0.0.0.0 rport 0`;
+    out.push({ candidate, sdpMid, sdpMLineIndex: 0 });
+  }
+  return out;
+}
 
 // Counts the ICE candidates in an SDP by type and family: host candidates with an
 // mDNS name (.local) are `mdns`, as only the same LAN can resolve them.
@@ -104,6 +174,7 @@ export class WebRtcTransport {
     this.congested = 0; // datagrams dropped because the DataChannel was full or refused them
     this.badSignals = 0; // signals refused as malformed or unproven (see onSignal)
     this.resent = 0; // offers and answers sent again (OFFER_RESEND_MS)
+    this.restarts = 0; // ICE restarts begun (as the dialling side)
     this.trace = null;
     this.sig = signaling;
     this.iceServers = iceServers;
@@ -151,10 +222,12 @@ export class WebRtcTransport {
     dc.binaryType = 'arraybuffer';
     // Without trickle: `described` once the offer or answer is out, `late` holds the
     // candidates found after it, `held` the peer's that came before its description.
-    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, failed: false, described: false, late: [], lateSent: false, lateTimer: null,
-      held: [], offerMsg: null, offerSdp: null, answerMsg: null, resends: [] };
+    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, failed: false, described: false, late: [], lateTimer: null,
+      held: [], offerMsg: null, offerSdp: null, answerMsg: null, resends: [],
+      lateSent: 0, opened: false, restarts: 0, restartTimer: null, guessed: null };
     dc.onopen = () => {
       clearTimeout(l.timer);
+      l.opened = true;
       if (l.dialer) this.ep.connect(h, peer);
       this.onPeer(peer, 'open');
     };
@@ -171,11 +244,19 @@ export class WebRtcTransport {
       if (c && this.privacy !== 'direct' && / typ host( |$)/.test(c.candidate)) return;
       if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: c.toJSON() }));
       if (!l.described) return; // still to go in the description
-      if (!c) this.sendLate(l); // gathering is complete
-      else if (l.late.length < MAX_ICE_BATCH) l.late.push(c.toJSON());
+      if (!c) return void this.sendLate(l); // gathering complete: send what is buffered
+      if (l.lateSent + l.late.length >= MAX_LATE) return; // bounded
+      l.late.push(c.toJSON());
+      // The first batch waits for gathering to settle (describe()'s LATE_ICE_MS timer);
+      // a candidate found after that batch is sent LATE_FLUSH_MS later, so a slow public
+      // address (a device that gathered mDNS first) still reaches the peer.
+      if (l.lateSent > 0 && !l.lateTimer) l.lateTimer = setTimeout(() => this.sendLate(l), LATE_FLUSH_MS);
     };
     if (typeof pc.addEventListener === 'function') {
-      pc.addEventListener('iceconnectionstatechange', () => this.tr(peer, 'ice-state', { state: pc.iceConnectionState }));
+      pc.addEventListener('iceconnectionstatechange', () => {
+        this.tr(peer, 'ice-state', { state: pc.iceConnectionState });
+        this.iceChanged(l);
+      });
       pc.addEventListener('icecandidateerror', (e) => this.tr(peer, 'candidate-error', { url: e.url, code: e.errorCode, text: e.errorText, address: e.address }));
     }
     this.links.set(h, l);
@@ -191,9 +272,117 @@ export class WebRtcTransport {
 
   failed(l) {
     clearTimeout(l.timer);
+    if (l.opened) return this.restartSoon(l, 0); // was linked: try to get it back
     if (l.failed || l.dc.readyState === 'open' || this.links.get(l.handle) !== l) return;
     l.failed = true;
     this.onPeer(l.peer, 'failed');
+  }
+
+  // ICE state of a link whose DataChannel was open: connected again resets the
+  // restart count; 'disconnected' restarts after a grace, 'failed' at once.
+  iceChanged(l) {
+    if (!l.opened || this.links.get(l.handle) !== l) return;
+    const s = l.pc.iceConnectionState;
+    if (s === 'connected' || s === 'completed') {
+      clearTimeout(l.restartTimer);
+      l.restartTimer = null;
+      l.restarts = 0;
+    } else if (s === 'disconnected') this.restartSoon(l, RESTART_AFTER_MS);
+    else if (s === 'failed') this.restartSoon(l, 0);
+  }
+
+  // Restarts ICE on `l` in `ms`, unless one is already due (a sooner one wins).
+  restartSoon(l, ms) {
+    if (l.restartTimer && ms > 0) return;
+    clearTimeout(l.restartTimer);
+    l.restartTimer = setTimeout(() => {
+      l.restartTimer = null;
+      this.restartIce(l, 'ice');
+    }, ms);
+  }
+
+  // The network changed (a network switch, or back online): links that were open but
+  // whose ICE isn't connected now restart at once, rather than after the grace.
+  networkChanged() {
+    for (const l of this.links.values()) {
+      const s = l.pc.iceConnectionState;
+      if (l.opened && s !== 'connected' && s !== 'completed') this.restartSoon(l, 0);
+    }
+  }
+
+  // Renegotiates `l` with new ICE credentials, so ICE gathers again (new local
+  // addresses after a network change) and checks every pair afresh. The DataChannel
+  // and the Peerwire session over it carry on. Only the dialling side offers; the
+  // other asks it to with a 'restart' signal.
+  async restartIce(l, reason) {
+    if (!l.opened || this.links.get(l.handle) !== l || l.restarts >= MAX_RESTARTS) return;
+    clearTimeout(l.restartTimer);
+    l.restarts++;
+    const again = RESTART_AFTER_MS * 2 ** l.restarts; // if this one doesn't connect either
+    l.restartTimer = setTimeout(() => {
+      l.restartTimer = null;
+      const s = l.pc.iceConnectionState;
+      if (s !== 'connected' && s !== 'completed') this.restartIce(l, 'retry');
+    }, again);
+    this.tr(l.peer, 'ice-restart', { n: l.restarts, reason, dialer: l.dialer });
+    if (!l.dialer) return this.signal(l.peer, { kind: 'restart' });
+    this.restarts++;
+    try {
+      await l.pc.setLocalDescription(await l.pc.createOffer({ iceRestart: true }));
+    } catch {
+      return; // mid-negotiation or closed: the retry timer tries again
+    }
+    Object.assign(l, { described: false, late: [], lateSent: 0 });
+    clearTimeout(l.lateTimer);
+    await this.gathered(l.pc);
+    const p = this.offerProof ? await this.offerProof.sign(l.peer) : undefined;
+    if (this.links.get(l.handle) !== l) return;
+    l.offerMsg = { kind: 'offer', sdp: this.describe(l), p, restart: true, ...this.prediction(l) };
+    this.signal(l.peer, l.offerMsg);
+    this.tr(l.peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), restart: true });
+    this.resendOffer(l);
+  }
+
+  // Whether `l` sent an offer and waits for its answer.
+  awaiting(l) {
+    const st = l.pc.signalingState;
+    return st === undefined ? !l.pc.remoteDescription : st === 'have-local-offer';
+  }
+
+  // No answer yet: the offer (or the answer) was lost on the way; send it again.
+  resendOffer(l) {
+    for (const t of l.resends) clearTimeout(t);
+    const msg = l.offerMsg;
+    l.resends = OFFER_RESEND_MS.map((ms) => setTimeout(() => {
+      if (this.links.get(l.handle) !== l || l.offerMsg !== msg || !this.awaiting(l) || l.failed) return;
+      if (!msg.restart && l.dc.readyState === 'open') return;
+      this.resent++;
+      this.signal(l.peer, msg);
+      this.tr(l.peer, 'offer-sent', { ...candidateSummary(msg.sdp.sdp), resend: true, restart: !!msg.restart });
+    }, ms));
+  }
+
+  // Our NAT's port prediction, for a message carrying our description: { nat } when
+  // our server-reflexive candidates show a sequential symmetric NAT, else nothing.
+  prediction(l, extra = []) {
+    const sdp = [l.pc.localDescription?.sdp ?? '', ...extra.map((c) => `a=${c.candidate}`)].join('\n');
+    const nat = natFromSdp(sdp);
+    return nat.next ? { nat: { ip: nat.ip, next: nat.next, step: nat.step } } : {};
+  }
+
+  // A peer's prediction came: unless our own NAT is symmetric (each probe would cost
+  // it a port, and its own mapping isn't the one the peer saw), add candidates at the
+  // ports around it, once per prediction.
+  async guess(l, nat) {
+    const p = checkPrediction(nat);
+    if (!p || !l.pc.remoteDescription || this.privacy === 'relay-only') return;
+    const key = `${p.ip}:${p.next}:${p.step}`;
+    if (l.guessed === key || natFromSdp(l.pc.localDescription?.sdp).type === 'symmetric') return;
+    l.guessed = key;
+    const mid = /^a=mid:(\S+)/m.exec(l.pc.remoteDescription.sdp ?? '')?.[1] ?? '0';
+    const cands = predictedCandidates(p, mid);
+    this.tr(l.peer, 'guesses', { ip: p.ip, next: p.next, step: p.step, n: cands.length });
+    await this.addCandidates(l, cands);
   }
 
   // Whether WebRTC (which hands the peer our addresses) may run with `peer`.
@@ -232,14 +421,20 @@ export class WebRtcTransport {
     return d;
   }
 
-  // Sends the candidates found after the description, once.
+  // Sends the late candidates buffered in `l.late` as an 'ice-batch', clearing it.
+  // Called when gathering completes, when the first batch is due (LATE_ICE_MS), and
+  // on the debounce after a later candidate, so candidates that arrive after the
+  // first batch are sent too, not lost. At most MAX_ICE_BATCH per batch (the receiver
+  // refuses more); the rest go next tick.
   sendLate(l) {
     clearTimeout(l.lateTimer);
-    if (l.lateSent || this.links.get(l.handle) !== l) return;
-    l.lateSent = true;
-    if (!l.late.length) return;
-    this.signal(l.peer, { kind: 'ice-batch', c: l.late });
-    this.tr(l.peer, 'ice-batch-sent', candidateSummary(l.late.map((c) => `a=${c.candidate}`).join('\n')));
+    l.lateTimer = null;
+    if (this.links.get(l.handle) !== l || !l.late.length) return;
+    const batch = l.late.splice(0, MAX_ICE_BATCH);
+    l.lateSent += batch.length;
+    this.signal(l.peer, { kind: 'ice-batch', c: batch, ...this.prediction(l, batch) });
+    this.tr(l.peer, 'ice-batch-sent', { ...candidateSummary(batch.map((c) => `a=${c.candidate}`).join('\n')), more: l.late.length > 0 });
+    if (l.late.length) l.lateTimer = setTimeout(() => this.sendLate(l), 0);
   }
 
   // Opens a DataChannel to `peer` and, once open, runs the Peerwire handshake.
@@ -253,19 +448,11 @@ export class WebRtcTransport {
     await this.gathered(l.pc);
     const p = this.offerProof ? await this.offerProof.sign(peer) : undefined;
     if (this.links.get(l.handle) !== l) return; // dropped meanwhile
-    l.offerMsg = { kind: 'offer', sdp: this.describe(l), p };
+    l.offerMsg = { kind: 'offer', sdp: this.describe(l), p, ...this.prediction(l) };
     this.signal(peer, l.offerMsg);
     this.tr(peer, 'offer-sent', candidateSummary(l.offerMsg.sdp.sdp));
     this.watch(l);
-    // No answer yet: the offer (or the answer) was lost on the way; send it again.
-    for (const ms of OFFER_RESEND_MS) {
-      l.resends.push(setTimeout(() => {
-        if (this.links.get(l.handle) !== l || l.pc.remoteDescription || l.failed || l.dc.readyState === 'open') return;
-        this.resent++;
-        this.signal(peer, l.offerMsg);
-        this.tr(peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), resend: true });
-      }, ms));
-    }
+    this.resendOffer(l);
   }
 
   async onSignal(from, msg) {
@@ -317,17 +504,19 @@ export class WebRtcTransport {
         if (fresh && this.links.get(l.handle) === l) this.drop(from);
         return void this.badSignals++;
       }
-      this.tr(from, 'offer-received', candidateSummary(sdp));
+      this.tr(from, 'offer-received', { ...candidateSummary(sdp), restart: !fresh });
       await this.addHeld(l);
+      if (!fresh) Object.assign(l, { described: false, late: [], lateSent: 0 });
       await this.gathered(l.pc);
       if (this.links.get(l.handle) !== l) return; // dropped meanwhile
-      l.answerMsg = { kind: 'answer', sdp: this.describe(l) };
+      l.answerMsg = { kind: 'answer', sdp: this.describe(l), ...this.prediction(l) };
       this.signal(from, l.answerMsg);
-      this.tr(from, 'answer-sent', candidateSummary(l.answerMsg.sdp.sdp));
-      this.watch(l);
+      this.tr(from, 'answer-sent', { ...candidateSummary(l.answerMsg.sdp.sdp), restart: !fresh });
+      if (fresh) this.watch(l);
+      await this.guess(l, msg.nat);
     } else if (msg.kind === 'answer') {
       const l = this.link(from);
-      if (l.pc.remoteDescription) return; // a copy of one already applied
+      if (!this.awaiting(l)) return; // a copy of one already applied
       try {
         await l.pc.setRemoteDescription(msg.sdp);
       } catch {
@@ -336,6 +525,11 @@ export class WebRtcTransport {
       }
       this.tr(from, 'answer-received', candidateSummary(msg.sdp?.sdp));
       await this.addHeld(l);
+      await this.guess(l, msg.nat);
+    } else if (msg.kind === 'restart') {
+      // The other side lost ICE: as the dialling side, renegotiate (within the limit).
+      const l = this.links.get(this.byPeer.get(from));
+      if (l.dialer) this.restartIce(l, 'asked');
     } else if (msg.kind === 'ice' || msg.kind === 'ice-batch') {
       const cands = msg.kind === 'ice' ? [msg.candidate] : msg.c;
       if (!Array.isArray(cands) || cands.length > MAX_ICE_BATCH) return void this.badSignals++;
@@ -344,6 +538,7 @@ export class WebRtcTransport {
       // Candidates can overtake the description they belong to: hold them until it comes.
       if (!l.pc.remoteDescription) return void l.held.push(...cands.slice(0, MAX_ICE_BATCH - l.held.length));
       await this.addCandidates(l, cands);
+      if (msg.kind === 'ice-batch') await this.guess(l, msg.nat);
     }
   }
 
@@ -483,6 +678,8 @@ export class WebRtcTransport {
   shut(l) {
     clearTimeout(l.timer);
     clearTimeout(l.lateTimer);
+    clearTimeout(l.restartTimer);
+    l.opened = false; // no restart for a link we closed
     for (const t of l.resends) clearTimeout(t);
     l.dc.onclose = null;
     l.pc.onconnectionstatechange = null;

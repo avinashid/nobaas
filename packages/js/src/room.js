@@ -188,6 +188,11 @@ export class Room {
       for (const end = performance.now() + PAGEHIDE_GRACE_MS; linked && performance.now() < end;);
     };
     globalThis.addEventListener?.('pagehide', this.onPageHide);
+    // A network switch: links whose ICE dropped restart it now (only those, so a new
+    // speed estimate, which fires 'change' too, costs nothing).
+    this.onNetwork = () => this.transport.networkChanged?.();
+    globalThis.addEventListener?.('online', this.onNetwork);
+    globalThis.navigator?.connection?.addEventListener?.('change', this.onNetwork);
   }
 
   get peers() {
@@ -285,6 +290,8 @@ export class Room {
     clearInterval(this.helloTimer);
     clearTimeout(this.flushTimer);
     globalThis.removeEventListener?.('pagehide', this.onPageHide);
+    globalThis.removeEventListener?.('online', this.onNetwork);
+    globalThis.navigator?.connection?.removeEventListener?.('change', this.onNetwork);
     const bye = Uint8Array.of(T.Bye);
     for (const p of this.linked) this.endpoint.send(p, bye, Lane.Unreliable);
     this.endpoint.pump();

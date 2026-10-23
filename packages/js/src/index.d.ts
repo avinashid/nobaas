@@ -266,6 +266,18 @@ export declare function toHex(bytes: Uint8Array): string;
 export declare function withoutHostCandidates(sdp: string): string;
 /** Counts an SDP's ICE candidates by type and family; `mdns` are host candidates named `*.local`. */
 export declare function candidateSummary(sdp: string): { host4: number; host6: number; mdns: number; srflx4: number; srflx6: number; prflx: number; relay: number };
+/** A NAT as the server-reflexive candidates in an SDP show it; a sequential symmetric one comes with its prediction. */
+export interface NatInfo {
+  type: 'symmetric' | 'cone' | 'unknown';
+  /** With `next` and `step`: the NAT's public IPv4 address, its likely next port, and the step between ports. */
+  ip?: string;
+  next?: number;
+  step?: number;
+}
+/** What the server-reflexive candidates in an SDP (or candidate lines) say about the NAT. */
+export declare function natFromSdp(sdp: string): NatInfo;
+/** ICE candidates at the ports around a peer's prediction, to add with `addIceCandidate`; `[]` if it doesn't check out. */
+export declare function predictedCandidates(nat: { ip: string; next: number; step: number }, sdpMid?: string): RTCIceCandidateInit[];
 export declare function fromHex(hex: string): Uint8Array;
 /** Whether `id` is a PeerId as text: 64 lowercase hex characters. Check ids from signalling with it. */
 export declare function isPeerId(id: unknown): id is PeerId;
@@ -285,7 +297,7 @@ export declare class WebRtcTransport implements Transport {
     signaling: SignalingAdapter,
     options?: {
       iceServers?: RTCIceServer[];
-      onPeer?: (peer: PeerId, state: 'open' | 'closed') => void;
+      onPeer?: (peer: PeerId, state: 'open' | 'closed' | 'failed') => void;
       loss?: number;
       trickle?: boolean;
       /** `'relay-only'` needs `relay`: WebRTC then runs only with that peer. */
@@ -309,12 +321,21 @@ export declare class WebRtcTransport implements Transport {
   readonly badSignals: number;
   /** Offers sent again for want of an answer, and answers sent again for a repeated offer. */
   readonly resent: number;
+  /** ICE restarts begun as the dialling side (a link that was open lost ICE). */
+  readonly restarts: number;
   /**
    * Diagnostics: called for each link's signalling (`offer-sent`, `offer-received`, `answer-sent`, `answer-received`,
-   * `ice-batch-sent`, `ice-batch-received`, with `candidateSummary` counts and `resend: true` on a copy) and ICE
-   * (`ice-state` with `state`, `candidate-error` with the STUN server `url`, `code`, `text`, `address`).
+   * `ice-batch-sent`, `ice-batch-received`, with `candidateSummary` counts, `resend: true` on a copy and
+   * `restart: true` for an ICE restart), ICE (`ice-state` with `state`, `candidate-error` with the STUN server `url`,
+   * `code`, `text`, `address`, `ice-restart` with `n`, `reason`, `dialer`) and port prediction (`guesses` with the
+   * peer's `ip`, `next`, `step` and the `n` candidates added).
    */
   trace: ((peer: PeerId, what: string, detail: Record<string, unknown>) => void) | null;
+  /**
+   * The network changed: links that were open but whose ICE isn't connected restart ICE now, rather than after
+   * the 2 s grace. `joinRoom` calls it on `online` and on a `navigator.connection` change.
+   */
+  networkChanged(): void;
   dial(peer: PeerId): Promise<void>;
   has(peer: PeerId): boolean;
   drop(peer: PeerId): void;
