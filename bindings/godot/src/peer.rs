@@ -105,6 +105,39 @@ impl PeerwireMultiplayerPeer {
         })
     }
 
+    /// The `ip:port` a direct link to peer `id` goes to (`[…]:port` for IPv6),
+    /// `""` if the link goes through a relay or `id` isn't linked.
+    #[func]
+    fn get_peer_address(&self, id: i32) -> GString {
+        match self.session.as_ref().and_then(|s| s.direct_address(id)) {
+            Some(a) => GString::from(a.to_string().as_str()),
+            None => GString::new(),
+        }
+    }
+
+    /// Whether the direct link to peer `id` came from a birthday punch: this
+    /// side's NAT gives a random port per destination, so it opened many sockets,
+    /// the peer's probes reached one, and the link goes out of it. The peer, which
+    /// probed, sees `false` here and its probes in `get_punch_stats()`.
+    #[func]
+    fn is_peer_via_birthday(&self, id: i32) -> bool {
+        self.session.as_ref().is_some_and(|s| s.via_birthday(id))
+    }
+
+    /// Hole-punching counters since `host` / `join`: `punches_sent`,
+    /// `punch_succeeded` (relayed links moved to direct), `punch_failed`,
+    /// `birthday_sockets` (sockets this side opened for birthday punching) and
+    /// `birthday_probes` (probes this side sent to a peer's ports for one).
+    #[func]
+    fn get_punch_stats(&self) -> VarDictionary {
+        let [sent, succeeded, failed, sockets, probes] = self.session.as_ref().map_or([0; 5], Session::punch_stats);
+        let n = |v: u64| v as i64;
+        vdict! {
+            "punches_sent" => n(sent), "punch_succeeded" => n(succeeded), "punch_failed" => n(failed),
+            "birthday_sockets" => n(sockets), "birthday_probes" => n(probes),
+        }
+    }
+
     /// Every address: the lowest latency, and LAN play.
     #[constant]
     const PRIVACY_DIRECT: i32 = 0;

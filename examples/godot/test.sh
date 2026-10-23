@@ -39,6 +39,7 @@ run() {
     wait $host || st=$?
     host=
     grep -q "^port mapping: off$" "$tmp/$name-host.log" || { echo "$name: no 'port mapping: off' line"; st=1; }
+    grep -q "^route to peer 1: direct to " "$tmp/$name-join.log" || { echo "$name: no direct route line"; st=1; }
     echo "--- $name: host";   cat "$tmp/$name-host.log"
     echo "--- $name: joiner"; cat "$tmp/$name-join.log"
     [ $st -eq 0 ] && echo "$name: PASS" || echo "$name: FAIL"
@@ -64,7 +65,7 @@ run relay-peer --host-room="$room-r" --stun=none --relay="$url" "$via" -- --join
 for side in host join; do
     grep -q "^relay peers: 1 linked$" "$tmp/relay-peer-$side.log" || { echo "relay-peer: $side never linked the relay peer"; status=1; }
 done
-grep -q "^route to peer 1: direct$" "$tmp/relay-peer-join.log" || { echo "relay-peer: no direct route to the host"; status=1; }
+grep -q "^route to peer 1: direct to " "$tmp/relay-peer-join.log" || { echo "relay-peer: no direct route to the host"; status=1; }
 
 [ $status -eq 0 ] && echo "PASS" || echo "FAIL"
 exit $status

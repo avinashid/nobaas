@@ -10,8 +10,9 @@ extends Node2D
 ## which addresses this peer gives out; `--port-mapping` asks the router to forward
 ## a port (off by default; the state line shows how it went); `--relay-peer=pw:…[,…]`
 ## keeps a link to always-on relay peers (`peerwire-peer`), through which two
-## players link when their NATs can't be punched (the log says whether each link
-## is direct or through a relay). Both move by themselves, chat, and
+## players link when their NATs can't be punched. The log says whether each link
+## is direct (and to which address, and whether a birthday punch made it) or
+## through a relay. Headless, both move by themselves, chat, and
 ## quit with 0 once they have seen another peer's square move and its chat line,
 ## or 1 on timeout.
 
@@ -34,8 +35,12 @@ var done_at := -1.0
 var elapsed := 0.0
 var nat_logged := false
 var relays_linked := -1
-## Godot peer id -> "direct" or "relay", as last logged.
+## Godot peer id -> its route line, as last logged.
 var routes := {}
+## Birthday punch sockets this side has opened, as last logged.
+var birthday_sockets := 0
+## Whether this side's birthday probing has been logged.
+var probing := false
 
 
 func _ready() -> void:
@@ -208,19 +213,44 @@ func _process(delta: float) -> void:
 		get_tree().quit(1)
 
 
-## Logs how many relay peers are linked, and each link's route, when they change.
+## Logs how many relay peers are linked, each link's route (and whether a birthday
+## punch made it), and a birthday punch starting on this side, when they change.
 func _log_links() -> void:
-	if not multiplayer.has_multiplayer_peer() or not args.has("relay-peer"):
+	if not multiplayer.has_multiplayer_peer():
 		return
-	var linked := peer.get_relay_peers_linked()
-	if linked != relays_linked:
-		relays_linked = linked
-		_log("relay peers: %d linked" % linked)
+	if args.has("relay-peer"):
+		var linked := peer.get_relay_peers_linked()
+		if linked != relays_linked:
+			relays_linked = linked
+			_log("relay peers: %d linked" % linked)
+	var stats := peer.get_punch_stats()
+	if stats["birthday_sockets"] != birthday_sockets:
+		birthday_sockets = stats["birthday_sockets"]
+		_log("birthday punch: this side opened %d sockets for the peer to find" % birthday_sockets)
+	if not probing and stats["birthday_probes"] > 0:
+		probing = true
+		_log("birthday punch: this side is probing the peer's ports")
 	for id in multiplayer.get_peers():
-		var route := peer.get_peer_route(id)
-		if not route.is_empty() and routes.get(id, "") != route:
-			routes[id] = route
-			_log("route to peer %d: %s" % [id, "direct" if route == "direct" else "through a relay"])
+		var line := _route_line(id, stats)
+		if not line.is_empty() and routes.get(id, "") != line:
+			routes[id] = line
+			_log("route to peer %d: %s" % [id, line])
+
+
+## "through a relay", "direct to ADDRESS" and, if a birthday punch made the link,
+## which side's part of it shows here; "" if `id` isn't linked.
+func _route_line(id: int, stats: Dictionary) -> String:
+	match peer.get_peer_route(id):
+		"relay":
+			return "through a relay"
+		"direct":
+			var line := "direct to %s" % peer.get_peer_address(id)
+			if peer.is_peer_via_birthday(id):
+				return line + " (birthday punch worked: over one of this side's birthday sockets)"
+			if stats["birthday_probes"] > 0:
+				return line + " (this side probed for a birthday punch)"
+			return line
+	return ""
 
 
 func _other_square_moved() -> bool:
