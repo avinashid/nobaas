@@ -10,11 +10,14 @@
 //   channel closes, the link falls back to the member (the endpoint's direct timeout);
 // - only one end adopts: false after CARRY_WAIT_MS, the route unchanged, the channel
 //   left open to the caller; a channel that closes while waiting: false;
-// - a link that is direct already: false, at once.
+// - a link that is direct already: false, at once;
+// - while the endpoint's path still names a relayed channel that just closed, the old
+//   WebRTC link to the peer closing doesn't drop it (NB48b-5);
+// - 500 CARRY get a handful of CARRIED, none past the buffer cap (NB48b-6).
 //
 //   node packages/js/test/room_adopt.mjs
 import { joinRoom } from '../src/index.js';
-import { CARRY_WAIT_MS } from '../src/webrtc.js';
+import { CARRY, CARRIED, CARRY_EVERY_MS, CARRY_WAIT_MS, MAX_BUFFERED } from '../src/webrtc.js';
 
 const fail = (m) => {
   console.error(`FAIL ${m}`);
@@ -191,6 +194,29 @@ block('a1', 'b1');
   const t2 = Date.now();
   if ((await a.adoptChannel(b.self, s.pc, s.dc)) !== false || Date.now() - t2 > 2000) fail('a channel closed while waiting was not refused promptly');
   console.log('a channel closed while waiting: false at once');
+
+  // 5. A CARRY flood (NB48b-6): a handful of CARRIED, at most one per CARRY_EVERY_MS,
+  // sent through dcSend, so none goes past the buffer cap.
+  const [f, g] = punched();
+  let replies = 0;
+  g.dc.onmessage = (e) => {
+    const v = new Uint8Array(e.data);
+    if (v.length === 1 && v[0] === CARRIED) replies++;
+  };
+  const adopted = a.transport.adopt(b.self, f.pc, f.dc);
+  for (let i = 0; i < 500; i++) g.dc.send(Uint8Array.of(CARRY));
+  if ((await adopted) < 0) fail('the flooded channel was not adopted');
+  await sleep(100);
+  if (replies > 3) fail(`500 CARRY got ${replies} CARRIED`);
+  const flood = replies;
+  await sleep(CARRY_EVERY_MS);
+  const congested = a.transport.congested;
+  f.dc.bufferedAmount = MAX_BUFFERED + 1;
+  for (let i = 0; i < 50; i++) g.dc.send(Uint8Array.of(CARRY));
+  await sleep(100);
+  if (replies !== flood || a.transport.congested === congested) fail(`with the buffer full, ${replies - flood} CARRIED went out (congested ${a.transport.congested - congested})`);
+  console.log(`a CARRY flood: 500 in, ${flood} CARRIED out; with the buffer full, none`);
+  f.pc.close();
   await Promise.all([a.leave(), b.leave()]);
 }
 
@@ -219,14 +245,27 @@ block('a2', 'b2');
   console.log(`relayed by c: both ends adopted, the endpoints punched over the channel and moved; 50 messages, c relayed none (punches ${a.stats().punchSucceeded}/${b.stats().punchSucceeded} succeeded)`);
   // The channel closes: the endpoint sees the direct path gone and goes back to c.
   const t0 = Date.now();
+  const left = [];
+  for (const r of [a, b]) r.on('peer-leave', (p, why) => left.push(why));
   y.pc.close();
-  await until('the routes back through c', () => a.route(b.self)?.kind === 'peer' && b.route(a.self)?.kind === 'peer', 30000);
+  // NB48b-5: until its direct timeout the endpoint's path still names the closed channel,
+  // so the route says direct; the old, failed WebRTC link to the peer closing now must
+  // not drop it.
+  await until('both channels gone', () => !a.transport.carrier(b.self) && !b.transport.carrier(a.self), 3000);
+  for (const [r, p] of [[a, b.self], [b, a.self]]) {
+    if (r.route(p)?.kind !== 'direct' || r.route(p).adopted) fail(`not in the stale window: ${JSON.stringify(r.route(p))}`);
+    const old = r.transport.links.get(r.transport.byPeer.get(p));
+    if (!old?.dc.onclose) fail('no old WebRTC link to close');
+    old.dc.onclose();
+  }
+  await until('the routes back through c', () => left.length || (a.route(b.self)?.kind === 'peer' && b.route(a.self)?.kind === 'peer'), 30000);
+  if (left.length) fail(`the old WebRTC link closing dropped the peer (${left})`);
   const back = [];
   a.on('message', (m) => back.push(m));
   b.send('relayed again', { to: a.self });
   await until('a message through c again', () => back.includes('relayed again'), 10000);
-  if ([a, b, c].some((r) => r.peers.length !== 2)) fail('a peer left when the channel closed');
-  console.log(`relayed by c: the channel closed, the link was back through c in ${Date.now() - t0} ms and carried on`);
+  if ([a, b, c].some((r) => r.peers.length !== 2) || left.length) fail(`a peer left when the channel closed (${left})`);
+  console.log(`relayed by c: the channel closed, the old WebRTC links closed too, the link was back through c in ${Date.now() - t0} ms and carried on`);
   await Promise.all([a.leave(), b.leave(), c.leave()]);
 }
 

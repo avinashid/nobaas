@@ -100,6 +100,37 @@ try {
   });
   ok(running === 1, `a refused punch keeps the one slot: ${running} running (NB48b-2)`);
 
+  // An accepted invite whose buffered offer openFleet refuses fails at once and frees the
+  // slot (not after the 70 s timer, with an unhandled rejection). Tab 0 plays a hostile
+  // easy side to the idle third tab: an invite, then an offer that isn't SDP.
+  const [t0, t1] = await Promise.all(pages.map((p) => p.evaluate(() => window.netlab.self)));
+  await third.waitForFunction((ids) => ids.every((id) => window.netlab.peers().some((p) => p.id === id)), [t0, t1], { timeout: 40000 });
+  await pages[0].evaluate(async (to) => {
+    const { Room } = await import('/src/room.js');
+    const send = Room.prototype.send;
+    const room = await new Promise((resolve) => {
+      Room.prototype.send = function (...a) {
+        Room.prototype.send = send;
+        resolve(this);
+        return send.apply(this, a);
+      };
+    });
+    room.send({ t: 'bday', step: 'start', yourRole: 'hard' }, { to });
+    room.send({ t: 'bday', step: 'offer', sdp: 'v=0 not an offer', addr: '203.0.113.9:40000' }, { to });
+  }, await third.evaluate(() => window.netlab.self));
+  await third.waitForFunction((id) => window.netlab.birthday().find((b) => b.id === id)?.status === 'invited', t0, { timeout: 20000 });
+  await third.waitForTimeout(500); // the offer follows the invite on the same reliable lane
+  await third.click(`#peers [data-bday="${t0}"]`); // the user accepts
+  await third.waitForFunction((id) => window.netlab.birthday().find((b) => b.id === id)?.status !== 'running', t0, { timeout: 10000 }).catch(() => {});
+  const refused = await third.evaluate((id) => window.netlab.birthday().find((b) => b.id === id), t0);
+  const unhandled = await third.evaluate(() => [...document.querySelectorAll('#log div')].filter((d) => /unhandled/.test(d.textContent)).length);
+  ok(refused.status === 'failed' && /^error: /.test(refused.why) && !unhandled, `a bad buffered offer fails the accepted punch at once: ${refused.status} (${refused.why ?? ''}), ${unhandled} unhandled`);
+  const next = await third.evaluate(async (id) => {
+    await window.netlab.punch(window.netlab.peers().findIndex((p) => p.id === id));
+    return window.netlab.birthday().find((b) => b.id === id);
+  }, t1);
+  ok(next.status === 'running', `and its slot is free: a punch with another peer runs (${next.status}${next.why ? `: ${next.why}` : ''})`);
+
   if (errors.length) throw new Error(`page errors: ${errors.join('; ')}`);
 } catch (e) {
   ok(false, e.stack ?? String(e));

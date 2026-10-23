@@ -173,8 +173,8 @@ export class Room {
     this.routes = new Map(); // linked peer -> { kind: 'direct' | 'peer' | 'signaling', via?, adopted? }
     this.paths = new Map(); // linked peer -> the endpoint's path to it
     this.fallingBack = new Set(); // peers we dial by fallback since WebRTC failed
-    this.transport = makeTransport((peer, state) => {
-      if (state === 'closed') this.rtcClosed(peer);
+    this.transport = makeTransport((peer, state, handle) => {
+      if (state === 'closed') this.rtcClosed(peer, handle);
       else if (state === 'failed') this.rtcFailed(peer);
       else if (state === 'carrier') this.reroute(peer);
     });
@@ -465,10 +465,13 @@ export class Room {
   }
 
   // A DataChannel closed: the peer is lost if that was its path, or if no fallback
-  // is under way; otherwise only the WebRTC link goes.
-  rtcClosed(peer) {
+  // is under way; otherwise only the WebRTC link goes. `handle`, the closed link's: a
+  // link that isn't the peer's path now (an old one, while the path still names a
+  // relayed channel that just ended, say) never drops the peer (NB48b-5).
+  rtcClosed(peer, handle) {
     const r = this.routes.get(peer);
-    if (r ? r.kind !== 'direct' || r.adopted : this.fallingBack.has(peer)) return this.transport.dropRtc(peer);
+    const stale = handle !== undefined && this.paths.get(peer)?.direct !== handle;
+    if (r ? r.kind !== 'direct' || r.adopted || stale : this.fallingBack.has(peer)) return this.transport.dropRtc(peer);
     this.lost(peer, 'closed');
   }
 

@@ -64,7 +64,8 @@ export const GUESS_BEFORE = 4;
 export const GUESS_AFTER = 27;
 // adopt(): a DataChannel made outside the transport carries a link only once both
 // ends adopt it. Each end sends CARRY every CARRY_EVERY_MS until it hears from the
-// other, and answers every CARRY with CARRIED (which gets no answer). These are
+// other, and answers a CARRY with CARRIED (which gets no answer), at most once per
+// CARRY_EVERY_MS, so a flood of CARRY gets a trickle of replies. These are
 // one-byte messages, which no Peerwire datagram is. Without a word from the far end
 // in CARRY_WAIT_MS, the channel is left to the caller.
 export const CARRY = 1;
@@ -161,8 +162,9 @@ export class WebRtcTransport {
   // `offerProof`: { sign(to), check(from, p) }, both async. Offers carry
   //   `p: await sign(to)`, and an offer is answered (with our addresses) only if
   //   check(from, p) holds. joinRoom passes a room-key proof (see proof.js).
-  // `onPeer(peer, state)`: 'open' and 'closed' for a DataChannel, and 'failed' once
-  //   when one isn't open `fallbackMs` after its offer or answer (or ICE failed).
+  // `onPeer(peer, state, handle)`: 'open' and 'closed' for a DataChannel (with its
+  //   link's endpoint handle), and 'failed' once when one isn't open `fallbackMs`
+  //   after its offer or answer (or ICE failed).
   // `pipes`: carry datagrams over signalling for peers allowed with allowPipe().
   // `trace(peer, what, detail)`, settable later: diagnostics of each link's
   //   signalling ('offer-sent', 'offer-received', 'answer-sent', 'answer-received',
@@ -250,7 +252,7 @@ export class WebRtcTransport {
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed') this.failed(l);
     };
-    dc.onclose = () => this.onPeer(peer, 'closed');
+    dc.onclose = () => this.onPeer(peer, 'closed', h);
     // Binary datagrams only: a string message would become a length in new Uint8Array(string).
     dc.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer && e.data.byteLength <= MAX_DATAGRAM) this.ep.receive(h, new Uint8Array(e.data));
@@ -697,16 +699,10 @@ export class WebRtcTransport {
     if (!isPeerId(peer) || dc?.readyState !== 'open' || (pipe && ph === undefined)) return Promise.resolve(-1);
     this.dropCarrier(peer);
     const handle = this.nextHandle++;
-    const c = { peer, pc, dc, handle, addr: pipe ? ph : handle, live: false, end: null };
+    const c = { peer, pc, dc, handle, addr: pipe ? ph : handle, live: false, end: null, replied: -Infinity };
     this.carriers.set(peer, c);
     dc.binaryType = 'arraybuffer';
-    const say = (b) => {
-      try {
-        dc.send(Uint8Array.of(b));
-      } catch {
-        // closing: onclose follows
-      }
-    };
+    const say = (b) => this.dcSend(dc, Uint8Array.of(b)); // bounded like any datagram; closing: onclose follows
     return new Promise((resolve) => {
       const every = setInterval(() => say(CARRY), CARRY_EVERY_MS);
       const wait = setTimeout(() => c.end(), CARRY_WAIT_MS);
@@ -735,7 +731,10 @@ export class WebRtcTransport {
         // Anything from the far end means it adopted its end too.
         if (!c.live) settle(true);
         if (b.length !== 1) return this.ep.receive(c.addr, b);
-        if (b[0] === CARRY) say(CARRIED);
+        if (b[0] === CARRY && Date.now() - c.replied >= CARRY_EVERY_MS) {
+          c.replied = Date.now();
+          say(CARRIED);
+        }
       };
       say(CARRY);
     });

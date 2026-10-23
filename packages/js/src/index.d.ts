@@ -307,8 +307,9 @@ export declare class WebRtcTransport implements Transport {
     signaling: SignalingAdapter,
     options?: {
       iceServers?: RTCIceServer[];
-      /** `'carrier'`: an adopted channel started or stopped carrying the peer's link (see `adopt`). */
-      onPeer?: (peer: PeerId, state: 'open' | 'closed' | 'failed' | 'carrier') => void;
+      /** `'carrier'`: an adopted channel started or stopped carrying the peer's link (see `adopt`). With
+       * `'closed'`, `handle` is the closed link's endpoint handle. */
+      onPeer?: (peer: PeerId, state: 'open' | 'closed' | 'failed' | 'carrier', handle?: number) => void;
       loss?: number;
       trickle?: boolean;
       /** `'relay-only'` needs `relay`: WebRTC then runs only with that peer. */
