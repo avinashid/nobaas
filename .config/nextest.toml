@@ -9,5 +9,8 @@ fail-fast = false
 # The slowest tests (5-18 s each) start first, so none of them is left running alone at the end. A renamed test
 # just loses its place in the queue.
 [[profile.gate.overrides]]
-filter = 'test(/overloaded_super_peer_degrades|worker_stopped_mid_upnp_chain|islands_survive_a_super_peer_dying|fuzz_hostile_peer|fuzz_sealed|fuzz_the_c_abi/)'
+filter = '''
+  test(overloaded_super_peer_degrades) | test(worker_stopped_mid_upnp_chain) | test(islands_survive_a_super_peer_dying)
+  | test(fuzz_hostile_peer) | test(fuzz_sealed) | test(fuzz_the_c_abi)
+'''
 priority = 100

@@ -8,8 +8,8 @@
 #                               the lead's one full run on the merged main, before a push
 #   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch relay.damus.io, nos.lol, relay.primal.net,
 #                               public STUN)
-#   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are skipped
-#                               when every file changed since GATE_BASE is JS, docs or another non-Rust path
+#   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are
+#                               skipped when every file changed since GATE_BASE is JS, docs or another non-Rust path
 #
 # Order: the builds first (wasm, clippy, the Rust tests with --no-run). Then the Rust tests run beside the Node tests
 # (GATE_JOBS at a time) and, once those are done, beside the browser tests (one at a time). The Rust tests run under
@@ -99,7 +99,9 @@ step() {
   "$@" >"$f.log" 2>&1 </dev/null
   case "$?/$1" in
     0/*) ;;
-    124/timeout|137/timeout) r=FAIL; echo "gate: no exit after GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT}s, killed" >>"$f.log" ;;
+    124/timeout|137/timeout)
+      r=FAIL
+      echo "gate: no exit after GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT}s, killed" >>"$f.log" ;;
     *) r=FAIL ;;
   esac
   echo "$r  $name ($((SECONDS - t0))s)" >"$f.res"
