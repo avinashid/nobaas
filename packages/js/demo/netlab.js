@@ -480,6 +480,7 @@ const SIG_TEXT = {
   'ice-batch-sent': (d) => `late addresses sent (${addrText(d)})`,
   'ice-batch-received': (d) => `late addresses received (${addrText(d)})`,
   'ice-state': (d) => `ICE ${d.state}`,
+  'same-nat': (d) => `same public IP as us (${d.ip}): falling back after ${secs(d.ms)} unless a direct path opens first`,
 };
 
 // The WebRTC transport's diagnostics for one link.
@@ -1084,7 +1085,7 @@ async function render() {
       relayHtml += `<dl style="margin-top:8px"><dt>Events</dt><dd>${s.published} sent · ${s.received} received${s.rejected ? ` · <span class="warn">${s.rejected} refused</span>` : ''}</dd>
         <dt>Reconnects</dt><dd>${s.reconnects ?? 0}${s.backoffs ? ` · <span class="warn">${s.backoffs} rate-limit pauses</span>` : ''}</dd>`;
       const piped = room.transport?.piped;
-      if (piped) relayHtml += `<dt>Fallback route</dt><dd>${piped.sent} batches sent · ${piped.received} datagrams received${piped.dropped ? ` · ${piped.dropped} dropped` : ''}</dd>`;
+      if (piped) relayHtml += `<dt>Fallback route</dt><dd>${piped.sent} batches sent · ${piped.received} datagrams received${piped.dropped ? ` · ${piped.dropped} dropped` : ''}${piped.stale ? ` · ${piped.stale} late (the WebRTC link took over)` : ''}</dd>`;
       const tr = room.transport;
       if (tr) relayHtml += `<dt>WebRTC signals</dt><dd>${tr.resent ?? 0} resent · ${tr.restarts ?? 0} ICE restarts${tr.badSignals ? ` · ${tr.badSignals} refused` : ''}</dd>`;
       relayHtml += '</dl>';
