@@ -60,7 +60,7 @@ that needs a change is tracked as an NB card.
 | Finding | Status |
 |---|---|
 | SEC-1 (High) | **Fixed** in NB-021 (`ccc3b79`), with its review findings N21-1 and N21-2 |
-| SEC-2 (Medium) | Narrowed by NB-031/NB-037: hellos need the room key; PeerId still readable by name holders |
+| SEC-2 (Medium) | **Fixed in JS** (NB-022): hello body encrypted to the room; Rust hello still cleartext (follow-up) |
 | SEC-3 (Medium) | Fixed for rooms (NB-031 Rust, NB-037 JS); open for a bare `WebRtcTransport` |
 | SEC-4…SEC-8 | Open (NB-024…NB-028) |
 | SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
@@ -137,13 +137,26 @@ hello and exchange the real PeerId inside the sealed channel; (c) at minimum
 document that room membership reveals every member's identity to anyone who knows
 the room name, so room names must be treated as secrets.
 
-**Status: narrowed, open (NB-022).** Since NB-031 (Rust) and NB-037 (JS) a room
-key, separate from the topic, is derived from the name, and a hello is acted on
-only with its HMAC proof, so someone without the name can no longer get dialled.
-But the JS hello still carries `from` in plain base64, and the topic is an
-unsalted hash of the name, so anyone who knows or guesses the name still reads
-every member's PeerId. Option (c) is done: the docs say private room names need
-at least 128 random bits (`randomRoomId()` in JS). Options (a)/(b) are not.
+**Status: fixed in JS (NB-022); Rust hello open.** Two earlier steps narrowed it:
+NB-031 (Rust) and NB-037 (JS) derive a room key, separate from the topic, from the
+name, and a hello is acted on only with its HMAC proof, so someone without the name
+can no longer get dialled. NB-022 then closes the disclosure itself for JS: the
+`hello` body is encrypted with AES-GCM under a key derived from the name
+(`sha256("peerwire/room-enc/<room>")`, a 12-byte random nonce per hello), so the
+PeerId is no longer in the clear. A relay operator, or anyone who only observes the
+traffic, now sees a ciphertext under an unsalted topic hash and learns neither the
+PeerId nor that it is a hello; only someone who already knows the room name — the
+same bar as computing the topic tag — can read it. The residual is inherent: a
+peer that holds the room key (a legitimate member, or anyone who learns the name)
+still learns the PeerIds of everyone in the room. Option (c) is also done: the docs
+say private room names need at least 128 random bits (`randomRoomId()`), and a
+guessable name is a public lobby.
+
+**Still open:** the Rust Nostr carrier builds its hello body separately and is not
+yet encrypted this way, so a Rust node in a room still publishes its PeerId in the
+clear. JS peers skip Rust UDP peers (`meta.pw`) and the browser WebRTC transport
+can't dial native UDP, so the two don't actually link over Nostr today; the Rust
+side is a follow-up for cross-stack consistency, tracked on NB-022.
 
 ### SEC-3 — Sealed-offer probe reveals IP candidates to anyone who knows your PeerId (Medium) — NB-023
 
