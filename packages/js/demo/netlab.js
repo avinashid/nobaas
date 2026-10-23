@@ -3,9 +3,10 @@
 // (everyone using Net Lab meets there) or a private room (a random key, shared as a
 // #key= link), and every member links to every other one. For each
 // peer it shows the route (direct WebRTC, relayed by a member, or over the
-// signalling relays), how the WebRTC link was made (ICE candidate pair, IPv4 or
-// IPv6, UDP or TCP), the time it took, and a ping measured by the page itself on
-// whatever route is in use (min/avg/max, jitter, loss). It also probes this
+// signalling relays), how the WebRTC link was made (ICE candidate pair, the address
+// it goes to, IPv4 or IPv6, UDP or TCP), the time it took, a birthday-punch test,
+// and a ping measured by the page itself on whatever route is in use (min/avg/max,
+// jitter, loss). It also probes this
 // device's network (public addresses, IPv6, a NAT mapping estimate), shows the
 // signalling relays' state, has a chat, logs every event, warning and error, and
 // copies all of it as one JSON report.
@@ -320,7 +321,7 @@ function peerState(peer) {
   let p = peers.get(peer);
   if (!p) {
     p = { id: peer, heardAt: null, rtcOpenAt: null, rtcFailedAt: null, joinedAt: null, leftAt: null, leaveReason: null, presence: null,
-      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set(), bday: null };
+      route: null, routeLog: [], ice: null, sig: [], pairs: new Map(), pings: new Map(), seq: 0, lastPing: 0, samples: [], sent: 0, recv: 0, lost: 0, warned: new Set(), bday: null, pathLogged: null };
     peers.set(peer, p);
   }
   return p;
@@ -585,19 +586,19 @@ async function beEasy(peer) {
   easy.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
 }
 
-function bdayWon(peer, pc) {
+async function bdayWon(peer, pc) {
   const b = peerState(peer).bday;
   if (!b || b.status !== 'running') return;
   const ms = Math.round(now() - b.startedAt);
-  // Read the pair that won (candidate types, family) for the report.
-  pc.getStats().then((stats) => {
-    let pair = null;
-    stats.forEach((r) => { if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded')) pair = r; });
-    const l = pair && stats.get(pair.localCandidateId), r = pair && stats.get(pair.remoteCandidateId);
-    const path = l && r ? `${l.candidateType}↔${r.candidateType}` : '';
-    bdayStatus(peer, 'linked', { ms, path });
-  }).catch(() => bdayStatus(peer, 'linked', { ms }));
-  log('info', `birthday punch with ${nameOf(peer)}: direct channel formed in ${secs(ms)}`);
+  const won = { ms, how: b.role === 'hard' ? "the peer's spray reached one of this side's fleet sockets" : "this side's spray reached one of the peer's fleet sockets" };
+  // Read the pair that won (candidate types, the address it goes to) for the card and report.
+  try {
+    const sel = selectedPair(await pc.getStats());
+    if (sel) Object.assign(won, { path: `${sel.local?.candidateType}↔${sel.remote?.candidateType}`, addr: addrOf(sel.remote) });
+  } catch { /* closed under us */ }
+  if (peerState(peer).bday !== b || b.status !== 'running') return; // timed out meanwhile
+  bdayStatus(peer, 'linked', won);
+  log('info', `birthday punch with ${nameOf(peer)} WORKED: a direct channel${won.addr ? ` to ${won.addr}` : ''}${won.path ? ` (${won.path})` : ''} formed in ${secs(ms)}, as the ${b.role} side (${won.how}). It is a test channel: the room link stays ${routeLabel(room.route(peer))}`);
   // It is a measurement, not a room link: close it after a moment so sockets don't linger.
   setTimeout(() => closeBday(peer), 1500);
 }
@@ -609,7 +610,11 @@ function bdayRow(p) {
   let label = 'Birthday punch', note = 'test a direct link across NATs', cls = 'faint';
   if (b?.status === 'running') { label = 'Punching…'; note = `running as the ${b.role} side…`; cls = 'warn'; }
   else if (b?.status === 'invited') { label = 'Accept punch'; note = `${nameOf(p.id)} asked — you'd be the ${b.role} side`; cls = 'warn'; }
-  else if (b?.status === 'linked') { label = 'Punch again'; note = `direct channel in ${secs(b.ms)}${b.path ? ` · ${esc(b.path)}` : ''}`; cls = 'ok'; }
+  else if (b?.status === 'linked') {
+    label = 'Punch again';
+    note = `worked: a direct channel${b.addr ? ` to ${b.addr}` : ''} in ${secs(b.ms)}${b.path ? ` · ${b.path}` : ''} · a test channel, the room link is ${routeLabel(room.route(p.id))}`;
+    cls = 'ok';
+  }
   else if (b?.status === 'failed') { label = 'Try again'; note = b.why; cls = 'bad'; }
   else if (roles?.bad) { note = roles.bad; }
   const disabled = b?.status === 'running' || (!b && roles?.bad);
@@ -686,30 +691,43 @@ async function iceOf(peer) {
   const out = { connection: pc.connectionState, ice: pc.iceConnectionState, gathering: pc.iceGatheringState, channel: link.dc?.readyState ?? null };
   try {
     const stats = await pc.getStats();
-    let pair = null;
     let local = 0, remote = 0;
     const p = peerState(peer);
     stats.forEach((r) => {
-      if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId);
       if (r.type === 'local-candidate') local++;
       if (r.type === 'remote-candidate') remote++;
       if (r.type === 'candidate-pair') notePair(p, r, stats);
     });
-    if (!pair) stats.forEach((r) => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
     out.candidates = { local, remote };
-    if (pair) {
-      const l = stats.get(pair.localCandidateId), r = stats.get(pair.remoteCandidateId);
-      const addr = (c) => c?.address ?? c?.ip ?? '';
+    const sel = selectedPair(stats);
+    if (sel) {
+      const { pair, local: l, remote: r } = sel;
       out.pair = {
         local: l?.candidateType, remote: r?.candidateType, protocol: l?.protocol,
-        family: String(addr(l)).includes(':') ? 'IPv6' : 'IPv4',
-        remoteAddress: addr(r) ? `${addr(r)}:${r.port}` : null,
+        family: String(l?.address ?? l?.ip ?? '').includes(':') ? 'IPv6' : 'IPv4',
+        remoteAddress: addrOf(r),
         iceRttMs: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
         bytesSent: pair.bytesSent, bytesReceived: pair.bytesReceived,
       };
     }
   } catch { /* the link closed under us */ }
   return out;
+}
+
+// The candidate pair a connection's stats say it uses (the transport's selected one,
+// else a nominated pair that succeeded) with its two candidates, or null.
+function selectedPair(stats) {
+  let pair = null;
+  stats.forEach((r) => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId); });
+  if (!pair) stats.forEach((r) => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
+  return pair ? { pair, local: stats.get(pair.localCandidateId), remote: stats.get(pair.remoteCandidateId) } : null;
+}
+
+// A candidate's `ip:port` (`[v6]:port`), or null.
+function addrOf(c) {
+  const ip = c?.address ?? c?.ip;
+  if (!ip) return null;
+  return String(ip).includes(':') ? `[${ip}]:${c.port}` : `${ip}:${c.port}`;
 }
 
 // Chrome deletes candidate pairs that never got an answer (after ~15 s), so the
@@ -842,6 +860,12 @@ function iceText(ice) {
     + `${p.remoteAddress ? ` <span class="mono dim">${esc(p.remoteAddress)}</span>` : ''}`;
 }
 
+// "203.0.113.7:41000 (IPv4 UDP, your public (STUN) ↔ their public (peer-seen))", for the log.
+function pathLine(p) {
+  const kind = (k) => KIND[k] ?? k;
+  return `${p.remoteAddress ?? '?'} (${p.family} ${String(p.protocol ?? '').toUpperCase()}, your ${kind(p.local)} ↔ their ${kind(p.remote)})`;
+}
+
 // What the two NAT results mean for a direct link.
 function pairHint(pres) {
   if (!myNet || !pres) return '';
@@ -965,6 +989,12 @@ async function render() {
       const restarts = p.sig.filter((e) => e.what === 'ice-restart').length;
       const guess = p.sig.find((e) => e.what === 'guesses');
       const name = nameOf(p.id);
+      // Log where a direct room link goes, once per path (it can move on an ICE restart).
+      const direct = isLinked && r?.kind === 'direct' && pair ? pathLine(pair) : null;
+      if (direct && direct !== p.pathLogged) {
+        p.pathLogged = direct;
+        log('info', `route to ${name}: direct to ${direct}`);
+      }
       cards.push(`<div class="peer${p.leftAt ? ' gone' : ''}">
         <div class="phead">
           <span class="avatar" style="background:hsl(${hue(p.id)} 45% 38%)">${esc(name.slice(0, 1).toUpperCase())}</span>
@@ -1046,6 +1076,7 @@ function report() {
       heardToJoinMs: p.heardAt && p.joinedAt ? Math.round(p.joinedAt - p.heardAt) : null,
       signaling: p.sig, theirHosts: p.theirHosts ?? [], hotspotTried: p.hotspot ?? [], iceChecks: [...p.pairs.values()],
       rtcFailed: !!p.rtcFailedAt, left: p.leftAt ? p.leaveReason : null,
+      birthday: p.bday && { status: p.bday.status, role: p.bday.role, ms: p.bday.ms, addr: p.bday.addr, path: p.bday.path, how: p.bday.how, why: p.bday.why },
     })),
     log: events.map((e) => ({ t: new Date(e.at).toISOString(), level: e.level, msg: e.msg })),
   };

@@ -45,6 +45,9 @@ try {
   await all(() => window.netlab?.self);
   await all(() => window.netlab.peers().length === 1 && window.netlab.peers()[0].route);
   ok(true, 'two tabs linked');
+  // The log says where each direct link goes: address, family, protocol, candidate kinds.
+  await all(() => [...document.querySelectorAll('#log div')].some((d) => /route to \S+: direct to \S+:\d+ \(IPv[46] UDP, your .+ ↔ their .+\)/.test(d.textContent)));
+  ok(true, 'each tab logs the direct route with its address and candidate pair');
   // The network probe must finish (roles and the hard side's IP come from it).
   await all(() => window.netlab.report().me.network);
 
