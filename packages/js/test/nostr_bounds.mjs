@@ -18,7 +18,8 @@ const sig = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/flood', relays:
 await sig.ready;
 const hellos = [];
 sig.onHello = (from) => hellos.push(from);
-const hello = b64(new TextEncoder().encode(JSON.stringify({ t: 'hello', from: other.id })));
+// Presence is encrypted to the room (SEC-2): build the hello the way hello() does.
+const hello = await sig.sealRoom({ t: 'hello', from: other.id });
 // NIP-01 ids are 64 lowercase hex characters.
 const hid = (i) => i.toString(16).padStart(64, '0');
 const feed = (id, extra = {}) =>
@@ -39,9 +40,22 @@ check(sig.stats.received === N, `every distinct event was counted once (${sig.st
 // 2. A recent duplicate is still dropped; a hello still gets through after the flood.
 feed(hid(N - 1));
 check(sig.stats.received === N, 'a recent duplicate id is still dropped');
-feed(hid(1e9), { content: hello });
-feed(hid(1e9), { content: hello });
+await feed(hid(1e9), { content: hello });
+await feed(hid(1e9), { content: hello });
 check(hellos.length === 1 && hellos[0] === other.id, 'a hello after the flood is delivered once');
+
+// 2b. Security SEC-2: the published hello body does not carry the PeerId in the clear
+// (the old plaintext format did), and a body sealed to another room's key is not read.
+const bodyText = new TextDecoder('latin1').decode(unb64(hello));
+check(!hello.includes(other.id) && !bodyText.includes(other.id) && !bodyText.includes('hello'),
+  'the hello body is ciphertext: neither the long-term PeerId nor "hello" appears in it');
+const foreign = new NostrSignaling(pw, pw.endpoint(), { room: 'perf2/other-room', relays: [] });
+await foreign.ready;
+const otherRoomHello = await foreign.sealRoom({ t: 'hello', from: other.id });
+const before2b = hellos.length;
+await feed(hid(2.1e9), { content: otherRoomHello });
+check(hellos.length === before2b, "a hello sealed to another room's key is not delivered");
+foreign.close();
 
 // 3. Malformed events neither throw nor enter the set.
 const size = sig.seen.size;

@@ -7,8 +7,13 @@
 // - Messages to a peer are sealed to its PeerId (Noise X: encrypted, and the
 //   sender's PeerId authenticated), because WebRTC offers carry IP addresses.
 //   They're tagged with a hash of the recipient's PeerId, not the PeerId.
-// - Presence ('hello') is tagged with a hash of the room name and is readable
-//   by anyone who knows the room name.
+// - Presence ('hello') is tagged with a hash of the room name. Its body (which
+//   carries our long-term PeerId) is encrypted with AES-GCM under a key derived
+//   from the room name (sha256("peerwire/room-enc/<room>")), so a relay operator
+//   or anyone who only sees the traffic learns nothing: only someone who already
+//   knows the room name can read who is in it (SEC-2). Knowing the name is the
+//   same bar as computing the topic tag, so this keeps presence confidential to
+//   room members without changing who can join.
 //
 // Same interface as BroadcastSignaling: id, hello(meta), onHello, send(to, body),
 // onMessage(fn), close().
@@ -70,6 +75,12 @@ export class NostrSignaling {
   async start(relays) {
     this.myTag = hex(await sha256(enc.encode(`peerwire/peer/${this.id}`)));
     this.roomTag = hex(await sha256(enc.encode(`peerwire/room/${this.room}`)));
+    // Presence bodies are encrypted under this key so only someone who knows the
+    // room name can read them (SEC-2); the topic tag above is a hash of the name,
+    // so the name itself can't be recovered from the traffic.
+    this.encKey = await crypto.subtle.importKey(
+      'raw', await sha256(enc.encode(`peerwire/room-enc/${this.room}`)),
+      { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
     this.sub = hex(crypto.getRandomValues(new Uint8Array(8)));
     // Only going online recycles open sockets: navigator.connection's 'change' also
     // fires when Chrome's speed estimate moves (rtt 450 -> 300 ms), and redialling every
@@ -109,7 +120,7 @@ export class NostrSignaling {
     };
     ws.onerror = () => opened();
     ws.onclose = () => this.lostSocket(ws);
-    ws.onmessage = (m) => this.onRelay(url, m.data);
+    ws.onmessage = (m) => void this.onRelay(url, m.data).catch(() => {});
     ws.dialled = Date.now();
     this.sockets.push(ws);
   }
@@ -163,7 +174,7 @@ export class NostrSignaling {
     this.stats.published++;
   }
 
-  onRelay(url, raw) {
+  async onRelay(url, raw) {
     let m;
     try {
       m = JSON.parse(raw);
@@ -199,9 +210,10 @@ export class NostrSignaling {
     if (typeof ev.content !== 'string' || ev.content.length > MAX_CONTENT) return;
     try {
       if (tag === this.roomTag) {
-        const h = JSON.parse(dec.decode(unb64(ev.content)));
+        // Presence is encrypted to the room: a body we can't open isn't ours to read.
+        const h = await this.openRoom(ev.content);
         // Anyone who knows the room name can publish a hello: check `from` is a PeerId.
-        if (h.t === 'hello' && isPeerId(h.from) && h.from !== this.id) this.onHello(h.from, h.meta);
+        if (h && h.t === 'hello' && isPeerId(h.from) && h.from !== this.id) this.onHello(h.from, h.meta);
       } else if (tag === this.myTag) {
         const opened = this.ep.open(unb64(ev.content));
         if (!opened) return; // not for us, or tampered: ignore
@@ -213,9 +225,38 @@ export class NostrSignaling {
     }
   }
 
+  // Encrypts an object for the room: base64 of nonce (12 bytes) || AES-GCM ciphertext.
+  async sealRoom(obj) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.encKey, enc.encode(JSON.stringify(obj))));
+    const out = new Uint8Array(iv.length + ct.length);
+    out.set(iv);
+    out.set(ct, iv.length);
+    return b64(out);
+  }
+
+  // Decrypts a room-sealed body back to its object, or null if it isn't one for
+  // this room (another room's tag collision, old plaintext, or a forgery).
+  async openRoom(content) {
+    if (typeof content !== 'string') return null;
+    let buf;
+    try {
+      buf = unb64(content);
+    } catch {
+      return null;
+    }
+    if (buf.length < 12 + 16) return null; // too short for a nonce and a GCM tag
+    try {
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.subarray(0, 12) }, this.encKey, buf.subarray(12));
+      return JSON.parse(dec.decode(new Uint8Array(pt)));
+    } catch {
+      return null;
+    }
+  }
+
   async hello(meta) {
-    await this.ready; // the room tag is computed asynchronously
-    this.publish(this.roomTag, b64(enc.encode(JSON.stringify({ t: 'hello', from: this.id, meta }))));
+    await this.ready; // the room tag and key are computed asynchronously
+    this.publish(this.roomTag, await this.sealRoom({ t: 'hello', from: this.id, meta }));
   }
 
   async send(to, body) {

@@ -145,9 +145,9 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
   const seen = [];
   sig.onHello = (from) => seen.push(from);
   let n = 0;
-  const event = (from) => ['EVENT', 'sub', { id: (n++).toString(16).padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.roomTag]], content: btoa(JSON.stringify({ t: 'hello', from, meta: {} })) }];
-  for (const from of hostile) sig.onRelay('test', JSON.stringify(event(from)));
-  sig.onRelay('test', JSON.stringify(event(other.id)));
+  const event = async (from) => ['EVENT', 'sub', { id: (n++).toString(16).padStart(64, '0'), kind: 25059, pubkey: 'x', tags: [['p', sig.roomTag]], content: await sig.sealRoom({ t: 'hello', from, meta: {} }) }];
+  for (const from of hostile) await sig.onRelay('test', JSON.stringify(await event(from)));
+  await sig.onRelay('test', JSON.stringify(await event(other.id)));
   check(seen.length === 1 && seen[0] === other.id, 'NostrSignaling drops hellos with bad froms, keeps a good one');
   let rejected = false;
   await sig.send('ab'.repeat(4096), {}).catch((e) => (rejected = e instanceof TypeError));

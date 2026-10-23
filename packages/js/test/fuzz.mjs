@@ -167,14 +167,15 @@ const pw = await loadPeerwire(wasm);
         const hello = { t: 'hello', from: r.oneIn(4) ? toHex(r.bytes(r.below(40))) : other.id, meta: r.pick([{}, null, 5, { role: 'peer' }]) };
         const msg = { kind: r.pick(['offer', 'answer', 'ice', 'dg']), sdp: { type: 'offer', sdp: 'v=0' }, n: r.u32() };
         const room = r.oneIn(2);
-        const content = room ? b64(enc.encode(JSON.stringify(hello))) : b64(other.seal(sig.id, enc.encode(JSON.stringify(msg))));
+        // Presence is encrypted to the room (SEC-2); sealed messages stay Noise-sealed.
+        const content = room ? await sig.sealRoom(hello) : b64(other.seal(sig.id, enc.encode(JSON.stringify(msg))));
         const ev = { id: id(), pubkey: 'ff'.repeat(32), created_at: r.u32(), kind: 25059, tags: [['p', room ? sig.roomTag : sig.myTag]], content, sig: '00' };
         raw = JSON.stringify(['EVENT', 's', ev]);
         if (r.below(3) !== 0) raw = dec.decode(r.mutate(enc.encode(raw), 8192));
       }
     }
     try {
-      sig.onRelay('fuzz', raw);
+      await sig.onRelay('fuzz', raw);
     } catch (err) {
       const [n, input] = threw.get(err.message) ?? [0, raw.slice(0, 60)];
       threw.set(err.message, [n + 1, input]);

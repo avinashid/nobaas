@@ -60,7 +60,7 @@ that needs a change is tracked as an NB card.
 | Finding | Status |
 |---|---|
 | SEC-1 (High) | **Fixed** in NB-021 (`ccc3b79`), with its review findings N21-1 and N21-2 |
-| SEC-2 (Medium) | Narrowed by NB-031/NB-037: hellos need the room key; PeerId still readable by name holders |
+| SEC-2 (Medium) | **Fixed in JS** (NB-022): hello body encrypted to the room; open in Rust/Godot (NB-022b, before a native or Godot release) |
 | SEC-3 (Medium) | Fixed for rooms (NB-031 Rust, NB-037 JS); open for a bare `WebRtcTransport` |
 | SEC-4…SEC-8 | Open (NB-024…NB-028) |
 | SEC-9…SEC-11 | Met by NB-020/NB-030 and `docs/GODOT.md` (Security); NB-029 audit and N29-1 fix |
@@ -143,13 +143,28 @@ hello and exchange the real PeerId inside the sealed channel; (c) at minimum
 document that room membership reveals every member's identity to anyone who knows
 the room name, so room names must be treated as secrets.
 
-**Status: narrowed, open (NB-022).** Since NB-031 (Rust) and NB-037 (JS) a room
-key, separate from the topic, is derived from the name, and a hello is acted on
-only with its HMAC proof, so someone without the name can no longer get dialled.
-But the JS hello still carries `from` in plain base64, and the topic is an
-unsalted hash of the name, so anyone who knows or guesses the name still reads
-every member's PeerId. Option (c) is done: the docs say private room names need
-at least 128 random bits (`randomRoomId()` in JS). Options (a)/(b) are not.
+**Status: fixed in JS (NB-022); open in Rust/Godot (NB-022b).** Two earlier steps
+narrowed it: NB-031 (Rust) and NB-037 (JS) derive a room key, separate from the
+topic, from the name, and a hello is acted on only with its HMAC proof, so someone
+without the name can no longer get dialled. NB-022 then encrypts the JS hello body
+(AES-GCM, key `sha256("peerwire/room-enc/<room>")`, random 12-byte nonce), so a
+relay or kind-25059 subscriber without the room name can't read the PeerId. It
+still sees that a hello was posted (room tag, fixed ~304-char body), the ephemeral
+pubkey and `created_at`, and via the inbox tag (SEC-5) a stable per-PeerId handle.
+Freshness comes from the NB-037 proof (`meta.ts`, 60 s): a replayed hello is
+refused once it is older than that. The residual is inherent: a peer that holds the
+room name (a legitimate member, or anyone who learns it) can read and forge hellos
+and learns the PeerIds of everyone in the room, the same bar as joining. Option (c)
+is also done: the docs say private room names need at least 128 random bits
+(`randomRoomId()`), and a guessable name is a public lobby.
+
+**Still open (NB-022b):** Rust/Godot hellos are still plaintext. Godot `join_room`
+uses the Rust `NostrSignaling` with the default public relays, so every native or
+Godot room member publishes its PeerId in the clear to any kind-25059 subscriber;
+this must be fixed before a native or Godot release (NB22-1). JS and Rust currently
+drop each other's hellos, but only because JS can't open a plaintext one: Rust marks
+its hello `meta.nb` while `room.js` checks `meta.pw`, so once Rust encrypts, JS
+would dial Rust peers unless the marker is reconciled (NB22-2).
 
 ### SEC-3 — Sealed-offer probe reveals IP candidates to anyone who knows your PeerId (Medium) — NB-023
 
@@ -198,8 +213,9 @@ their exposure.
 The per-peer tag is `sha256("peerwire/peer/<PeerId>")`, a fixed function of the
 public PeerId. Anyone who knows a target's PeerId can compute the tag and
 subscribe to it on the public relays to learn whenever that identity is addressed,
-and to correlate activity across sessions and rooms. (SEC-2 hands out the PeerIds;
-even without it, PeerIds are shared in invites.)
+and to correlate activity across sessions and rooms. (SEC-2 hands out the PeerIds
+to room-name holders, and to anyone in Rust/Godot rooms until NB-022b; even
+without it, PeerIds are shared in invites.)
 
 **Fix.** Derive the routing tag from a rotating, room- or epoch-scoped secret
 rather than from the bare PeerId, so the tag is unlinkable to anyone who only
