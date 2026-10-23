@@ -11,13 +11,14 @@
 #   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are skipped
 #                               when every file changed since GATE_BASE is JS, docs or another non-Rust path
 #
-# Order: the builds first (wasm, clippy, the Rust tests with --no-run), then the Rust tests, the Node tests
-# (GATE_JOBS at a time) and the browser tests (one at a time) side by side. The Rust tests run under cargo-nextest
-# when it is installed (doctests through cargo test --doc), else under cargo test. Each step writes its own log,
-# target/gate-logs/<step>.log; a failed step's log is printed in full before the summary.
+# Order: the builds first (wasm, clippy, the Rust tests with --no-run). Then the Rust tests run beside the Node tests
+# (GATE_JOBS at a time) and, once those are done, beside the browser tests (one at a time). The Rust tests run under
+# cargo-nextest when it is installed (doctests through cargo test --doc), else under cargo test. Each step writes its
+# own log, target/gate-logs/<step>.log; a failed step's log is printed in full before the summary.
 #
 # Env: WASM_MAX_BYTES (default 358400 = 350 KB), PLAYWRIGHT (path to playwright's index.mjs),
-#      GATE_JOBS (Node tests at once, default 4), GATE_BASE (what "changed" is measured against, default origin/main).
+#      GATE_JOBS (Node tests at once, default 4), GATE_BASE (what "changed" is measured against, default origin/main),
+#      GATE_STEP_TIMEOUT (seconds a Node or browser test may run, default 300).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -40,6 +41,7 @@ WASM_MAX_BYTES=${WASM_MAX_BYTES:-358400}
 WASM=packages/js/pkg/peerwire_ffi.wasm
 GATE_JOBS=${GATE_JOBS:-4}
 GATE_BASE=${GATE_BASE:-origin/main}
+GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT:-300}
 LOGS=target/gate-logs
 rm -rf "$LOGS" && mkdir -p "$LOGS"
 trap 'trap - INT TERM; kill 0' INT TERM
@@ -64,6 +66,7 @@ NODE=(
   "node late ice|node packages/js/test/late_ice.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
 )
+NODE_FIRST='^node (room adopt|fuzz|room fallback|nostr bounds|pump re-arm)$'
 # Browser tests (headless Chromium on loopback): one at a time, as WebRTC timing suffers under load.
 BROWSER=(
   "browser|node packages/js/test/browser.mjs 2"
@@ -93,7 +96,12 @@ step() {
   local f t0=$SECONDS r=PASS
   f=$LOGS/$(slug "$name")
   echo "==> $name: $*"
-  "$@" >"$f.log" 2>&1 </dev/null || r=FAIL
+  "$@" >"$f.log" 2>&1 </dev/null
+  case "$?/$1" in
+    0/*) ;;
+    124/timeout|137/timeout) r=FAIL; echo "gate: no exit after GATE_STEP_TIMEOUT=${GATE_STEP_TIMEOUT}s, killed" >>"$f.log" ;;
+    *) r=FAIL ;;
+  esac
   echo "$r  $name ($((SECONDS - t0))s)" >"$f.res"
   echo "    $r  $name ($((SECONDS - t0))s)"
 }
@@ -102,11 +110,11 @@ skip() {
   echo "SKIP  $1 ($2)" >"$LOGS/$(slug "$1").res"
 }
 
-# entry "name|command": one step from the NODE or BROWSER list.
+# entry "name|command": one step from the NODE or BROWSER list. A step that runs past GATE_STEP_TIMEOUT fails.
 entry() {
   local cmd
   read -ra cmd <<<"${1#*|}"
-  step "${1%%|*}" "${cmd[@]}"
+  step "${1%%|*}" timeout -k 10 "$GATE_STEP_TIMEOUT" "${cmd[@]}"
 }
 
 # Size and import count of the browser module: it must stay small and import nothing.
@@ -170,11 +178,20 @@ if [ $full = 0 ] && base=$(git merge-base "$GATE_BASE" HEAD 2>/dev/null); then
 fi
 
 # The Node tests, GATE_JOBS at a time. Run in a subshell, so its job table holds only these.
+# --no-wasm-tier-up: on a busy host, Node 26.7 sometimes deadlocks in process.exit() while V8 is still tiering the
+# wasm up in the background (room_drain.mjs hung after "all passed" in 5 of 280 runs four at a time, 0 of 100 one at
+# a time, 0 of 360 four at a time with the flag). The tests run as fast without it.
+# The slowest (5-22 s) start first, so the pool doesn't end waiting on one of them.
 node_pool() {
-  local s
-  for s in "${NODE[@]}"; do
-    while [ "$(jobs -rp | wc -l)" -ge "$GATE_JOBS" ]; do wait -n; done
-    entry "$s" &
+  local s first slow
+  for first in 1 0; do
+    for s in "${NODE[@]}"; do
+      slow=0
+      [[ ${s%%|*} =~ $NODE_FIRST ]] && slow=1
+      [ $slow = $first ] || continue
+      while [ "$(jobs -rp | wc -l)" -ge "$GATE_JOBS" ]; do wait -n; done
+      entry "${s%%|*}|node --no-wasm-tier-up ${s#*|node }" &
+    done
   done
   wait
 }
@@ -188,14 +205,16 @@ browser_lane() {
   fi
 }
 
+# The Rust tests run from start to end; the Node tests beside them, then the browser tests. Some Node tests are
+# timing-sensitive (room_adopt.mjs failed once with Chromium running beside it), so the browser tests wait for
+# them and overlap only the Rust tests.
 lanes() {
   if [ -z "$rust_skip" ]; then
     { step "cargo test" rust_tests; [ $strict = 0 ] || step "fuzz (debug)" fuzz_tests; } &
   fi
-  node_pool &
-  if [ "${GATE_OVERLAP:-0}" = 1 ]; then browser_lane & fi
+  (node_pool)
+  browser_lane
   wait
-  [ "${GATE_OVERLAP:-0}" = 1 ] || browser_lane
 }
 
 echo "logs: $LOGS/   rust tests: $([ $nextest = 1 ] && echo cargo-nextest || echo cargo test)   node jobs: $GATE_JOBS"
