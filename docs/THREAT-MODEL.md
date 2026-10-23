@@ -75,10 +75,10 @@ that needs a change is tracked as an NB card.
 | NB44-2, NB44-3 (Low) | **Fixed** by `a16072e` (NB-044b: authenticated routes, fd reserve), re-checked 2026-10-23; residuals NB44c-1, NB44c-2 |
 | NB48b-2 (Low) | **Fixed** by `de9efea` (the busy slot is held per peer), re-checked 2026-10-24 |
 | NB48b-1, NB48b-3 (Low) | **Fixed** by `de9efea` (the answer is stripped) and `695b38b` (Chrome's line model, checked after apply), re-checked 2026-10-24 |
-| NB48b-4, NB48b-7 (Low) | **Fixed** by `4b6c0f7` and `46a5da3` (relay-only dials through a relay stay relayed, also when switched on mid-dial), re-checked 2026-10-24 |
+| NB48b-4, NB48b-7 (Low) | **Fixed** by `4b6c0f7`, `46a5da3` and `4c37bb7` (relay-only dials through a relay stay relayed, also when switched on mid-dial), re-checked 2026-10-24 |
 | NB44c-1, NB44c-2, NB46-1 (Low) | Open, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
-| NB48b-5, NB48b-6 (Info) | Open (robustness and hardening of the carried channel), same section |
+| NB48b-5, NB48b-6 (Info) | **Fixed** by `08425b8` (a stale link's close keeps the peer) and `2a00ecb` (CARRY replies bounded), re-checked 2026-10-24 |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -648,8 +648,10 @@ reveals our address to whoever is there, which relay-only promises not to do.
   - Probes: candidates, guesses and sweeps on a relay-only relayed dial send nothing
     direct, and a simultaneous direct handshake from the peer is dropped.
   - Residual (Info, accepted): a *direct* dial made while relay-only that later also
-    names a relay keeps its direct target, so it can still go live direct. The host
-    chose to dial that address, so nothing new is revealed.
+    names a relay keeps its direct target, so it can still go live direct. As for an
+    incoming HS1, the peer's answer is then taken at our address whatever address it
+    comes from (`4c37bb7`). Dialling a peer directly gives up relay-only for that
+    peer: the host chose to send its handshake there.
 
 **NB48b-7 — Relay-only: a relayed dial takes the peer's answer at our own address
 (Low).** Found in the NB48b-4 re-check. The handshake answer (HS2) set the link's path
@@ -659,7 +661,11 @@ could answer there: the link went live direct and our traffic confirmed the addr
 - Fix: a relay-only dial through a relay drops an HS2 that arrives direct, before
   reading it, and waits for the relayed answer.
 - **Status: fixed** by `46a5da3`, with a core test (an answer to an HS1 sent direct
-  before the switch is dropped; the link comes up through the relay).
+  before the switch is dropped; the link comes up through the relay). `4c37bb7` keys
+  the check on the dial instead of its relay, the same rule as an incoming HS1: under
+  relay-only, an HS2 at our own address is taken only by a dial with a direct target.
+  Re-checked 2026-10-24: a relayed dial, also one switched to relay-only with the
+  peer's direct answer in flight, still drops it and completes through the relay.
 
 **NB48b-5 — A route reads `direct` while a relayed link waits to fall back (Info).**
 After a carried channel that replaced a relayed link closes, the core keeps the dead
@@ -669,11 +675,23 @@ peer, and the peer counts as a relay for others. Only the peer itself or the net
 can cause this.
 - Fix: `rtcClosed` drops the peer only if the closed link's handle is its current
   path, or ex-carrier handles stay marked until the path changes.
+- **Status: fixed** by `08425b8` (the first fix), re-checked 2026-10-24. The transport
+  passes the closed link's handle, and a close that isn't the peer's path now only
+  forgets the WebRTC link. The transport keeps one WebRTC link per peer and detaches
+  `onclose` from links it drops, so this never closes a live link. Probe: the peer's
+  current link closing still drops it.
+  - Residual (Info, accepted): in the same window `rtcFailed` can still pick the
+    peer as a relay for another member's fallback. That dial fails through it; the
+    other relays and the pipe still run.
 
 **NB48b-6 — CARRY replies are unbounded (Info).** Every CARRY is answered with a
 CARRIED, sent without the `MAX_BUFFERED` check. A peer can fill its own channel's send
 queue with one-byte replies (probe: 500 in, 500 out).
 - Fix: answer at most once per `CARRY_EVERY_MS`, through the congestion check.
+- **Status: fixed** by `2a00ecb`, re-checked 2026-10-24. Each adopted channel answers
+  at most one CARRY per `CARRY_EVERY_MS`, and every marker goes through `dcSend`.
+  Probes: 500 CARRY at once got 1 reply (none with the buffer full); 193 spread over
+  2 s got 10.
 
 **NB48-2 — The easy side sprays whatever IPv4 address the peer names (Low).** In Net
 Lab's `answer` step, `data.ip` goes to `applyAnswer` after `sprayCandidates` checks
