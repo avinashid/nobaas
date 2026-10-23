@@ -537,6 +537,9 @@ async function tryBirthday(peer) {
   if (!iAmHard) await beEasy(peer); // the hard side waits for the easy side's offer
   else if (pending) await onBirthday(peer, pending);
 }
+// A punch from a click or the console: one that throws (an accepted invite whose buffered
+// offer openFleet refuses, say) fails at once and frees the slot, not after the 70 s timer.
+const punch = (peer) => tryBirthday(peer).catch((e) => bdayFail(peer, `error: ${e.message}`));
 
 async function onBirthday(peer, data) {
   const p = peerState(peer);
@@ -1198,7 +1201,7 @@ $('download').onclick = downloadReport;
 // The peer cards are rebuilt each second; one delegated listener on the container survives.
 $('peers').addEventListener('click', (e) => {
   const id = e.target.closest('[data-bday]')?.dataset.bday;
-  if (id) tryBirthday(id);
+  if (id) punch(id);
 });
 addEventListener('pagehide', () => room?.leave());
 
@@ -1213,7 +1216,7 @@ window.netlab = {
   hotspotCandidates,
   joinGlobal: () => enter('global'),
   joinNamed: (name) => enter('named', roomIdOf(name)),
-  punch: (i = 0) => tryBirthday(room.peers[i]),
+  punch: (i = 0) => punch(room.peers[i]),
   // Tests: as if a birthday punch with peer i had just made the channel `{ pc, dc }`
   // (loopback has one NAT, so a real punch can't meet there).
   punchWon: (i, chan) => {
