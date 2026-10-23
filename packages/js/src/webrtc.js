@@ -22,6 +22,13 @@ import { b64, unb64 } from './nostr.js';
 export const MAX_BUFFERED = 1024 * 1024;
 // A DataChannel not open this long after the offer or answer counts as failed.
 export const RTC_FALLBACK_MS = 8000;
+// Same NAT: a peer whose server-reflexive (public) IPv4 is one of ours sits behind the
+// same NAT, like a laptop on a phone's hotspot. Browsers find no direct path there
+// unless they show their LAN addresses (mDNS hides them; Android Chrome lists only its
+// mobile-data interface), so such a link counts as failed this soon instead. Strangers
+// behind one carrier NAT match too, and seldom link direct either. ICE goes on checking:
+// a DataChannel that opens after the fallback takes the link over (see dc.onopen).
+export const RTC_SAME_NAT_FALLBACK_MS = 3000;
 // Pipes: datagrams are batched for PIPE_FLUSH_MS into one signalling message of at
 // most PIPE_BATCH bytes. All pipes together send PIPE_RATE messages a second (burst
 // PIPE_BURST), within what public relays allow one client, and batch more while they
@@ -102,6 +109,16 @@ export function natFromSdp(sdp) {
   return { type: 'cone' };
 }
 
+// The server-reflexive IPv4 addresses in `text` (a description, or candidate lines).
+export function srflxV4(text) {
+  const out = [];
+  for (const l of typeof text === 'string' ? text.split(/\r?\n/) : []) {
+    const m = CANDIDATE.exec(l.trim());
+    if (m && m[3] === 'srflx' && IPV4.test(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
 // A peer's prediction as sent in signalling, checked: { ip, next, step } or null.
 export function checkPrediction(nat) {
   if (!nat || typeof nat !== 'object' || typeof nat.ip !== 'string' || !IPV4.test(nat.ip)) return null;
@@ -164,13 +181,15 @@ export class WebRtcTransport {
   //   check(from, p) holds. joinRoom passes a room-key proof (see proof.js).
   // `onPeer(peer, state, handle)`: 'open' and 'closed' for a DataChannel (with its
   //   link's endpoint handle), and 'failed' once when one isn't open `fallbackMs`
-  //   after its offer or answer (or ICE failed).
+  //   after its offer or answer (`sameNatFallbackMs` for a peer behind our public
+  //   IPv4), or ICE failed.
   // `pipes`: carry datagrams over signalling for peers allowed with allowPipe().
   // `trace(peer, what, detail)`, settable later: diagnostics of each link's
   //   signalling ('offer-sent', 'offer-received', 'answer-sent', 'answer-received',
-  //   'ice-batch-sent', 'ice-batch-received'; detail has candidateSummary counts)
-  //   and of ICE ('ice-state', 'candidate-error').
-  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, pipes = false, fallbackMs = RTC_FALLBACK_MS, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
+  //   'ice-batch-sent', 'ice-batch-received'; detail has candidateSummary counts),
+  //   of ICE ('ice-state', 'candidate-error') and 'same-nat' ({ ip, ms }: the peer
+  //   has our public IPv4, so the link falls back after `ms`).
+  constructor(endpoint, signaling, { iceServers = [], onPeer = () => {}, loss = 0, trickle = true, privacy = 'direct', relay = null, offerProof = null, pipes = false, fallbackMs = RTC_FALLBACK_MS, sameNatFallbackMs = RTC_SAME_NAT_FALLBACK_MS, RTCPeerConnection = globalThis.RTCPeerConnection } = {}) {
     if (!['direct', 'public-only', 'relay-only'].includes(privacy)) throw new Error(`unknown privacy mode: ${privacy}`);
     if (privacy === 'relay-only' && !isPeerId(relay)) throw new TypeError("privacy 'relay-only' needs a relay peer id");
     this.ep = endpoint;
@@ -194,13 +213,16 @@ export class WebRtcTransport {
     this.byPeer = new Map(); // peer hex -> handle
     this.nextHandle = 1;
     this.fallbackMs = fallbackMs;
+    this.sameNatMs = Math.min(sameNatFallbackMs, fallbackMs);
     this.pipesOn = pipes;
     this.pipes = new Map(); // handle -> pipe (see pipe())
     this.pipeByPeer = new Map(); // peer hex -> handle
     this.pipeAllowed = new Set(); // peers whose datagrams over signalling we take
     this.pipeTokens = PIPE_BURST; // the rate budget all pipes share
     this.pipeRefilled = Date.now();
-    this.piped = { sent: 0, received: 0, dropped: 0 }; // batches sent; datagrams received and dropped
+    // Batches sent; datagrams received, dropped (queue full), and stale (from a peer whose
+    // own DataChannel carries its datagrams now: sent before it opened).
+    this.piped = { sent: 0, received: 0, dropped: 0, stale: 0 };
     this.carriers = new Map(); // peer hex -> adopted channel (see adopt())
     this.carried = new Map(); // endpoint handle -> the adopted channel carrying it now
     endpoint.onTransmit = (handle, bytes) => {
@@ -211,7 +233,13 @@ export class WebRtcTransport {
       const c = this.carried.get(handle);
       if (c && c.dc.readyState === 'open') return this.dcSend(c.dc, bytes);
       const pipe = this.pipes.get(handle);
-      if (pipe) return this.pipeSend(pipe, bytes);
+      if (pipe) {
+        // The peer's own DataChannel opened after its link fell back to this pipe: the
+        // datagrams go over the channel, and the far end's core, hearing them there,
+        // moves the link onto it (as a direct path moves to a new address), then ours.
+        const own = this.links.get(this.byPeer.get(pipe.peer));
+        return own?.dc.readyState === 'open' ? this.dcSend(own.dc, bytes) : this.pipeSend(pipe, bytes);
+      }
       const l = this.links.get(handle);
       if (l && l.dc.readyState === 'open') this.dcSend(l.dc, bytes);
     };
@@ -240,13 +268,20 @@ export class WebRtcTransport {
     dc.binaryType = 'arraybuffer';
     // Without trickle: `described` once the offer or answer is out, `late` holds the
     // candidates found after it, `held` the peer's that came before its description.
-    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, failed: false, described: false, late: [], lateTimer: null,
+    // `mine` and `theirs`: the public IPv4s each side's candidates name (see sameNat);
+    // `heard` once the DataChannel has carried a datagram from the peer.
+    const l = { pc, dc, peer, handle: h, dialer: false, timer: null, watchedAt: 0, failed: false, described: false, late: [], lateTimer: null,
       held: [], offerMsg: null, offerSdp: null, answerMsg: null, resends: [],
-      lateSent: 0, opened: false, restarts: 0, restartTimer: null, guessed: null };
+      lateSent: 0, opened: false, restarts: 0, restartTimer: null, guessed: null,
+      mine: new Set(), theirs: new Set(), sameNat: false, heard: false };
     dc.onopen = () => {
       clearTimeout(l.timer);
       l.opened = true;
-      if (l.dialer) this.ep.connect(h, peer);
+      // Opened after the room fell back (ICE went on checking): a link relayed by a
+      // member punches over it and moves there; a pipe's datagrams go over it (see
+      // onTransmit). Else the dialler's handshake goes over it, joining a dial under way.
+      if (this.ep.isConnected(peer)) this.ep.addCandidate(h, peer);
+      else if (l.dialer) this.ep.connect(h, peer);
       this.onPeer(peer, 'open');
     };
     pc.onconnectionstatechange = () => {
@@ -255,10 +290,13 @@ export class WebRtcTransport {
     dc.onclose = () => this.onPeer(peer, 'closed', h);
     // Binary datagrams only: a string message would become a length in new Uint8Array(string).
     dc.onmessage = (e) => {
-      if (e.data instanceof ArrayBuffer && e.data.byteLength <= MAX_DATAGRAM) this.ep.receive(h, new Uint8Array(e.data));
+      if (!(e.data instanceof ArrayBuffer) || e.data.byteLength > MAX_DATAGRAM) return;
+      l.heard = true;
+      this.ep.receive(h, new Uint8Array(e.data));
     };
     pc.onicecandidate = (e) => {
       const c = e.candidate;
+      if (c) this.sameNat(l, l.mine, c.candidate);
       if (c && this.privacy !== 'direct' && / typ host( |$)/.test(c.candidate)) return;
       if (this.trickle) return void (c && this.signal(peer, { kind: 'ice', candidate: c.toJSON() }));
       if (!l.described) return; // still to go in the description
@@ -282,10 +320,26 @@ export class WebRtcTransport {
     return l;
   }
 
-  // Starts the clock on a link once its offer or answer is out.
-  watch(l) {
+  // Starts the clock on a link once its offer or answer is out; `again` re-arms it from
+  // the same start, for a link just found to be behind our NAT.
+  watch(l, again = false) {
+    if (!again) l.watchedAt = Date.now();
     clearTimeout(l.timer);
-    if (l.dc.readyState !== 'open') l.timer = setTimeout(() => this.failed(l), this.fallbackMs);
+    const ms = l.sameNat ? this.sameNatMs : this.fallbackMs;
+    if (l.dc.readyState !== 'open') l.timer = setTimeout(() => this.failed(l), Math.max(0, l.watchedAt + ms - Date.now()));
+  }
+
+  // Notes the public IPv4s that candidates in `text` name, ours or the peer's (`set`),
+  // and once the two sides share one, shortens the link's clock to sameNatMs (see
+  // RTC_SAME_NAT_FALLBACK_MS). Called for every description and candidate either way.
+  sameNat(l, set, text) {
+    for (const ip of srflxV4(text)) if (set.size < MAX_LATE) set.add(ip);
+    if (l.sameNat || l.opened || l.failed) return;
+    const ip = [...l.mine].find((a) => l.theirs.has(a));
+    if (!ip) return;
+    l.sameNat = true;
+    this.tr(l.peer, 'same-nat', { ip, ms: this.sameNatMs });
+    if (l.watchedAt) this.watch(l, true);
   }
 
   failed(l) {
@@ -435,6 +489,7 @@ export class WebRtcTransport {
   describe(l) {
     const d = this.description(l.pc);
     l.described = true;
+    this.sameNat(l, l.mine, l.pc.localDescription?.sdp);
     if (!this.trickle && l.pc.iceGatheringState !== 'complete') l.lateTimer = setTimeout(() => this.sendLate(l), LATE_ICE_MS);
     return d;
   }
@@ -523,6 +578,7 @@ export class WebRtcTransport {
         return void this.badSignals++;
       }
       this.tr(from, 'offer-received', { ...candidateSummary(sdp), restart: !fresh });
+      this.sameNat(l, l.theirs, sdp);
       await this.addHeld(l);
       if (!fresh) Object.assign(l, { described: false, late: [], lateSent: 0 });
       await this.gathered(l.pc);
@@ -542,6 +598,7 @@ export class WebRtcTransport {
         return;
       }
       this.tr(from, 'answer-received', candidateSummary(msg.sdp?.sdp));
+      this.sameNat(l, l.theirs, msg.sdp?.sdp);
       await this.addHeld(l);
       await this.guess(l, msg.nat);
     } else if (msg.kind === 'restart') {
@@ -553,6 +610,7 @@ export class WebRtcTransport {
       if (!Array.isArray(cands) || cands.length > MAX_ICE_BATCH) return void this.badSignals++;
       const l = this.link(from);
       if (msg.kind === 'ice-batch') this.tr(from, 'ice-batch-received', candidateSummary(cands.map((c) => `a=${c?.candidate}`).join('\n')));
+      this.sameNat(l, l.theirs, cands.map((c) => (typeof c?.candidate === 'string' ? c.candidate : '')).join('\n'));
       // Candidates can overtake the description they belong to: hold them until it comes.
       if (!l.pc.remoteDescription) return void l.held.push(...cands.slice(0, MAX_ICE_BATCH - l.held.length));
       await this.addCandidates(l, cands);
@@ -670,6 +728,10 @@ export class WebRtcTransport {
 
   pipeReceive(from, d) {
     if (!this.pipeAllowed.has(from) || !Array.isArray(d) || d.length > MAX_PIPE_ITEMS) return void this.badSignals++;
+    // The peer's own DataChannel opened late and carries its datagrams now: these were
+    // sent before, and taking them would move the link back onto the pipe for a while.
+    const own = this.links.get(this.byPeer.get(from));
+    if (own?.heard && own.dc.readyState === 'open') return void (this.piped.stale += d.length);
     const h = this.pipe(from);
     for (const s of d) {
       if (typeof s !== 'string' || s.length > (MAX_DATAGRAM * 4) / 3 + 4) return void this.badSignals++;
