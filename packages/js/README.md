@@ -298,7 +298,12 @@ Run these with Node and the Playwright install on this host:
   link over signalling (`?rtc=off`). A real loopback channel between them, handed in as
   a birthday punch's winner, carries the room link: the route goes direct, the log
   gives the channel's address, and chat goes over it. When it closes, the link goes back
-  to signalling.
+  to signalling. Net Lab's transport hook passes a closed link's handle on to the room.
+- `node packages/js/test/netlab_mic.mjs [shot-prefix]`: Net Lab's "Use microphone" button, with fake
+  media and the browser's mDNS hiding on. Before, the local addresses are `.local`; after a grant the
+  report says `granted`, the network test lists real local addresses and reads the same NAT, the room
+  is joined again, and the other tab sees `mic` and real local addresses and links direct. A refused
+  prompt reports `denied` and doesn't rejoin.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

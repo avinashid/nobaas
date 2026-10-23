@@ -7,7 +7,8 @@
 // it goes to, IPv4 or IPv6, UDP or TCP), the time it took, a birthday-punch test,
 // and a ping measured by the page itself on whatever route is in use (min/avg/max,
 // jitter, loss). It also probes this
-// device's network (public addresses, IPv6, a NAT mapping estimate), shows the
+// device's network (public addresses, IPv6, a NAT mapping estimate), can ask for the
+// microphone so the browser shows this device's local addresses, shows the
 // signalling relays' state, has a chat, logs every event, warning and error, and
 // copies all of it as one JSON report.
 //
@@ -134,6 +135,7 @@ async function probeNetwork() {
       if (!c) return;
       const entry = { address: c.address ?? '', port: c.port, protocol: c.protocol, server: e.url ?? null };
       if (c.type === 'srflx') {
+        entry.base = `${c.relatedAddress ?? ''}:${c.relatedPort ?? ''}`; // the local socket (0.0.0.0:0 while hidden)
         res.srflx.push(entry);
         // Gathering can take many seconds to 'complete' (unreachable IPv6, slow servers):
         // the second server's mapping comes within moments of the first, if at all.
@@ -153,9 +155,14 @@ async function probeNetwork() {
   const v6 = (a) => a.includes(':');
   res.udp = res.srflx.some((c) => c.protocol === 'udp');
   res.ipv6 = res.srflx.some((c) => v6(c.address)) || res.host.some((c) => v6(c.address) && !c.address.endsWith('.local'));
-  // Per public IPv4 address: how many public ports one socket got from the two servers.
+  // Per local socket and public IPv4 address: how many public ports the socket got from
+  // the two servers. With the local addresses shown (mic permission) each interface has
+  // its own socket, and its own public port, which is no sign of a symmetric NAT.
   const byIp = new Map();
-  for (const c of res.srflx.filter((c) => !v6(c.address))) byIp.set(c.address, new Set([...(byIp.get(c.address) ?? []), c.port]));
+  for (const c of res.srflx.filter((c) => !v6(c.address))) {
+    const k = `${c.base} ${c.address}`;
+    byIp.set(k, new Set([...(byIp.get(k) ?? []), c.port]));
+  }
   if (!res.srflx.length) {
     res.nat = 'no STUN answer';
     res.notes.push('No STUN server answered: UDP to the internet may be blocked, so direct WebRTC will fail; only the fallback over the signalling relays (WebSocket) can work.');
@@ -198,7 +205,75 @@ async function reprobe() {
 }
 
 function presence() {
-  return { name: myName(), dev: device(), conn: connInfo(), nat: myNet?.nat ?? 'testing', v6: !!myNet?.ipv6 };
+  return { name: myName(), dev: device(), conn: connInfo(), nat: myNet?.nat ?? 'testing', v6: !!myNet?.ipv6, mic: micState === 'granted' };
+}
+
+// ---------- microphone permission (shows local addresses) ----------
+//
+// Chrome hides this device's LAN addresses behind mDNS names (and Android Chrome
+// offers only its mobile-data addresses, not its hotspot one) unless the page has mic
+// or camera permission: then a new connection offers every interface's real address,
+// so a laptop on a phone's hotspot may link to the phone directly. A connection made
+// before the grant stays hidden, so a grant re-runs the network test and rejoins the
+// room, which makes every link a new connection. Only the permission is needed: the
+// microphone is closed at once.
+let micState = typeof navigator.mediaDevices?.getUserMedia === 'function' ? 'prompt' : 'unsupported';
+async function watchMic() {
+  if (micState !== 'unsupported') {
+    try {
+      const st = await navigator.permissions.query({ name: 'microphone' });
+      micState = st.state;
+      st.onchange = () => { micState = st.state; renderMic(); };
+    } catch { /* no 'microphone' query (Firefox): 'prompt' until the button is used */ }
+  }
+  renderMic();
+}
+function renderMic() {
+  const [cls, text] = {
+    granted: ['ok', "allowed: new links offer this device's local addresses"],
+    denied: ['warn', 'not allowed: local addresses stay hidden (allow the microphone in the site settings)'],
+    unsupported: ['faint', 'not available here (needs HTTPS)'],
+  }[micState] ?? ['faint', "for a phone's hotspot: a laptop on it may then link directly. The microphone closes at once"];
+  $('mic').disabled = micState === 'unsupported';
+  $('micmsg').className = cls;
+  $('micmsg').textContent = text;
+}
+async function useMic() {
+  $('mic').disabled = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    for (const t of stream.getTracks()) t.stop();
+    micState = 'granted';
+  } catch (e) {
+    if (e?.name === 'NotAllowedError' || e?.name === 'SecurityError') micState = 'denied';
+    log('warn', `microphone ${micState === 'denied' ? 'not allowed' : 'unavailable'}: ${e?.name ?? 'error'}${e?.message ? ` (${clip(e.message, 120)})` : ''}; local addresses stay hidden`);
+    return renderMic();
+  }
+  renderMic();
+  $('mic').disabled = true; // until the room is joined again
+  log('info', `microphone allowed (closed again at once): new connections offer this device's local addresses; re-testing the network${room ? ' and rejoining the room' : ''}`);
+  try {
+    await reprobe();
+    await rejoin();
+  } finally {
+    renderMic();
+  }
+}
+
+// Leaves the room and joins it again as a new member, so every link is a new connection.
+async function rejoin() {
+  if (!room) return;
+  const old = room, kind = roomKind, key = kind === 'private' ? roomKey : roomName;
+  for (const peer of peers.keys()) closeBday(peer);
+  room = null;
+  await old.leave();
+  peers.clear();
+  await enter(kind, key);
+  if (!room) {
+    // Could not join again: back to the join card, to try by hand.
+    $('join').classList.remove('hidden');
+    $('roombar').classList.add('hidden');
+  }
 }
 const myName = () => clip($('name').value.trim(), 20) || `guest-${short(room?.self ?? '000000')}`;
 
@@ -288,7 +363,7 @@ async function enter(kind, key) {
       // Named rooms get a prefix, so no name opens the global room or a private one.
       roomId: kind === 'global' ? GLOBAL_ROOM : kind === 'named' ? `named/${key}` : key,
       signaling,
-      presence: { name: clip($('name').value.trim(), 20) || 'guest', dev: device(), conn: connInfo(), nat: myNet?.nat ?? 'testing', v6: !!myNet?.ipv6 },
+      presence: { ...presence(), name: clip($('name').value.trim(), 20) || 'guest' },
       ...(relays?.length && { relays }),
       ...(params.get('rtc') === 'off' && { RTCPeerConnection: NoIcePc }),
     });
@@ -334,9 +409,13 @@ function warnOnce(p, key, msg) {
 }
 
 function hook() {
+  // After a rejoin, the old room's late events don't touch the new room's peers.
+  const live = room;
+  const mine = () => room === live;
   const sig = room.signaling;
   const hello = sig.onHello;
   sig.onHello = (peer, meta) => {
+    if (!mine()) return hello(peer, meta);
     const p = peerState(peer);
     if (!p.heardAt || p.leftAt) {
       p.heardAt = now();
@@ -346,10 +425,11 @@ function hook() {
     hello(peer, meta);
   };
   const t = room.transport;
-  if (t && 'trace' in t) t.trace = onTrace;
+  if (t && 'trace' in t) t.trace = (...a) => { if (mine()) onTrace(...a); };
   if (t?.onPeer) {
     const onPeer = t.onPeer;
-    t.onPeer = (peer, state) => {
+    t.onPeer = (peer, state, ...rest) => {
+      if (!mine()) return onPeer(peer, state, ...rest);
       const p = peerState(peer);
       if (state === 'open') {
         p.rtcOpenAt = now();
@@ -358,26 +438,30 @@ function hook() {
         p.rtcFailedAt = now();
         log('warn', `WebRTC to ${nameOf(peer)} failed (ICE found no working pair): trying a member relay, then the signalling relays`);
       } else if (state === 'closed') log('info', `WebRTC link to ${nameOf(peer)} closed`);
-      onPeer(peer, state);
+      onPeer(peer, state, ...rest);
     };
   }
   room.on('peer-join', (peer, pres) => {
+    if (!mine()) return;
     const p = peerState(peer);
     p.presence = pres;
     p.joinedAt = now();
     p.leftAt = null;
-    log('info', `${nameOf(peer)} joined (${clip(pres?.dev, 40)}, NAT ${clip(pres?.nat, 20)}, IPv6 ${pres?.v6 ? 'yes' : 'no'})${p.heardAt ? `, ${secs(p.joinedAt - p.heardAt)} after hearing it` : ''}`);
+    log('info', `${nameOf(peer)} joined (${clip(pres?.dev, 40)}, NAT ${clip(pres?.nat, 20)}, IPv6 ${pres?.v6 ? 'yes' : 'no'}${micText(pres)})${p.heardAt ? `, ${secs(p.joinedAt - p.heardAt)} after hearing it` : ''}`);
   });
-  room.on('presence', (peer, pres) => { peerState(peer).presence = pres; });
+  room.on('presence', (peer, pres) => { if (mine()) peerState(peer).presence = pres; });
   room.on('peer-leave', (peer, reason) => {
+    if (!mine()) return;
     const p = peerState(peer);
     p.leftAt = now();
     p.leaveReason = reason;
     p.pings.clear();
     log(reason === 'left' || reason === 'closed' ? 'info' : 'warn', `${nameOf(peer)} left: ${reason}`);
   });
-  room.on('message', onMessage);
+  room.on('message', (...a) => { if (mine()) onMessage(...a); });
 }
+// A peer's mic permission from its presence (an older Net Lab doesn't say).
+const micText = (pres) => (typeof pres?.mic === 'boolean' ? `, mic ${pres.mic ? 'allowed' : 'not allowed'}` : '');
 
 // The addresses in an offer, answer or late batch, as "1 IPv6 public, 2 hidden (mDNS)".
 function addrText(d) {
@@ -733,7 +817,7 @@ async function iceOf(peer) {
       const { pair, local: l, remote: r } = sel;
       out.pair = {
         local: l?.candidateType, remote: r?.candidateType, protocol: l?.protocol,
-        family: String(l?.address ?? l?.ip ?? '').includes(':') ? 'IPv6' : 'IPv4',
+        family: pairFamily(l, r) === 'v6' ? 'IPv6' : 'IPv4',
         remoteAddress: addrOf(r),
         iceRttMs: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
         bytesSent: pair.bytesSent, bytesReceived: pair.bytesReceived,
@@ -759,14 +843,20 @@ function addrOf(c) {
   return String(ip).includes(':') ? `[${ip}]:${c.port}` : `${ip}:${c.port}`;
 }
 
+// A candidate's IP family, 'v4' or 'v6'. Chrome leaves a hidden local address (mDNS)
+// out of the stats, so a local candidate with none is on its pair's remote family.
+const candAddr = (c) => String(c?.address ?? c?.ip ?? '');
+const famOf = (c) => (candAddr(c).includes(':') ? 'v6' : 'v4');
+const pairFamily = (l, rc) => famOf(candAddr(l) && !candAddr(l).endsWith('.local') ? l : rc);
+// A candidate pair from the stats, as "host/v6 ↔ srflx/v6 2001:db8::1:5000".
+const pairLabel = (l, rc) => `${l?.candidateType}/${pairFamily(l, rc)} ↔ ${rc?.candidateType}/${famOf(rc)} ${candAddr(rc)}:${rc?.port ?? ''}`;
+
 // Chrome deletes candidate pairs that never got an answer (after ~15 s), so the
 // counts are kept here: the most each pair ever reached.
 const MAX_PAIRS = 24;
 function notePair(p, r, stats) {
   const l = stats.get(r.localCandidateId), rc = stats.get(r.remoteCandidateId);
-  const addr = (c) => c?.address ?? c?.ip ?? '';
-  const fam = (c) => (String(addr(c)).includes(':') ? 'v6' : 'v4');
-  const key = `${l?.candidateType}/${fam(l)} ↔ ${rc?.candidateType}/${fam(rc)} ${addr(rc)}:${rc?.port ?? ''}`;
+  const key = pairLabel(l, rc);
   let q = p.pairs.get(key);
   if (!q) {
     if (p.pairs.size >= MAX_PAIRS) return;
@@ -1045,7 +1135,7 @@ async function render() {
           ${p.pairs.size ? `<dt>ICE checks</dt><dd>${checksText(p)}</dd>` : ''}
           ${restarts ? `<dt>ICE restarts</dt><dd class="warn">${restarts}</dd>` : ''}
           ${guess ? `<dt>Port guesses</dt><dd>${guess.n} ports around <span class="mono">${esc(guess.ip)}:${guess.next}</span> (step ${guess.step})</dd>` : ''}
-          <dt>Their network</dt><dd>NAT <b>${esc(clip(pres.nat, 20) || '?')}</b> · IPv6 ${pres.v6 ? 'yes' : 'no'}${pres.conn && pres.conn !== 'unknown' ? ` · ${esc(clip(pres.conn, 40))}` : ''}</dd>
+          <dt>Their network</dt><dd>NAT <b>${esc(clip(pres.nat, 20) || '?')}</b> · IPv6 ${pres.v6 ? 'yes' : 'no'}${typeof pres.mic === 'boolean' ? ` · mic ${pres.mic ? '<span class="ok">allowed</span>' : 'not allowed'}` : ''}${pres.conn && pres.conn !== 'unknown' ? ` · ${esc(clip(pres.conn, 40))}` : ''}</dd>
         </dl>
         ${hint ? `<div class="hintbox">${esc(hint)}</div>` : ''}
         ${isLinked && rtcAvailable() ? bdayRow(p) : ''}
@@ -1089,7 +1179,7 @@ function report() {
   const t = now();
   return {
     tool: 'peerwire-netlab', at: new Date().toISOString(), page: location.origin + location.pathname, uptimeS: Math.round((Date.now() - t0) / 1000),
-    me: { id: room?.self ?? null, name: myName(), device: device(), connection: connInfo(), userAgent: navigator.userAgent, network: myNet },
+    me: { id: room?.self ?? null, name: myName(), device: device(), connection: connInfo(), userAgent: navigator.userAgent, mediaPermission: micState, network: myNet },
     room: room && {
       kind: roomKind, inRoomS: Math.round((t - joinedAt) / 1000),
       signaling: room.signaling.sockets
@@ -1196,6 +1286,7 @@ $('share').onclick = async () => {
   }
 };
 $('reprobe').onclick = reprobe;
+$('mic').onclick = useMic;
 $('copy').onclick = copyReport;
 $('download').onclick = downloadReport;
 // The peer cards are rebuilt each second; one delegated listener on the container survives.
@@ -1214,6 +1305,7 @@ window.netlab = {
   chat: () => chat.map((c) => `${c.from}: ${c.text}`),
   report,
   hotspotCandidates,
+  pairLabel,
   joinGlobal: () => enter('global'),
   joinNamed: (name) => enter('named', roomIdOf(name)),
   punch: (i = 0) => punch(room.peers[i]),
@@ -1238,6 +1330,7 @@ const hashRoom = parseRoom(location.hash);
 $('roomname').value = hashRoom ?? params.get('room') ?? '';
 roomHint();
 showRecent();
+watchMic();
 reprobe();
 if (hashKey) enter('private', hashKey);
 else if (hashRoom) enter('named', hashRoom);
