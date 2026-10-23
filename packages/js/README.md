@@ -190,6 +190,13 @@ one, `joinRoom` falls back per peer, on its own, with no setup on either side:
    offer, or its ICE fails, the dialling side dials the peer again through every member
    it has a direct link to, including members that link later. The core forwards for
    linked peers (`connect_via`, 256 KiB/s per peer) and sees only ciphertext (`'peer'`).
+   - **Behind one NAT.** A peer whose ICE candidates name one of your public IPv4
+     addresses (a laptop on a phone's hotspot) gets `sameNatFallbackMs` (3 s) instead.
+     Browsers find no direct path there unless they show their LAN addresses: mDNS hides
+     them, and Android Chrome lists only its mobile-data interface. Waiting the full 8 s
+     rarely helps, so such a pair links over signalling about 4 s after hearing each
+     other, not 9 s. Strangers behind one carrier NAT match too, and seldom link direct
+     either. The transport traces `same-nat`.
 3. **Over the signalling relays.** If no member has answered within 1 s, Peerwire
    datagrams also go as signalling messages (a *pipe*). On Nostr each batch is sealed
    to the peer again (`'signaling'`). This works wherever the relays are reachable.
@@ -203,6 +210,15 @@ The core keeps the first path that completes the handshake, and the room's proof
 presence and messages run unchanged on it. A pipe opens only for a peer whose hello
 proved the room key. `fallback: 'peers'` skips step 3; `'off'` keeps WebRTC only.
 TURN in `iceServers` still works and is faster than step 3 when you have a server.
+
+**Direct still wins.** ICE goes on checking after the fallback starts. If the link's own
+DataChannel opens later (two desktops on one Wi-Fi resolve each other's mDNS names), the
+link moves onto it, and `room.route(peer)` says `'direct'` again:
+- **A relayed link** punches over the channel and moves there once the punch is answered.
+- **A link over signalling** sends its datagrams over the channel. The far end's core, hearing
+  them there, moves the link onto it, and then ours does: an authenticated datagram from a
+  new address moves a direct path. Datagrams that still come over signalling after that were
+  sent before the channel opened. They are dropped, so the link doesn't move back.
 
 **A direct channel found later.** A DataChannel to the peer opened outside the room (a
 browser birthday punch's, `src/birthday.js`, as Net Lab runs one) can take a fallback
@@ -297,6 +313,13 @@ Run these with Node and the Playwright install on this host:
   arrives with nothing over signalling, or the member relays nothing more. When the
   channel closes, the link goes back to its fallback route and carries on. A channel
   only one end adopts is refused after 5 s, and a direct link isn't moved.
+- `node packages/js/test/room_same_nat.mjs`: members behind one public IPv4, on a fake whose
+  descriptions name it (or trickle it 1 s late, on either side) and whose ICE never
+  connects. The pair traces `same-nat`, falls back 3 s after the offer, not 8, and links
+  over signalling; different public IPv4s still take 8 s. When the pair's DataChannel
+  opens after the fallback, a link over signalling (pipe batches 300 ms late) or relayed
+  by a member goes direct and stays direct, with nothing more over the pipe. A pair that
+  opens at once never falls back.
 - `node packages/js/test/netlab_carry.mjs [shot-prefix]`: Net Lab in two tabs that
   link over signalling (`?rtc=off`). A real loopback channel between them, handed in as
   a birthday punch's winner, carries the room link: the route goes direct, the log
@@ -310,6 +333,10 @@ Run these with Node and the Playwright install on this host:
   no local address and still links, and a birthday punch's offer carries no candidate. Pressed in the
   global room, the button rejoins before it re-tests the network, so a tab joining meanwhile hears no
   local address. A refused prompt reports `denied` and doesn't rejoin.
+- `node packages/js/test/netlab_punch_close.mjs`: a Net Lab birthday punch that ends (the peer's abort)
+  while its certificate, fleet, spray connection or answer is still being set up closes the connections
+  made after it ended, and its card keeps the reason it ended, not a stale error. A second offer or
+  answer from the peer is ignored: one fleet, all of it closed at the end.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;

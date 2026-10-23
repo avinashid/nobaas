@@ -91,6 +91,7 @@ step "node fuzz" node packages/js/test/fuzz.mjs
 step "node room leave" node packages/js/test/room_leave.mjs
 step "node room fallback" node packages/js/test/room_fallback.mjs
 step "node room adopt" node packages/js/test/room_adopt.mjs
+step "node room same nat" node packages/js/test/room_same_nat.mjs
 step "node nat prediction" node packages/js/test/nat_predict.mjs
 step "node late ice" node packages/js/test/late_ice.mjs
 step "node birthday primitives" node packages/js/test/birthday.mjs
@@ -109,6 +110,7 @@ if [ $quick = 1 ]; then
   skip "netlab" "--quick"
   skip "netlab rooms" "--quick"
   skip "netlab mic" "--quick"
+  skip "netlab punch close" "--quick"
 else
   step "browser" node packages/js/test/browser.mjs 2
   step "arena" node packages/js/test/arena.mjs 8 10
@@ -123,6 +125,7 @@ else
   step "netlab" env RTC_OFF=2 node packages/js/test/netlab.mjs 3
   step "netlab rooms" node packages/js/test/netlab_rooms.mjs
   step "netlab mic" node packages/js/test/netlab_mic.mjs
+  step "netlab punch close" node packages/js/test/netlab_punch_close.mjs
 fi
 if [ $nostr = 1 ]; then
   step "nostr" node packages/js/test/nostr.mjs

@@ -23,9 +23,11 @@
 // peers) and over the signalling channel itself (a pipe, see webrtc.js), at once,
 // and the first path to answer wins. Every path carries the same Noise session,
 // so relays and signalling only ever see sealed datagrams. room.route(peer) says
-// which path a peer is on. `fallback: 'peers'` skips the pipe, 'off' both. A direct
-// DataChannel found later by other means (a birthday punch, birthday.js) can take a
-// fallback link over: room.adoptChannel().
+// which path a peer is on. `fallback: 'peers'` skips the pipe, 'off' both. A peer
+// behind our own public IPv4 (a laptop on a phone's hotspot) falls back after
+// sameNatFallbackMs, not fallbackMs. The link's own DataChannel opening later takes
+// the link back (webrtc.js), and one found by other means (a birthday punch,
+// birthday.js) can take a fallback link over: room.adoptChannel().
 //
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
@@ -106,6 +108,7 @@ export async function joinRoom({
   privacy = 'direct',
   fallback = 'auto',
   fallbackMs,
+  sameNatFallbackMs,
   RTCPeerConnection = globalThis.RTCPeerConnection,
 } = {}) {
   if (!appId || !roomId) throw new TypeError('joinRoom needs an appId and a roomId');
@@ -134,7 +137,7 @@ export async function joinRoom({
       check: (from, p) => proof.checkPair('pw-rtc-offer', from, endpoint.id, p),
     };
     const pipes = fallback === 'auto';
-    transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy, offerProof, pipes, fallbackMs, RTCPeerConnection });
+    transport = (onPeer) => new WebRtcTransport(endpoint, sig, { iceServers: ice, trickle: signaling === 'local', onPeer, privacy, offerProof, pipes, fallbackMs, sameNatFallbackMs, RTCPeerConnection });
   } else if (signaling === 'local') {
     transport = () => new LocalTransport(endpoint, sig);
   } else {

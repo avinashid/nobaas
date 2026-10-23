@@ -68,6 +68,7 @@ jobs:
       - run: node packages/js/test/room_leave.mjs
       - run: node packages/js/test/room_fallback.mjs
       - run: node packages/js/test/room_adopt.mjs
+      - run: node packages/js/test/room_same_nat.mjs
       - run: node packages/js/test/nat_predict.mjs
       - run: node packages/js/test/late_ice.mjs
       - run: node packages/js/test/birthday.mjs

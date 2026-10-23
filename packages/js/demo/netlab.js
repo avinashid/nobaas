@@ -510,6 +510,7 @@ const SIG_TEXT = {
   'ice-batch-sent': (d) => `late addresses sent (${addrText(d)})`,
   'ice-batch-received': (d) => `late addresses received (${addrText(d)})`,
   'ice-state': (d) => `ICE ${d.state}`,
+  'same-nat': (d) => `same public IP as us (${d.ip}): falling back after ${secs(d.ms)} unless a direct path opens first`,
 };
 
 // The WebRTC transport's diagnostics for one link.
@@ -607,6 +608,10 @@ function bdayFail(peer, why) {
   bdayStatus(peer, 'failed', { why });
   log('warn', `birthday punch with ${nameOf(peer)}: ${why}`);
 }
+// Whether `b` is still `peer`'s punch in progress: not closed (a failure, the timeout,
+// the peer's abort) nor left behind by a rejoin. Checked after every await of a punch's
+// setup, so what it opened meanwhile is closed, not kept running (MIC-2).
+const current = (peer, b) => peers.get(peer)?.bday === b && !!b.ctx;
 function closeBday(peer) {
   if (bdayBusy === peer) bdayBusy = null; // NB48b-2: only the punch holding the slot frees it, not a refusal
   const b = peerState(peer).bday;
@@ -674,22 +679,38 @@ async function onBirthday(peer, data) {
     return;
   }
   if (data.step === 'offer' && b.role === 'hard' && typeof data.sdp === 'string') {
+    // One offer per punch, marked before any await: a second would open a second fleet,
+    // and closing the punch would close only the last one.
+    if (b.ctx.offered) return;
+    b.ctx.offered = true;
     // The hard side: open the fleet answering the easy side's one offer, aimed only at the
     // one validated address it gave (openFleet strips the offer's candidates). Answer with our IP.
     const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+    if (!current(peer, b)) return;
     const creds = randomCredentials();
     const size = Number(params.get('fleet')) || FLEET_SIZE;
     const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: data.sdp, size, easyAddr: data.addr });
+    if (!current(peer, b)) {
+      for (const c of hard.conns) c.pc.close();
+      return;
+    }
     b.ctx.hard = hard;
     log('info', `birthday punch with ${nameOf(peer)}: opened ${hard.conns.length} sockets, answering`);
     room.send({ t: 'bday', step: 'answer', sdp: hard.answerSdp, ip: myProbedV4() }, { to: peer });
     hard.done.then((c) => bdayWon(peer, c)).catch(() => {});
   } else if (data.step === 'answer' && b.role === 'easy' && typeof data.sdp === 'string') {
+    // One answer per punch: a second would be applied to a connection that has one.
+    if (b.ctx.answered) return;
+    b.ctx.answered = true;
     const ip = typeof data.ip === 'string' ? data.ip : null;
     if (!isPublicV4(ip)) return bdayFail(peer, 'the peer named no public IPv4 to spray'); // NB48-2
     const ports = sprayPorts(SPRAY_PORTS);
     log('info', `birthday punch with ${nameOf(peer)}: spraying ${ports.length} ports at ${ip}`);
-    await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
+    try {
+      await b.ctx.easy.applyAnswer(data.sdp, ip, ports);
+    } catch (e) {
+      if (current(peer, b)) throw e; // else the punch ended meanwhile, and its end closed the connection
+    }
   } else if (data.step === 'abort') {
     bdayFail(peer, `the peer stopped: ${clip(data.why, 80)}`);
   }
@@ -699,6 +720,7 @@ async function onBirthday(peer, data) {
 async function beEasy(peer) {
   const b = peerState(peer).bday;
   const easy = await openSpray({ RTCPeerConnection, iceServers: bdayIce() });
+  if (!current(peer, b)) return void easy.pc.close();
   b.ctx.easy = easy;
   // The offer goes without its candidates: the hard side uses none (openFleet strips them
   // and aims at `addr`), and after a mic grant they would name every local address, in
@@ -1117,7 +1139,7 @@ async function render() {
       relayHtml += `<dl style="margin-top:8px"><dt>Events</dt><dd>${s.published} sent · ${s.received} received${s.rejected ? ` · <span class="warn">${s.rejected} refused</span>` : ''}</dd>
         <dt>Reconnects</dt><dd>${s.reconnects ?? 0}${s.backoffs ? ` · <span class="warn">${s.backoffs} rate-limit pauses</span>` : ''}</dd>`;
       const piped = room.transport?.piped;
-      if (piped) relayHtml += `<dt>Fallback route</dt><dd>${piped.sent} batches sent · ${piped.received} datagrams received${piped.dropped ? ` · ${piped.dropped} dropped` : ''}</dd>`;
+      if (piped) relayHtml += `<dt>Fallback route</dt><dd>${piped.sent} batches sent · ${piped.received} datagrams received${piped.dropped ? ` · ${piped.dropped} dropped` : ''}${piped.stale ? ` · ${piped.stale} late (the WebRTC link took over)` : ''}</dd>`;
       const tr = room.transport;
       if (tr) relayHtml += `<dt>WebRTC signals</dt><dd>${tr.resent ?? 0} resent · ${tr.restarts ?? 0} ICE restarts${tr.badSignals ? ` · ${tr.badSignals} refused` : ''}</dd>`;
       relayHtml += '</dl>';

@@ -79,6 +79,9 @@ that needs a change is tracked as an NB card.
 | NB44c-1, NB44c-2, NB46-1 (Low) | Open, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
 | NB48b-5, NB48b-6 (Info) | **Fixed** by `08425b8` (a stale link's close keeps the peer) and `2a00ecb` (CARRY replies bounded), re-checked 2026-10-24 |
+| MIC-1, MIC-3 (Low) | **Fixed** by `d78d046`, `877d02c` and `6303bd8` (Net Lab's global room and punch offers; `public-only` in `@peerwire/js` 0.1.1 and earlier), reviewed 2026-10-24; residual MIC-4 ([below](#bounds-and-residuals-from-reviews-nb-014nb-043)) |
+| MIC-2 (Info) | **Fixed** by `9282d36` (a punch that ended closes what it opened) and `691dec0` (one offer and one answer per punch, which also closes a Low NB48-1 bypass), reviewed 2026-10-24 |
+| MIC-4 (Low), MIC-5 (Info) | Open, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -843,6 +846,34 @@ and what it accepted. Values are from main `7b716a2`.
   by name, but VPN tunnels (`wg*`, `tun*`, `utun*`, `ppp*`) are not. So under
   `Direct` a peer can learn, for example, a corporate VPN address. Suggested: skip
   those interface names too.
+- **MIC-3 (Low, privacy): `public-only` in `@peerwire/js` 0.1.1 and earlier gave out
+  local addresses.**
+  - **What:** once a browser shows a page's local addresses (the page has microphone
+    or camera permission), a server-reflexive candidate's related address (`raddr`,
+    `rport`) is the local socket it was sent from. So each interface with a STUN
+    mapping gave away its local address, in the description and in trickled and late
+    candidates. When no STUN answer came before the description was taken (on Nostr,
+    within `GATHER_MAX_MS`, 2 s), gathering had also written a host address into `c=`,
+    the m-line port and `a=rtcp:`.
+  - **Who:** `joinRoom({ privacy: 'public-only' })`, and `WebRtcTransport` under
+    `'public-only'` or `'relay-only'`. An app with camera or microphone permission
+    (voice, video, meetings) that chose `public-only` gave every peer that got its
+    description (in a room, every member) its LAN, VPN tunnel and container bridge
+    addresses.
+  - **Fixed** by `6303bd8`: `withoutHostCandidates` and the transport's sent
+    candidates clear the related address to `0.0.0.0 0`, and `c=`, the m-line port and
+    `a=rtcp:` go back to `0.0.0.0` and `9`, as before gathering. ICE reads none of
+    these. The clearing doesn't rely on the runtime hiding anything, so it also holds
+    in runtimes that never hide local addresses (we haven't checked which ones fill
+    `raddr` without a permission). Suggested: the next npm release notes tell apps on
+    0.1.1 that use `public-only` to upgrade.
+  - **Not covered:** `'direct'` gives out every local address the runtime shows. ICE
+    checks leave from local sockets, so a peer on the same network can still see a
+    local address as a peer-reflexive candidate.
+- **MIC-5 (Info):** `withoutHostCandidates` splits on `\r\n` only, so an SDP with bare
+  `\n` line ends comes out unchanged, host candidates and all. Browsers write `\r\n`;
+  a custom `RTCPeerConnection` (Node, native) might not. Suggested: split on `\n` as
+  `stripCandidates` does (NB48b-3), and match `typ host` before any `\r`.
 
 **Demos**
 - No CSP is sent by `crew-server.mjs`, which serves Net Lab and Crew. Only the Docker
@@ -864,17 +895,33 @@ and what it accepted. Values are from main `7b716a2`.
     the default route, such as the connection under a VPN, or mobile data while on
     Wi-Fi. In the global room that is anyone. The grant is stored per origin, so
     later visits and the other demos on that origin do the same without a tap.
-    `privacy: 'public-only'` drops the local (`host`) candidates but not the
-    per-interface mappings. Any app that asks for the microphone or camera (voice,
-    video) gets the same under `privacy: 'direct'`, the default. Suggested: Net Lab
-    joins the global room with `privacy: 'public-only'` while the microphone is
-    allowed, and the button says that local addresses go to room members until the
-    permission is removed in the site settings.
+    `privacy: 'public-only'` drops the local (`host`) candidates, and since `6303bd8`
+    every other local address too (MIC-3), but still sends each interface's public
+    mapping. Any app that asks for the microphone or camera (voice, video) gets the
+    same under `privacy: 'direct'`, the default. **Fixed** for Net Lab by `d78d046`:
+    the global room is joined with `privacy: 'public-only'` while the microphone is
+    allowed, also after a grant made in another tab, in the site settings or while
+    joining. The button and its text say that named and private rooms get the local
+    addresses until the permission is removed in the site settings. `877d02c` sends a
+    birthday punch's offer without candidates (the hard side never used them), and
+    `6303bd8` takes the default address out of both punch descriptions. Residual MIC-4.
   - **MIC-2 (Info):** a birthday punch closed while its `openFleet`, `openSpray` or
     certificate is still pending (a rejoin, its timeout, the peer's abort) throws
     when that resolves. The connections it just opened are left open, and the
-    one-fleet slot is already free. Nothing is sent. Suggested: after each await,
-    check that the punch is still the current one, and close what was opened if not.
+    one-fleet slot is already free. Nothing is sent. **Fixed** by `9282d36`: after
+    each await of a punch's setup, a punch that has ended closes what it just opened
+    and returns. `691dec0` takes one offer per punch on the hard side and one answer
+    on the easy side, marked before the first await. Before, each further offer from
+    the peer in a punch the user had accepted opened another fleet of up to
+    `FLEET_SIZE` connections, and closing the punch closed only the last: a Low
+    bypass of NB48-1's one fleet at a time.
+  - **MIC-4 (Low, privacy):** in the global room, the button re-tests the network
+    after the grant (`reprobe()`: 2.5 s after the first STUN answer, at most 8 s) and
+    only then rejoins with `public-only`; `guardGlobal` leaves it to the button. A
+    member who links in that window gets the real local addresses. In Chromium, with
+    a 2.5 s re-test, a tab that joined during it got all four of the other tab's local
+    addresses, and none with the rejoin first. Suggested: rejoin as soon as the
+    permission changes, before anything else that waits.
 
 ---
 
