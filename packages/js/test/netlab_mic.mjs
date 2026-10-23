@@ -126,7 +126,8 @@ try {
       const easyId = ids[0] < ids[1] ? ids[0] : ids[1];
       await easy.evaluate(() => window.netlab.punch(0));
       const offer = await hard.waitForFunction((x) => window.netlab.birthday().find((b) => b.id === x)?.pendingOffer?.sdp, easyId, { timeout: 20000 }).then((v) => v.jsonValue());
-      return { hosts, offer, mic: r1.me.mediaPermission,
+      const locals = [...new Set((await report(easy)).me.network.host.map((c) => c.address))];
+      return { hosts, offer, locals, mic: r1.me.mediaPermission,
         joinLog: r1.log.find((e) => e.msg.startsWith('joining the global room'))?.msg, note: await g1.textContent('#micmsg'), page: g1 };
     })(),
     (async () => {
@@ -147,6 +148,9 @@ try {
     ok(/without local addresses/.test(g.joinLog) && /kept out of the global room/.test(g.note), `and it says so: "${g.joinLog}" · "${g.note.split(' · ')[1]}"`);
     const cands = g.offer.split('\n').filter((l) => /^a=candidate:/.test(l.trim()));
     ok(/^v=0/.test(g.offer) && /\nm=application /.test(g.offer) && !cands.length, `and a birthday punch's offer carries no candidate (${cands.length}${cands.length ? `: ${cands.map((l) => l.split(' ')[4]).join(', ')}` : ''})`);
+    // Nor any of the tab's local addresses anywhere else (gathering writes one into c=).
+    const named = g.locals.filter((ip) => g.offer.includes(ip));
+    ok(g.locals.length > 0 && !named.length, `and names none of its ${g.locals.length} local addresses${named.length ? `: ${named.join(', ')} in ${g.offer.split('\n').filter((l) => named.some((ip) => l.includes(ip))).map((l) => l.trim()).join(' | ')}` : ''}`);
     if (shot) await card(g.page).screenshot({ path: `${shot}-global.png` });
   }
   if (hSettled.status === 'rejected') ok(false, `global room, granted while in it: ${hSettled.reason.message}`);

@@ -145,7 +145,10 @@ it is given:
 - `'direct'` (default): every candidate.
 - `'public-only'`: no `host` candidates (LAN, loopback, mDNS `.local` names), in
   trickled ICE and in the SDP. Only what STUN reports goes out, so two tabs on one
-  machine with no STUN server can't link this way.
+  machine with no STUN server can't link this way. No other local address goes either:
+  a candidate's related address (its local socket, which browsers show once a page has
+  mic or camera permission) is cleared, and so is the default address that gathering
+  writes into the SDP's `c=` line and m-line port.
 - `'relay-only'` with `relay: <peer id>`: WebRTC runs with the relay only (also
   public-only); offers from anyone else are ignored and `dial()` to them throws.
   Reach other peers with `endpoint.connectVia(relay, peer)`: the endpoint is
