@@ -235,7 +235,8 @@ export declare class Endpoint {
   /** Throws `Error('connectVia: endpoint closed')` after `close()`. */
   connectVia(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): number;
   /** A direct address for a relayed (or dialling) peer: punches to it and moves the link there once the peer
-   * answers from it. Does nothing for a peer linked directly or unknown, or after `close()`. */
+   * answers from it. Does nothing for a peer linked directly or unknown, while relay-only for one linked or
+   * being dialled through a relay (nothing is sent to `addr`), or after `close()`. */
   addCandidate(addr: number, peer: PeerId | Uint8Array): void;
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
    * (reason 'closed') now rather than after its idle timeout. No local event; does nothing after `close()`. */
