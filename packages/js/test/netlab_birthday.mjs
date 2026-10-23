@@ -28,7 +28,16 @@ const ok = (cond, what) => {
 };
 try {
   await new Promise((r) => setTimeout(r, 600));
-  browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  // The route line is logged from a 1 s render timer in each tab: keep background tabs'
+  // timers running (as arena.mjs), or a loaded host can starve them past the waits.
+  browser = await chromium.launch({
+    args: [
+      '--disable-features=WebRtcHideLocalIpsWithMdns',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding',
+      '--disable-backgrounding-occluded-windows',
+    ],
+  });
   const ctx = await browser.newContext({ viewport: { width: 1360, height: 900 } });
   const key = `bday${port}abcdefgh`;
   const pages = [];
