@@ -280,7 +280,8 @@ export class WebRtcTransport {
       // Opened after the room fell back (ICE went on checking): a link relayed by a
       // member punches over it and moves there; a pipe's datagrams go over it (see
       // onTransmit). Else the dialler's handshake goes over it, joining a dial under way.
-      if (this.ep.isConnected(peer)) this.ep.addCandidate(h, peer);
+      // (An endpoint stand-in with only connect and receive gets the dial alone.)
+      if (this.ep.isConnected?.(peer)) this.ep.addCandidate?.(h, peer);
       else if (l.dialer) this.ep.connect(h, peer);
       this.onPeer(peer, 'open');
     };
