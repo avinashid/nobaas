@@ -676,6 +676,10 @@ async function onBirthday(peer, data) {
     return;
   }
   if (data.step === 'offer' && b.role === 'hard' && typeof data.sdp === 'string') {
+    // One offer per punch, marked before any await: a second would open a second fleet,
+    // and closing the punch would close only the last one.
+    if (b.ctx.offered) return;
+    b.ctx.offered = true;
     // The hard side: open the fleet answering the easy side's one offer, aimed only at the
     // one validated address it gave (openFleet strips the offer's candidates). Answer with our IP.
     const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
@@ -692,6 +696,9 @@ async function onBirthday(peer, data) {
     room.send({ t: 'bday', step: 'answer', sdp: hard.answerSdp, ip: myProbedV4() }, { to: peer });
     hard.done.then((c) => bdayWon(peer, c)).catch(() => {});
   } else if (data.step === 'answer' && b.role === 'easy' && typeof data.sdp === 'string') {
+    // One answer per punch: a second would be applied to a connection that has one.
+    if (b.ctx.answered) return;
+    b.ctx.answered = true;
     const ip = typeof data.ip === 'string' ? data.ip : null;
     if (!isPublicV4(ip)) return bdayFail(peer, 'the peer named no public IPv4 to spray'); // NB48-2
     const ports = sprayPorts(SPRAY_PORTS);

@@ -307,8 +307,9 @@ Run these with Node and the Playwright install on this host:
   no local address and still links, and a birthday punch's offer carries no candidate. A refused
   prompt reports `denied` and doesn't rejoin.
 - `node packages/js/test/netlab_punch_close.mjs`: a Net Lab birthday punch that ends (the peer's abort)
-  while its fleet, its spray connection or the answer is still being set up closes the connections
-  made after it ended, and its card keeps the reason it ended, not a stale error.
+  while its certificate, fleet, spray connection or answer is still being set up closes the connections
+  made after it ended, and its card keeps the reason it ended, not a stale error. A second offer or
+  answer from the peer is ignored: one fleet, all of it closed at the end.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
