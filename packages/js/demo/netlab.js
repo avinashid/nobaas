@@ -441,10 +441,11 @@ function onMessage(data, peer, info) {
 //
 // Runs the browser birthday punch (src/birthday.js) between this tab and a peer, over
 // the room's own signalling, and reports whether a direct WebRTC data channel forms
-// across their real NATs. This is a measurement: the channel it makes is not used for
-// room traffic (that still needs the core's fallback→direct upgrade); it answers "can
-// these two browsers punch directly?". The symmetric-NAT side opens a fleet of
-// connections sharing one certificate and credentials; the cone side sprays its IP.
+// across their real NATs. When it does and the room reaches that peer only by fallback
+// (relayed by a member, or over signalling), both tabs hand the channel to the room
+// (room.adoptChannel) and the room link goes direct over it; when the room link is
+// direct already, the channel was a test and closes. The symmetric-NAT side opens a
+// fleet of connections sharing one certificate and credentials; the cone side sprays.
 
 const BDAY_TIMEOUT_MS = 70000;
 const BDAY_COOLDOWN_MS = 300000; // one punch per peer per 5 min (NB48-1); reload to reset
@@ -565,7 +566,7 @@ async function onBirthday(peer, data) {
     b.ctx.hard = hard;
     log('info', `birthday punch with ${nameOf(peer)}: opened ${hard.conns.length} sockets, answering`);
     room.send({ t: 'bday', step: 'answer', sdp: hard.answerSdp, ip: myProbedV4() }, { to: peer });
-    hard.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
+    hard.done.then((c) => bdayWon(peer, c)).catch(() => {});
   } else if (data.step === 'answer' && b.role === 'easy' && typeof data.sdp === 'string') {
     const ip = typeof data.ip === 'string' ? data.ip : null;
     if (!isPublicV4(ip)) return bdayFail(peer, 'the peer named no public IPv4 to spray'); // NB48-2
@@ -583,10 +584,13 @@ async function beEasy(peer) {
   const easy = await openSpray({ RTCPeerConnection, iceServers: bdayIce() });
   b.ctx.easy = easy;
   room.send({ t: 'bday', step: 'offer', sdp: easy.offerSdp, addr: srflxAddr(easy.offerSdp) }, { to: peer });
-  easy.done.then((c) => bdayWon(peer, c.pc)).catch(() => {});
+  easy.done.then((c) => bdayWon(peer, c)).catch(() => {});
 }
 
-async function bdayWon(peer, pc) {
+// The punch made a direct channel `{ pc, dc }`. If the room reaches the peer only by
+// fallback, offer the channel to the room (the peer does the same on its side);
+// otherwise, or if the peer doesn't take it, it was a test: close it after a moment.
+async function bdayWon(peer, { pc, dc }) {
   const b = peerState(peer).bday;
   if (!b || b.status !== 'running') return;
   const ms = Math.round(now() - b.startedAt);
@@ -597,10 +601,29 @@ async function bdayWon(peer, pc) {
     if (sel) Object.assign(won, { path: `${sel.local?.candidateType}↔${sel.remote?.candidateType}`, addr: addrOf(sel.remote) });
   } catch { /* closed under us */ }
   if (peerState(peer).bday !== b || b.status !== 'running') return; // timed out meanwhile
-  bdayStatus(peer, 'linked', won);
-  log('info', `birthday punch with ${nameOf(peer)} WORKED: a direct channel${won.addr ? ` to ${won.addr}` : ''}${won.path ? ` (${won.path})` : ''} formed in ${secs(ms)}, as the ${b.role} side (${won.how}). It is a test channel: the room link stays ${routeLabel(room.route(peer))}`);
-  // It is a measurement, not a room link: close it after a moment so sockets don't linger.
-  setTimeout(() => closeBday(peer), 1500);
+  // The winner leaves the punch's hands, so closeBday (which frees the slot and closes
+  // the losers) leaves it open.
+  if (b.ctx?.easy?.pc === pc) b.ctx.easy = null;
+  if (b.ctx?.hard) b.ctx.hard.conns = b.ctx.hard.conns.filter((c) => c.pc !== pc);
+  closeBday(peer);
+  const before = room.route(peer);
+  const what = `birthday punch with ${nameOf(peer)} WORKED: a direct channel${won.addr ? ` to ${won.addr}` : ''}${won.path ? ` (${won.path})` : ''} formed in ${secs(ms)}, as the ${b.role} side (${won.how})`;
+  if (!before || before.kind === 'direct') {
+    bdayStatus(peer, 'linked', { ...won, carried: false });
+    log('info', `${what}. The room link is ${routeLabel(before)} already, so this was a test channel; closing it`);
+    setTimeout(() => pc.close(), 1500);
+    return;
+  }
+  bdayStatus(peer, 'linked', { ...won, carried: null });
+  const mine = peerState(peer).bday; // bdayStatus makes a new object
+  log('info', `${what}. Moving the room link onto it (it is ${routeLabel(before)} now)…`);
+  const carried = await room.adoptChannel(peer, pc, dc);
+  if (peerState(peer).bday === mine) bdayStatus(peer, 'linked', { carried });
+  if (carried) log('info', `room link to ${nameOf(peer)} now goes over the birthday-punch channel (was ${routeLabel(before)})`);
+  else {
+    log('warn', `${nameOf(peer)} didn't take the birthday-punch channel (an older Net Lab, or its link to you is direct): it was a test channel; closing it. The room link stays ${routeLabel(room.route(peer))}`);
+    pc.close();
+  }
 }
 
 // The birthday-punch control + result in a peer card.
@@ -612,7 +635,9 @@ function bdayRow(p) {
   else if (b?.status === 'invited') { label = 'Accept punch'; note = `${nameOf(p.id)} asked — you'd be the ${b.role} side`; cls = 'warn'; }
   else if (b?.status === 'linked') {
     label = 'Punch again';
-    note = `worked: a direct channel${b.addr ? ` to ${b.addr}` : ''} in ${secs(b.ms)}${b.path ? ` · ${b.path}` : ''} · a test channel, the room link is ${routeLabel(room.route(p.id))}`;
+    const r = room.route(p.id);
+    const use = r?.adopted ? 'the room link goes over it' : b.carried === null ? 'moving the room link onto it…' : b.carried ? `it closed: the room link is ${routeLabel(r)}` : `a test channel, the room link is ${routeLabel(r)}`;
+    note = `worked: a direct channel${b.addr ? ` to ${b.addr}` : ''} in ${secs(b.ms)}${b.path ? ` · ${b.path}` : ''} · ${use}`;
     cls = 'ok';
   }
   else if (b?.status === 'failed') { label = 'Try again'; note = b.why; cls = 'bad'; }
@@ -627,7 +652,7 @@ function routeLabel(r) {
   if (!r) return 'not linked';
   if (r.kind === 'peer') return `relayed by ${nameOf(r.via)}`;
   if (r.kind === 'signaling') return 'over the signalling relays';
-  return 'direct';
+  return r.adopted ? 'direct (birthday-punch channel)' : 'direct';
 }
 
 function tickPings() {
@@ -685,7 +710,8 @@ function pingStats(p) {
 // ---------- WebRTC details ----------
 
 async function iceOf(peer) {
-  const link = [...(room.transport?.links?.values() ?? [])].find((l) => l.peer === peer);
+  // A link a birthday punch's channel carries: that connection, not the failed one.
+  const link = room.transport?.carrier?.(peer) ?? [...(room.transport?.links?.values() ?? [])].find((l) => l.peer === peer);
   if (!link?.pc) return null;
   const pc = link.pc;
   const out = { connection: pc.connectionState, ice: pc.iceConnectionState, gathering: pc.iceGatheringState, channel: link.dc?.readyState ?? null };
@@ -993,7 +1019,7 @@ async function render() {
       const direct = isLinked && r?.kind === 'direct' && pair ? pathLine(pair) : null;
       if (direct && direct !== p.pathLogged) {
         p.pathLogged = direct;
-        log('info', `route to ${name}: direct to ${direct}`);
+        log('info', `route to ${name}: direct to ${direct}${r.adopted ? ', over the birthday-punch channel' : ''}`);
       }
       cards.push(`<div class="peer${p.leftAt ? ' gone' : ''}">
         <div class="phead">
@@ -1076,7 +1102,7 @@ function report() {
       heardToJoinMs: p.heardAt && p.joinedAt ? Math.round(p.joinedAt - p.heardAt) : null,
       signaling: p.sig, theirHosts: p.theirHosts ?? [], hotspotTried: p.hotspot ?? [], iceChecks: [...p.pairs.values()],
       rtcFailed: !!p.rtcFailedAt, left: p.leftAt ? p.leaveReason : null,
-      birthday: p.bday && { status: p.bday.status, role: p.bday.role, ms: p.bday.ms, addr: p.bday.addr, path: p.bday.path, how: p.bday.how, why: p.bday.why },
+      birthday: p.bday && { status: p.bday.status, role: p.bday.role, ms: p.bday.ms, addr: p.bday.addr, path: p.bday.path, how: p.bday.how, why: p.bday.why, carried: p.bday.carried },
     })),
     log: events.map((e) => ({ t: new Date(e.at).toISOString(), level: e.level, msg: e.msg })),
   };
@@ -1188,6 +1214,13 @@ window.netlab = {
   joinGlobal: () => enter('global'),
   joinNamed: (name) => enter('named', roomIdOf(name)),
   punch: (i = 0) => tryBirthday(room.peers[i]),
+  // Tests: as if a birthday punch with peer i had just made the channel `{ pc, dc }`
+  // (loopback has one NAT, so a real punch can't meet there).
+  punchWon: (i, chan) => {
+    const peer = room.peers[i];
+    bdayStatus(peer, 'running', { role: 'hard', startedAt: now(), ctx: {} });
+    return bdayWon(peer, chan);
+  },
   birthday: () => room?.peers.map((id) => ({ id, name: nameOf(id), ...(peerState(id).bday ?? { status: null }) })).map(({ ctx, ...b }) => b) ?? [],
   get room() { return roomKind && { kind: roomKind, label: roomLabel(), link: roomLink() }; },
   roomIdOf,
