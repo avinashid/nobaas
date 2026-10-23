@@ -218,12 +218,14 @@ const pw = await loadPeerwire(wasm);
   const r = rng('room');
   const opts = { appId: 'peerwire-fuzz', roomId: `fuzz-${process.pid}` };
   const [a, b] = await Promise.all([joinRoom(opts), joinRoom(opts)]);
-  const t = Date.now();
-  while (a.peers.length !== 1 || b.peers.length !== 1) {
-    if (Date.now() - t > 10000) break;
-    await new Promise((res) => setTimeout(res, 10));
-  }
-  check(a.peers.length === 1, 'room: two peers joined');
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+  const until = async (cond, ms) => {
+    for (const t = Date.now(); !cond() && Date.now() - t < ms;) await sleep(10);
+    return cond();
+  };
+  // Both sides, not just one: b.send below reaches only b's members.
+  const meshed = () => a.peers.includes(b.self) && b.peers.includes(a.self);
+  check(await until(meshed, 10000), `room: two peers joined (a lists ${a.peers.length}, b lists ${b.peers.length})`);
   const got = [];
   a.on('message', (data, from, info) => got.push([data, from, info.kind]));
   let threw = 0;
@@ -244,14 +246,13 @@ const pw = await loadPeerwire(wasm);
       threw++;
     }
   }
-  await new Promise((res) => setTimeout(res, 300)); // proof checks of strangers' frames settle
+  await sleep(300); // proof checks of strangers' frames settle
   check(threw === 0, `room: ${cases(5000)} frames, none throws`);
   check(got.length > 0 && got.every(([, f, k]) => f === b.self && ['bytes', 'text', 'json'].includes(k)), `room: ${got.length} messages, all from the member`);
   got.length = 0;
   b.send('still here');
-  const t2 = Date.now();
-  while (!got.some(([d]) => d === 'still here') && Date.now() - t2 < 5000) await new Promise((res) => setTimeout(res, 10));
-  check(got.some(([d]) => d === 'still here') && a.peers.includes(b.self), 'room: the member still reaches us afterwards');
+  const heard = await until(() => got.some(([d]) => d === 'still here'), 5000);
+  check(heard && meshed(), `room: the member still reaches us afterwards (${heard ? 'heard' : 'not heard'}, a lists ${a.peers.length}, b lists ${b.peers.length})`);
   await Promise.all([a.leave(), b.leave()]);
 }
 
