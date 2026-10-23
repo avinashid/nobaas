@@ -71,11 +71,11 @@ that needs a change is tracked as an NB card.
 | NPM-3 (Low) | **Fixed** by `6f947f3`: a map request in flight at stop gets one delete |
 | NB44-1 (Medium) | **Fixed** by `40e42db` (per-IP punch cap), re-checked 2026-10-23 ([below](#hard-nat-punching-nb-044-nb-045-nb-046-nb-048--nb44-1nb48-2)) |
 | NB48-1 (Medium) | **Fixed** by `d1b2d25` (fleet checks one public address; Net Lab consent and cooldown), re-checked 2026-10-23 |
-| NB48-2 (Low) | Fixed in part by `d1b2d25` (public spray IP); the rest is NB48b-3 |
+| NB48-2 (Low) | **Fixed** by `d1b2d25` (public spray IP) and `695b38b` (NB48b-3); the IP isn't matched to the peer's signalling (accepted) |
 | NB44-2, NB44-3 (Low) | **Fixed** by `a16072e` (NB-044b: authenticated routes, fd reserve), re-checked 2026-10-23; residuals NB44c-1, NB44c-2 |
 | NB48b-2 (Low) | **Fixed** by `de9efea` (the busy slot is held per peer), re-checked 2026-10-24 |
-| NB48b-1 (Low) | Fix applied by `de9efea` (the answer is stripped), but bypassed: NB48b-3 |
-| NB44c-1, NB44c-2, NB46-1, NB48b-3, NB48b-4 (Low) | Open, same section |
+| NB48b-1, NB48b-3 (Low) | **Fixed** by `de9efea` (the answer is stripped) and `695b38b` (Chrome's line model, checked after apply), re-checked 2026-10-24 |
+| NB44c-1, NB44c-2, NB46-1, NB48b-4 (Low) | Open, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
 | NB48b-5, NB48b-6 (Info) | Open (robustness and hardening of the carried channel), same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -551,7 +551,8 @@ loopback included.
 - Test: an answer with N candidates leaves only the spray candidates.
 - **Status: fix applied** by `de9efea`, re-checked 2026-10-24. Answers with CRLF,
   LF-only, upper-case or tab-separated candidates drew 0 remote candidates and 0
-  checks in Chromium. The strip itself can be bypassed, though: NB48b-3.
+  checks in Chromium. The strip itself could be bypassed, though: NB48b-3, fixed by
+  `695b38b`.
 
 **NB48b-2 — "One fleet at a time" is cleared by its own refusal (Low).**
 - The bug: `closeBday` always sets `bdayBusy = false`. Both the busy refusal and the
@@ -587,6 +588,23 @@ survive the strip and are still parsed as candidates.
 - Test: stripping SDPs with every line ending, and a stray `\r` or U+2028 inside a
   candidate line, leaves no `\n`-delimited candidate line. In Chromium, the fleet
   has 0 remote candidates and the easy side only the sprayed ones.
+- **Status: fixed** by `695b38b`, re-checked 2026-10-24.
+  - `stripCandidates` splits on `\n` only, as Chrome does, and drops every line that
+    starts (after any whitespace) with `a=candidate:`, in any case.
+  - `openFleet` and `applyAnswer` then check Chrome's own remote description. If a
+    candidate is still there, they close every connection they opened and fail.
+  - Re-check probe (Chromium, loopback listeners counting STUN checks): 29
+    line-ending, prefix and case variants, each with one candidate aimed at a
+    listener. Unstripped, Chrome checked 4 of them (41 checks each in 2.5 s) and
+    rejected or ignored the rest. Through the fixed `openFleet` and `applyAnswer`:
+    0 checks for all 29, and the easy side had only its sprayed candidates. The
+    variants the strip leaves alone make Chrome reject the whole description, and
+    both calls then fail and close.
+  - Residual (Info, accepted): the after-apply check is a backstop for a future
+    parser change. On the fleet it runs before the answer, so ICE never starts (0
+    checks). On the easy side, which offers, ICE starts as soon as the answer is
+    applied: with candidates forced past the strip, exactly one check left before the
+    close, for 1, 5 or 20 candidates.
 
 **A punched channel carries the room link (`fd660de`, `cf49f72`; reviewed
 2026-10-24).** A birthday punch that works hands its DataChannel to the room
@@ -642,13 +660,13 @@ ports 1024 and up of any IPv4 address, including the visitor's own router or LAN
 hosts, or loopback. Fix: accept only a public IPv4 address (not RFC 1918, loopback,
 100.64/10, link-local or multicast) that matches a server-reflexive address in the
 peer's own signalling.
-- **Status: fixed in part** by `d1b2d25`.
+- **Status: fixed** by `d1b2d25` and `695b38b`.
   - Fixed: `isPublicV4` refuses non-public spray IPs, and the spray needs the
     visitor's click.
   - Left as is: the IP isn't matched to anything the peer proved, since the peer
     writes all of that signalling anyway.
-  - Still open: the LAN reach this finding was about remains through the answer's
-    own candidates: NB48b-1, now NB48b-3.
+  - The LAN reach that remained through the answer's own candidates (NB48b-1, then
+    NB48b-3) is closed by `695b38b`.
 
 **NB46-1 — A peer can keep the dialling side publishing offers (Low).** A `restart`
 signal makes the dialling side create and publish an ICE-restart offer, resent up to
