@@ -1144,9 +1144,12 @@ impl<A: Address> Endpoint<A> {
         let State::Dialing(dial) = &mut sess.state else {
             return Some(receiver); // duplicate HS2 for a link that is already up
         };
-        // Relay-only: a dial through a relay completes through it, even if an HS1
-        // sent direct before relay-only was turned on is answered there.
-        if self.relay_only && sess.relay.is_some() && matches!(from, Path::Direct(_)) {
+        // Relay-only: answered at our own address only if dialled directly (as
+        // `answers_directly`), so a dial through a relay alone completes through
+        // it, even if an HS1 sent direct before relay-only was turned on is
+        // answered there.
+        let direct_dial = dial.targets.iter().any(|t| matches!(t, Path::Direct(_)));
+        if self.relay_only && matches!(from, Path::Direct(_)) && !direct_dial {
             self.stats.rx_handshake_dropped += 1;
             return None;
         }
@@ -1899,5 +1902,25 @@ mod tests {
         assert_eq!(eps[0].path(&b), Some(&Path::Via(r)), "the dial completes through r");
         let to_c: Vec<u32> = sent.iter().filter(|&&(i, d)| i == 0 && to_c(&d)).map(|s| s.1).collect();
         assert!([21, 22, 23].into_iter().chain(500..600).all(|x| to_c.contains(&x)), "{to_c:?}");
+    }
+
+    /// Relay-only, a direct dial also given a relay while pending keeps its
+    /// direct target, so the peer's answer there is taken and the link is direct.
+    #[test]
+    fn relay_only_direct_dial_given_a_relay_takes_the_direct_answer() {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (b, r) = (ids[1].peer_id(), ids[2].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, 3, r).unwrap();
+        eps[1].connect(t, 3, r).unwrap();
+        route(&mut eps, &mut t, 100, None);
+        eps[0].set_relay_only(true);
+        eps[0].connect(t, 2, b).unwrap();
+        eps[0].connect_via(t, r, b, &[]).unwrap();
+        route(&mut eps, &mut t, 1000, None);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)));
+        assert_eq!(eps[0].stats().rx_handshake_dropped, 0);
     }
 }
