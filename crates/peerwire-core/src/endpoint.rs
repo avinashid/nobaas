@@ -976,6 +976,20 @@ impl<A: Address> Endpoint<A> {
         self.on_packet(now, Path::Direct(from), data);
     }
 
+    /// Like [`Endpoint::handle_datagram`], and additionally reports whether the
+    /// datagram authenticated to a session whose direct path is now `from`.
+    ///
+    /// A birthday-punch host (`Node::read_extra`) adopts an extra socket as the
+    /// route to `from` only when this holds, so an unauthenticated or spoofed
+    /// source can neither redirect our egress nor hold an extra socket open past
+    /// its deadline (NB44-2).
+    pub fn handle_datagram_direct(&mut self, now: Instant, from: A, data: &[u8]) -> bool {
+        match self.on_packet(now, Path::Direct(from.clone()), data) {
+            Some(idx) => self.sessions.get(&idx).and_then(|s| s.path.direct()) == Some(&from),
+            None => false,
+        }
+    }
+
     /// Returns the session the packet belonged to.
     fn on_packet(&mut self, now: Instant, from: Path<A>, data: &[u8]) -> Option<u32> {
         self.stats.rx_packets += 1;

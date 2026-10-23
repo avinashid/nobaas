@@ -26,6 +26,12 @@ const RELAY_REDIAL: Duration = Duration::from_secs(1);
 const RELAY_REDIAL_MAX: Duration = Duration::from_secs(30);
 /// Most extra sockets open at once, for birthday punching (two punches' worth).
 const MAX_EXTRA_SOCKETS: usize = 512;
+/// Extra sockets to release when a bind runs out of file descriptors, so the rest
+/// of the process keeps headroom instead of sitting at the ceiling (NB44-3).
+const FD_RESERVE: usize = 64;
+/// Most routes held at once: one per open extra socket, so a flood can't grow the
+/// map (NB44-2). `close_extra` prunes it to the open sockets anyway.
+const MAX_ROUTES: usize = MAX_EXTRA_SOCKETS;
 /// An extra socket that carries a route is closed once it has heard nothing for this long.
 const ROUTE_IDLE: Duration = Duration::from_secs(60);
 /// While extra sockets are open, a host sleeping on `next_timeout` wakes at least
@@ -763,19 +769,33 @@ impl Node {
     fn open_extra(&mut self, b: &Birthday<SocketAddr>) {
         let any = SocketAddr::new(self.local.ip(), 0);
         let n = (b.sockets as usize).min(MAX_EXTRA_SOCKETS.saturating_sub(self.extra.len()));
+        let mut opened: Vec<u64> = Vec::new();
         for _ in 0..n {
-            let Ok(sock) = bind_socket(any) else { break };
+            let sock = match bind_socket(any) {
+                Ok(s) => s,
+                // NB44-3: out of file descriptors (the macOS default soft limit is
+                // 256). Don't sit at the ceiling for the socket's lifetime, which
+                // would make the rest of the process fail with EMFILE: release a
+                // reserve of the sockets this punch just opened and stop.
+                Err(_) => {
+                    for id in opened.iter().rev().take(FD_RESERVE) {
+                        self.extra.remove(id);
+                    }
+                    break;
+                }
+            };
             if sock.set_nonblocking(true).is_err() {
                 continue;
             }
             let _ = sock.send_to(&b.payload, self.wire_addr(b.dst));
             self.next_extra += 1;
             self.extra.insert(self.next_extra, Extra { sock, until: b.until, last_recv: None });
+            opened.push(self.next_extra);
         }
     }
 
     /// Hands the endpoint what the extra sockets heard. The first open one to hear
-    /// from an address becomes its route.
+    /// an authenticated packet from an address becomes its route.
     fn read_extra(&mut self, now: peerwire_core::Instant) {
         let ids: Vec<u64> = self.extra.keys().copied().collect();
         for id in ids {
@@ -790,6 +810,16 @@ impl Node {
                 if peerwire_core::stun::is_stun(&self.buf[..n]) {
                     continue; // STUN is asked on the main socket only
                 }
+                // NB44-2: adopt `from` as a route only once the datagram has
+                // authenticated to a session on this direct path. An unauthenticated
+                // or spoofed source otherwise made itself a route, redirecting our
+                // egress and holding the socket open; now it is just dropped.
+                if !self.ep.handle_datagram_direct(now, from, &self.buf[..n]) {
+                    continue;
+                }
+                if self.routes.len() >= MAX_ROUTES && !self.routes.contains_key(&from) {
+                    continue; // bound the map (NB44-2); real routes never reach this
+                }
                 let open = |r: &u64| self.extra.get(r).is_some_and(|x| x.open(now));
                 let route = self.routes.get(&from).copied().filter(open).unwrap_or(id);
                 self.routes.insert(from, route);
@@ -798,7 +828,6 @@ impl Node {
                         x.last_recv = Some(now);
                     }
                 }
-                self.ep.handle_datagram(now, from, &self.buf[..n]);
             }
         }
     }
@@ -819,6 +848,12 @@ impl Node {
     fn extra_sockets(&self) -> (Vec<SocketAddr>, usize) {
         let addrs = self.extra.values().filter_map(|x| x.sock.local_addr().ok()).collect();
         (addrs, self.extra.values().filter(|x| x.last_recv.is_some()).count())
+    }
+
+    /// Entries in the route map.
+    #[cfg(test)]
+    fn route_count(&self) -> usize {
+        self.routes.len()
     }
 
     fn track(&mut self, e: &Event) {
@@ -1014,6 +1049,37 @@ mod tests {
         }
         let (socks, routes) = a.extra_sockets();
         assert_eq!((socks, routes), (vec![hit], 1), "only the route is left");
+    }
+
+    /// NB44-2: an unauthenticated flood to an extra socket makes no route and does
+    /// not keep the socket open; the extra sockets still close at `until`.
+    #[test]
+    fn birthday_sockets_ignore_unauthenticated_floods() {
+        let mut a = quiet("127.0.0.1:0");
+        let peer = quiet("127.0.0.1:0").peer_id(); // a peer we never dial
+        let until = a.now() + Duration::from_millis(200);
+        let dst = "127.0.0.1:9".parse().unwrap();
+        let opened = Birthday { peer, dst, sockets: 4, payload: b"x".to_vec(), until };
+        a.open_extra(&opened);
+        let (socks, _) = a.extra_sockets();
+        assert_eq!(socks.len(), 4);
+        let target = socks[1];
+        for _ in 0..64 {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.send_to(b"not a peerwire packet", target).unwrap();
+        }
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(60) {
+            a.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(a.route_count(), 0, "junk made no route");
+        assert_eq!(a.extra_sockets().1, 0, "no extra socket became a route");
+        while t0.elapsed() < Duration::from_millis(280) {
+            a.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(a.extra_sockets().0.is_empty(), "sockets closed at until, not held by junk");
     }
 
     /// NB-042: any interface lists IPv6 only on a dual-stack socket.

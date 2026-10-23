@@ -454,8 +454,10 @@ traversal privacy_modes_matrix -- --nocapture`:
   spray up to 2048 ports of the offer's first address's IP: about 270 KB over 3.8 s, unless a probe links first.
   Only a room member or a peer the node dialled can get an offer acted on, the address must be public IPv4, and
   it happens once per peer per 5 minutes and at most 4 times at once per node, then once per 30 s. Per victim IP
-  the cap is tighter (NB44-1): one spray at a time and at most 2 per 5 minutes across all peers, so a single
-  address receives at most about 550 KB per 5 minutes however many PeerIds name it. The probes are Noise
+  the cap is tighter (NB44-1): one spray at a time and at most 2 per 5 minutes across all of that node's peers, so
+  a single address receives at most about 550 KB per 5 minutes **from one node** however many PeerIds that node
+  names it with. The cap is per node, so N nodes recruited with one offer each still contribute that much apiece.
+  The probes are Noise
   handshakes or sealed punches, about 130 bytes each (~270 KB for a full 2048-probe spray, ~270× the offer that
   triggered it — a reflection amplifier, which is why the per-IP cap bounds what reaches one victim). An offer
   saying `Cone` makes a symmetric node send 256 handshakes (about 33 KB) to the offer's address, from 256 sockets

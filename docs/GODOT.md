@@ -358,3 +358,7 @@ binary:
   That is follow-up work.
 - **Android / iOS** need per-target builds (`aarch64-linux-android`, `aarch64-apple-ios`) and `.gdextension`
   entries. Not built or tested yet.
+- **File descriptors.** A birthday punch opens up to 512 extra UDP sockets for about 10 s (NB44-3). The macOS
+  default soft `RLIMIT_NOFILE` is 256, so on macOS raise it (`ulimit -n 1024` before launch, or set it in the app)
+  if your game also opens many files; a node that hits the limit releases a reserve of its punch sockets rather than
+  starving the rest of the process, so it stays up but that punch may not link.
