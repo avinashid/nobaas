@@ -304,7 +304,8 @@ Run these with Node and the Playwright install on this host:
   report says `granted`, the network test lists real local addresses and reads the same NAT, the room
   is joined again, and the other tab sees `mic` and real local addresses and links direct. The global
   room, with the grant stored before the tabs open or given while they're in it, gives the other tab
-  no local address and still links. A refused prompt reports `denied` and doesn't rejoin.
+  no local address and still links, and a birthday punch's offer carries no candidate. A refused
+  prompt reports `denied` and doesn't rejoin.
 - `node packages/js/test/netlab_punch_close.mjs`: a Net Lab birthday punch that ends (the peer's abort)
   while its fleet, its spray connection or the answer is still being set up closes the connections
   made after it ended, and its card keeps the reason it ended, not a stale error.
