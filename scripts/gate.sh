@@ -3,8 +3,9 @@
 # Runs every step even after a failure, prints a summary and exits non-zero if any step failed.
 #
 #   scripts/gate.sh             Rust tests, clippy, wasm build and checks, Node glue, browser tests (loopback)
-#   scripts/gate.sh --quick     skip the browser tests
-#   scripts/gate.sh --strict    clippy with -D warnings, and the fuzz tests again in a debug build (overflow checks)
+#   scripts/gate.sh --quick     skip the browser tests: an author's run before handing a branch over (see AGENTS.md)
+#   scripts/gate.sh --strict    clippy with -D warnings, and the fuzz tests again in a debug build (overflow checks):
+#                               the lead's one full run on the merged main, before a push
 #   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch relay.damus.io, nos.lol, relay.primal.net,
 #                               public STUN)
 #
@@ -18,7 +19,7 @@ for a in "$@"; do
     --quick) quick=1 ;;
     --strict) strict=1 ;;
     --nostr) nostr=1 ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
