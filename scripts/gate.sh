@@ -89,6 +89,7 @@ step "node room drain" node packages/js/test/room_drain.mjs
 step "node fuzz" node packages/js/test/fuzz.mjs
 step "node room leave" node packages/js/test/room_leave.mjs
 step "node room fallback" node packages/js/test/room_fallback.mjs
+step "node room adopt" node packages/js/test/room_adopt.mjs
 step "node nat prediction" node packages/js/test/nat_predict.mjs
 step "node late ice" node packages/js/test/late_ice.mjs
 step "node birthday primitives" node packages/js/test/birthday.mjs
@@ -102,6 +103,7 @@ if [ $quick = 1 ]; then
   skip "ice restart" "--quick"
   skip "birthday fleet" "--quick"
   skip "netlab birthday" "--quick"
+  skip "netlab carry" "--quick"
   skip "tab close" "--quick"
   skip "netlab" "--quick"
   skip "netlab rooms" "--quick"
@@ -114,6 +116,7 @@ else
   step "ice restart" node packages/js/test/ice_restart.mjs
   step "birthday fleet" node packages/js/test/birthday_fleet.mjs 32
   step "netlab birthday" node packages/js/test/netlab_birthday.mjs
+  step "netlab carry" node packages/js/test/netlab_carry.mjs
   step "tab close" node packages/js/test/leave.mjs --runs=5 --crash=0
   step "netlab" env RTC_OFF=2 node packages/js/test/netlab.mjs 3
   step "netlab rooms" node packages/js/test/netlab_rooms.mjs

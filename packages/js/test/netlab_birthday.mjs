@@ -45,6 +45,9 @@ try {
   await all(() => window.netlab?.self);
   await all(() => window.netlab.peers().length === 1 && window.netlab.peers()[0].route);
   ok(true, 'two tabs linked');
+  // The log says where each direct link goes: address, family, protocol, candidate kinds.
+  await all(() => [...document.querySelectorAll('#log div')].some((d) => /route to \S+: direct to \S+:\d+ \(IPv[46] UDP, your .+ ↔ their .+\)/.test(d.textContent)));
+  ok(true, 'each tab logs the direct route with its address and candidate pair');
   // The network probe must finish (roles and the hard side's IP come from it).
   await all(() => window.netlab.report().me.network);
 
@@ -72,6 +75,21 @@ try {
   // The card shows the running state and offers a control; the run can be stopped.
   ok(await pages[0].evaluate(() => /Punching|running/.test(document.querySelector('#peers .bdayrow')?.textContent ?? '')), 'the peer card shows the punch running');
   if (shot) await pages[0].screenshot({ path: `${shot}-birthday.png`, fullPage: true });
+
+  // NB48b-2: one punch at a time per tab. With tab 0's punch still running, a third
+  // member joins and tab 0 tries to punch it twice: both are refused, and the refusal
+  // must not free the slot for the second try.
+  const third = await ctx.newPage();
+  third.on('pageerror', (e) => errors.push(`tab 2: ${e.message}`));
+  await third.goto(`http://127.0.0.1:${port}/demo/netlab.html?signal=local&name=n2&fleet=8#key=${key}`);
+  await pages[0].waitForFunction(() => window.netlab.peers().length === 2, null, { timeout: 40000 });
+  const running = await pages[0].evaluate(async () => {
+    const other = window.netlab.birthday().findIndex((b) => b.status !== 'running');
+    await window.netlab.punch(other);
+    await window.netlab.punch(other);
+    return window.netlab.birthday().filter((b) => b.status === 'running').length;
+  });
+  ok(running === 1, `a refused punch keeps the one slot: ${running} running (NB48b-2)`);
 
   if (errors.length) throw new Error(`page errors: ${errors.join('; ')}`);
 } catch (e) {

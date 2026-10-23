@@ -138,9 +138,14 @@ export declare class Room {
   getPresence(peer?: PeerId): Presence | undefined;
   setPresence(presence: Presence): void;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
-  /** How `peer` is reached: its own WebRTC link, relayed by member `via`, or over the
-   * signalling relays; null while it isn't linked. */
-  route(peer: PeerId): { kind: 'direct' } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' } | null;
+  /** How `peer` is reached: its own WebRTC link, a channel handed to `adoptChannel` (`adopted`), relayed by
+   * member `via`, or over the signalling relays; null while it isn't linked. */
+  route(peer: PeerId): { kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' } | null;
+  /** Moves `peer`'s link onto `dc`, an open DataChannel to it made outside the room (`pc` its connection; a
+   * birthday punch's, say), when the room reaches `peer` only by fallback and the peer adopts its end too.
+   * True once the channel carries the link; false, leaving the channel to the caller, if the link is direct
+   * already or the peer didn't adopt within 5 s. When the channel closes, the link goes back to its fallback. */
+  adoptChannel(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel): Promise<boolean>;
   rtt(peer: PeerId): number | null;
   stats(): EndpointStats;
   /** Tells every peer we're going, then closes the links, all before it returns (so it works from `pagehide`,
@@ -229,6 +234,9 @@ export declare class Endpoint {
   connect(addr: number, peer: PeerId | Uint8Array): number;
   /** Throws `Error('connectVia: endpoint closed')` after `close()`. */
   connectVia(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): number;
+  /** A direct address for a relayed (or dialling) peer: punches to it and moves the link there once the peer
+   * answers from it. Does nothing for a peer linked directly or unknown, or after `close()`. */
+  addCandidate(addr: number, peer: PeerId | Uint8Array): void;
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
    * (reason 'closed') now rather than after its idle timeout. No local event; does nothing after `close()`. */
   disconnect(peer: PeerId | Uint8Array): void;
@@ -297,7 +305,8 @@ export declare class WebRtcTransport implements Transport {
     signaling: SignalingAdapter,
     options?: {
       iceServers?: RTCIceServer[];
-      onPeer?: (peer: PeerId, state: 'open' | 'closed' | 'failed') => void;
+      /** `'carrier'`: an adopted channel started or stopped carrying the peer's link (see `adopt`). */
+      onPeer?: (peer: PeerId, state: 'open' | 'closed' | 'failed' | 'carrier') => void;
       loss?: number;
       trickle?: boolean;
       /** `'relay-only'` needs `relay`: WebRTC then runs only with that peer. */
@@ -336,6 +345,17 @@ export declare class WebRtcTransport implements Transport {
    * the 2 s grace. `joinRoom` calls it on `online` and on a `navigator.connection` change.
    */
   networkChanged(): void;
+  /**
+   * Carries `peer`'s link over `dc`, an open DataChannel to it made outside the transport, once the far end
+   * adopts its end too (each sends a one-byte marker until it hears the other's). With `pipe`, the peer's pipe
+   * datagrams go over `dc` instead of signalling; otherwise `dc` gets its own handle, for
+   * `endpoint.addCandidate`. Resolves to that handle, or -1 (the channel left to the caller) if the far end
+   * didn't adopt within 5 s or `dc` closed first. Once carrying, `dc` closing or `pc` failing ends it, as do
+   * `drop(peer)`, `close()` and a newer `adopt(peer)`; ending it closes `pc`. `room.adoptChannel` uses it.
+   */
+  adopt(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel, options?: { pipe?: boolean }): Promise<number>;
+  /** The adopted channel carrying `peer`'s link now, or null. */
+  carrier(peer: PeerId): { pc: RTCPeerConnection; dc: RTCDataChannel } | null;
   dial(peer: PeerId): Promise<void>;
   has(peer: PeerId): boolean;
   drop(peer: PeerId): void;

@@ -148,6 +148,17 @@ pub unsafe extern "C" fn pw_connect_via(h: *mut PwEndpoint, now_us: u64, relay: 
     }
 }
 
+/// Adds `addr` as a direct address of `peer_id`, a relayed or dialling peer: the
+/// endpoint punches towards it and moves the link there once the peer answers
+/// from it. Does nothing for a peer linked directly, an unknown one, or a
+/// relayed link while relay-only.
+#[no_mangle]
+pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr: u32, peer_id: *const u8) -> i32 {
+    let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
+    (*h).ep.add_candidates(now(now_us), &p, &[addr]);
+    0
+}
+
 /// Relay-only (`on` != 0): relayed links stay relayed (no punching, no direct
 /// path), relays are asked not to tag our packets with our address, and a direct
 /// handshake is answered only from a peer this endpoint is dialling directly.
@@ -505,6 +516,100 @@ mod tests {
         }
     }
 
+    /// An endpoint's index and a handle it uses.
+    type Hop = (usize, u32);
+
+    /// Delivers every queued datagram along `routes`: (from endpoint, its handle)
+    /// → (to endpoint, the handle `to` sees it at). Datagrams to other handles are lost.
+    unsafe fn route(eps: &[*mut PwEndpoint], routes: &[(Hop, Hop)], t: u64) {
+        let (mut buf, mut addr) = (vec![0u8; 2048], 0u32);
+        loop {
+            let mut moved = false;
+            for (i, &h) in eps.iter().enumerate() {
+                loop {
+                    let n = pw_poll_transmit(h, t, &mut addr, buf.as_mut_ptr(), buf.len());
+                    if n <= 0 {
+                        break;
+                    }
+                    if let Some(&(_, (to, seen))) = routes.iter().find(|(from, _)| *from == (i, addr)) {
+                        pw_handle_datagram(eps[to], t, seen, buf.as_ptr(), n as usize);
+                        moved = true;
+                    }
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    /// The direct handles `h` reported in PATH_CHANGED events since the last call.
+    unsafe fn direct_paths(h: *mut PwEndpoint) -> Vec<u32> {
+        let (mut buf, mut out) = (vec![0u8; 4096], Vec::new());
+        loop {
+            let n = pw_poll_event(h, buf.as_mut_ptr(), buf.len());
+            if n <= 0 {
+                return out;
+            }
+            if buf[0] == 5 && buf[33] == 0 {
+                out.push(u32::from_le_bytes(buf[34..38].try_into().unwrap()));
+            }
+        }
+    }
+
+    /// pw_add_candidate: a link a and b made through relay r moves to the direct
+    /// handle once one side adds it (both sides end up there), and stays relayed
+    /// without it. A bad peer pointer is refused; an unknown peer changes nothing.
+    #[test]
+    fn add_candidate_moves_a_relayed_link_to_a_direct_handle() {
+        unsafe {
+            for add in [true, false] {
+                let mut ids = [[0u8; 32]; 3];
+                let eps: Vec<_> = (0..3)
+                    .map(|i| pw_endpoint_new(std::ptr::null(), [i as u8 + 1; 32].as_ptr(), 0, ids[i].as_mut_ptr()))
+                    .collect();
+                let (a, b) = (eps[0], eps[1]);
+                // a sees r at 10 and b at 11; b sees r at 20 and a at 21; r sees a at 30 and b at 31.
+                let mut routes = vec![((0, 10), (2, 30)), ((1, 20), (2, 31)), ((2, 30), (0, 10)), ((2, 31), (1, 20))];
+                let mut t = 1000u64;
+                assert_eq!(pw_connect(a, t, 10, ids[2].as_ptr()), 0);
+                assert_eq!(pw_connect(b, t, 20, ids[2].as_ptr()), 0);
+                route(&eps, &routes, t);
+                assert_eq!(pw_connect_via(a, t, ids[2].as_ptr(), ids[1].as_ptr()), 0);
+                route(&eps, &routes, t);
+                assert_eq!((pw_is_connected(a, ids[1].as_ptr()), pw_is_connected(b, ids[0].as_ptr())), (1, 1));
+                // The direct path between a and b opens only now (a birthday punch's channel, say).
+                routes.extend([((0, 11), (1, 21)), ((1, 21), (0, 11))]);
+                direct_paths(a); // drop the events so far
+                direct_paths(b);
+                if add {
+                    assert_eq!(pw_add_candidate(a, t, 11, std::ptr::null()), PW_ERR_INVALID);
+                    assert_eq!(pw_add_candidate(a, t, 11, [7u8; 32].as_ptr()), 0, "an unknown peer is a no-op");
+                    assert_eq!(pw_add_candidate(a, t, 11, ids[1].as_ptr()), 0);
+                }
+                let (mut pa, mut pb) = (Vec::new(), Vec::new());
+                for _ in 0..40 {
+                    t += 50_000;
+                    for &h in &eps {
+                        pw_handle_timeout(h, t);
+                    }
+                    route(&eps, &routes, t);
+                    pa.extend(direct_paths(a));
+                    pb.extend(direct_paths(b));
+                }
+                if add {
+                    assert_eq!((pa.last(), pb.last()), (Some(&11), Some(&21)), "both sides moved to the direct handle");
+                } else {
+                    assert!(pa.is_empty() && pb.is_empty(), "no candidate, no move: {pa:?} {pb:?}");
+                }
+                assert_eq!((pw_is_connected(a, ids[1].as_ptr()), pw_is_connected(b, ids[0].as_ptr())), (1, 1));
+                for h in eps {
+                    pw_endpoint_free(h);
+                }
+            }
+        }
+    }
+
     /// Whether `e` has the documented event encoding (see the module docs).
     fn event_ok(e: &[u8]) -> bool {
         let path_ok = |p: &[u8]| matches!(p, [0, _, _, _, _]) || p.len() == 33 && p[0] == 1;
@@ -635,8 +740,9 @@ mod tests {
                                 || r >= 0 && r as usize <= s.len()
                         );
                     }
-                    6 => match rng.below(4) {
+                    6 => match rng.below(5) {
                         0 => pw_disconnect(h, target.as_ptr()),
+                        1 => assert_eq!(pw_add_candidate(h, t, *rng.pick(&[1, 2, 3]), target.as_ptr()), 0),
                         _ => assert!([0, PW_ERR_INVALID].contains(&pw_connect(h, t, 2 - x as u32, target.as_ptr()))),
                     },
                     7 => {

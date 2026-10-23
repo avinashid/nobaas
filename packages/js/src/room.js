@@ -23,7 +23,9 @@
 // peers) and over the signalling channel itself (a pipe, see webrtc.js), at once,
 // and the first path to answer wins. Every path carries the same Noise session,
 // so relays and signalling only ever see sealed datagrams. room.route(peer) says
-// which path a peer is on. `fallback: 'peers'` skips the pipe, 'off' both.
+// which path a peer is on. `fallback: 'peers'` skips the pipe, 'off' both. A direct
+// DataChannel found later by other means (a birthday punch, birthday.js) can take a
+// fallback link over: room.adoptChannel().
 //
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
@@ -168,11 +170,13 @@ export class Room {
     this.proofSent = new Map(); // linked peer -> resolves once our link proof is written
     this.deadlines = new Map(); // peer -> timer that drops it unless it proves the key
     this.fallback = fallback;
-    this.routes = new Map(); // linked peer -> { kind: 'direct' | 'peer' | 'signaling', via? }
+    this.routes = new Map(); // linked peer -> { kind: 'direct' | 'peer' | 'signaling', via?, adopted? }
+    this.paths = new Map(); // linked peer -> the endpoint's path to it
     this.fallingBack = new Set(); // peers we dial by fallback since WebRTC failed
     this.transport = makeTransport((peer, state) => {
       if (state === 'closed') this.rtcClosed(peer);
       else if (state === 'failed') this.rtcFailed(peer);
+      else if (state === 'carrier') this.reroute(peer);
     });
     endpoint.onEvent = (e) => this.onEvent(e);
     // ACKs free send window: flush the outbox as they arrive (the timer is a fallback).
@@ -264,11 +268,30 @@ export class Room {
     for (const p of this.proven) this.write(p, f, Lane.Reliable);
   }
 
-  // How `peer` is reached: { kind: 'direct' } (its own WebRTC link), { kind: 'peer',
-  // via } (relayed by member `via`), { kind: 'signaling' } (over the signalling
-  // relays), or null while not linked.
+  // How `peer` is reached: { kind: 'direct' } (its own WebRTC link), { kind: 'direct',
+  // adopted: true } (a channel handed to adoptChannel), { kind: 'peer', via } (relayed
+  // by member `via`), { kind: 'signaling' } (over the signalling relays), or null while
+  // not linked.
   route(peer) {
     return this.routes.get(peer) ?? null;
+  }
+
+  // Moves `peer`'s link onto `dc`, an open DataChannel to it made outside the room
+  // (`pc` its connection; a birthday punch's, say), when the room reaches `peer` only by
+  // fallback (relayed by a member, or over signalling) and the peer adopts its end too.
+  // Resolves true once the channel carries the link: a link over signalling moves at
+  // once; a relayed one once the endpoint's punch over the channel is answered. route()
+  // then says { kind: 'direct', adopted: true }. Resolves false, leaving the channel to
+  // the caller, if the link is direct already or the peer didn't adopt in time. When
+  // the channel closes, the link goes back to its fallback route.
+  async adoptChannel(peer, pc, dc) {
+    const r = this.routes.get(peer);
+    if (this.left || !r || r.kind === 'direct' || !this.transport.adopt) return false;
+    const pipe = r.kind === 'signaling';
+    const h = await this.transport.adopt(peer, pc, dc, { pipe });
+    if (h < 0) return false;
+    if (!pipe) this.endpoint.addCandidate(h, peer);
+    return true;
   }
 
   rtt(peer) {
@@ -307,6 +330,7 @@ export class Room {
     for (const t of this.deadlines.values()) clearTimeout(t);
     this.deadlines.clear();
     this.routes.clear();
+    this.paths.clear();
     this.fallingBack.clear();
   }
 
@@ -338,6 +362,7 @@ export class Room {
     if (e.type === 'connected') {
       const peer = e.peer;
       this.linked.add(peer);
+      this.paths.set(peer, e.path);
       this.routes.set(peer, this.routeOf(e.path));
       this.fallingBack.delete(peer);
       // Prove the room key first; presence follows once the peer has proved it too.
@@ -351,7 +376,10 @@ export class Room {
     } else if (e.type === 'message') {
       this.onMessage(e.peer, e.data, e.lane);
     } else if (e.type === 'pathChanged') {
-      if (this.linked.has(e.peer)) this.routes.set(e.peer, this.routeOf(e.path));
+      if (this.linked.has(e.peer)) {
+        this.paths.set(e.peer, e.path);
+        this.reroute(e.peer);
+      }
     } else if (e.type === 'disconnected') {
       this.lost(e.peer, e.reason);
     } else if (e.type === 'connectFailed') {
@@ -425,14 +453,22 @@ export class Room {
 
   routeOf(path) {
     if (path.via) return { kind: 'peer', via: path.via };
+    if (this.transport.carries?.(path.direct)) return { kind: 'direct', adopted: true };
     return { kind: this.transport.isPipe?.(path.direct) ? 'signaling' : 'direct' };
+  }
+
+  // The route to a linked `peer` again: its path changed, or an adopted channel took
+  // its link or gave it back.
+  reroute(peer) {
+    const path = this.paths.get(peer);
+    if (path && this.linked.has(peer)) this.routes.set(peer, this.routeOf(path));
   }
 
   // A DataChannel closed: the peer is lost if that was its path, or if no fallback
   // is under way; otherwise only the WebRTC link goes.
   rtcClosed(peer) {
     const r = this.routes.get(peer);
-    if (r ? r.kind !== 'direct' : this.fallingBack.has(peer)) return this.transport.dropRtc(peer);
+    if (r ? r.kind !== 'direct' || r.adopted : this.fallingBack.has(peer)) return this.transport.dropRtc(peer);
     this.lost(peer, 'closed');
   }
 
@@ -470,6 +506,7 @@ export class Room {
     this.outbox.delete(peer);
     this.greeted.delete(peer);
     this.routes.delete(peer);
+    this.paths.delete(peer);
     this.fallingBack.delete(peer);
     if (this.members.delete(peer)) this.emit('peer-leave', peer, reason);
   }

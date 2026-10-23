@@ -189,7 +189,9 @@ export async function openSpray({ RTCPeerConnection, iceServers = [], advertise 
   const offerSdp = advertise ? pc.localDescription.sdp : stripCandidates(pc.localDescription.sdp);
   const done = new Promise((resolve) => { dc.onopen = () => resolve({ pc, dc }); });
   const applyAnswer = async (answerSdp, hardIp, ports) => {
-    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    // NB48b-1: never check the candidates in the peer's answer — a hostile hard side
+    // could list LAN or loopback addresses; only the sprayed guesses at `hardIp` count.
+    await pc.setRemoteDescription({ type: 'answer', sdp: stripCandidates(answerSdp) });
     for (const c of sprayCandidates(hardIp, ports)) await pc.addIceCandidate(c).catch(() => {});
   };
   return { offerSdp, pc, dc, done, applyAnswer };

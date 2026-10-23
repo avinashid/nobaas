@@ -1,7 +1,7 @@
 // PERF1-2: close() frees the endpoint's wasm handle and buffers, so after it no public
 // method may call into wasm with them: a late datagram from a peer's still-open
 // DataChannel would otherwise run on freed memory shared with every other endpoint.
-// send and connect* throw, receive and setRelayOnly do nothing, queries return
+// send and connect* throw, receive, addCandidate and setRelayOnly do nothing, queries return
 // null or false, and stats() returns the counters as they were at close.
 import { loadPeerwire, Lane, MAX_DATAGRAM } from '../src/peerwire.js';
 
@@ -78,6 +78,7 @@ check(b.open(sealed) === null, 'open() is null');
 check(b.isConnected(a.id) === false, 'isConnected() is false');
 check(b.rttMs(a.id) === null, 'rttMs() is null');
 check(b.setRelayOnly(true) === undefined, 'setRelayOnly() does nothing');
+check(b.addCandidate(3, a.id) === undefined, 'addCandidate() does nothing');
 check(b.disconnect(a.id) === undefined, 'disconnect() does nothing');
 const after = b.stats();
 check(Object.keys(after).join() === Object.keys(before).join() && after.txPackets >= before.txPackets && after.rxPackets >= before.rxPackets,
