@@ -107,8 +107,17 @@ function dataChannel(pc) {
 // address, so the easy side reaches it only through the sprayed guesses (as a real
 // cone NAT only lets in a port it has sprayed), and the hard side advertises none, so
 // it cannot connect on its own and the spray is what completes the link.
+// NB48b-3: lines are split the way Chrome's SDP parser splits them, on `\n` only, so a
+// candidate line ending in `\r\r\n`, a stray `\r` or a U+2028 is dropped like any other
+// (a regex line model kept those, and Chrome still parsed them as candidates).
 export function stripCandidates(sdp) {
-  return sdp.replace(/^a=candidate:.*(\r?\n)/gm, '');
+  return sdp.split('\n').filter((l) => !/^\s*a=candidate:/i.test(l)).join('\n');
+}
+
+// NB48b-3: Chrome's own view of a remote description we stripped must carry no
+// candidate either; if one got through, fail rather than check it.
+function assertNoCandidates(pc) {
+  if (/a=candidate:/i.test(pc.remoteDescription?.sdp ?? '')) throw new Error("the peer's description still carries ICE candidates");
 }
 
 // The host UDP port an RTCPeerConnection gathered on, from its local description
@@ -138,14 +147,20 @@ export async function openFleet({ RTCPeerConnection, cert, creds, offerSdp, size
     return { pc, dc: dataChannel(pc) };
   });
   let answer = null;
-  await Promise.all(conns.map(async ({ pc }) => {
-    await pc.setRemoteDescription({ type: 'offer', sdp: offer });
-    const ans = await pc.createAnswer();
-    const munged = shareCredentials(ans.sdp, creds); // same ufrag/pwd on every connection
-    await pc.setLocalDescription({ type: 'answer', sdp: munged });
-    if (cand) await pc.addIceCandidate(cand).catch(() => {});
-    answer ??= munged;
-  }));
+  try {
+    await Promise.all(conns.map(async ({ pc }) => {
+      await pc.setRemoteDescription({ type: 'offer', sdp: offer });
+      assertNoCandidates(pc);
+      const ans = await pc.createAnswer();
+      const munged = shareCredentials(ans.sdp, creds); // same ufrag/pwd on every connection
+      await pc.setLocalDescription({ type: 'answer', sdp: munged });
+      if (cand) await pc.addIceCandidate(cand).catch(() => {});
+      answer ??= munged;
+    }));
+  } catch (e) {
+    for (const c of conns) c.pc.close(); // no half-built fleet left behind
+    throw e;
+  }
   let settled = false;
   const done = new Promise((resolve) => {
     for (const c of conns) {
@@ -191,7 +206,13 @@ export async function openSpray({ RTCPeerConnection, iceServers = [], advertise 
   const applyAnswer = async (answerSdp, hardIp, ports) => {
     // NB48b-1: never check the candidates in the peer's answer — a hostile hard side
     // could list LAN or loopback addresses; only the sprayed guesses at `hardIp` count.
-    await pc.setRemoteDescription({ type: 'answer', sdp: stripCandidates(answerSdp) });
+    try {
+      await pc.setRemoteDescription({ type: 'answer', sdp: stripCandidates(answerSdp) });
+      assertNoCandidates(pc);
+    } catch (e) {
+      pc.close();
+      throw e;
+    }
     for (const c of sprayCandidates(hardIp, ports)) await pc.addIceCandidate(c).catch(() => {});
   };
   return { offerSdp, pc, dc, done, applyAnswer };

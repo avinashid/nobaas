@@ -43,6 +43,16 @@ try {
     const ufrag = (sdp) => /a=ice-ufrag:(\S+)/.exec(sdp)?.[1];
     const fp = (sdp) => /a=fingerprint:\S+ (\S+)/.exec(sdp)?.[1];
     const until = async (cond, ms = 10000) => { const t = performance.now(); while (!cond() && performance.now() - t < ms) await sleep(50); return cond(); };
+    // The most remote candidates any of `conns` has (what its ICE agent would check).
+    const remoteCands = async (conns) => {
+      let max = 0;
+      for (const c of conns) {
+        let n = 0;
+        (await c.pc.getStats()).forEach((r) => { if (r.type === 'remote-candidate') n++; });
+        max = Math.max(max, n);
+      }
+      return max;
+    };
 
     // The hit case: a few of the fleet's real socket ports are among the sprayed guesses.
     {
@@ -93,15 +103,6 @@ try {
       const inject = Array.from({ length: 20 }, (_, i) => `a=candidate:inj${i} 1 udp 1 ${10 + i}.0.0.${i} ${20000 + i} typ host`).join('\r\n') + '\r\n';
       const sdp = probe.localDescription.sdp.replace(/\r\n$/, '\r\n') + inject;
       probe.close();
-      const remoteCands = async (conns) => {
-        let max = 0;
-        for (const c of conns) {
-          let n = 0;
-          (await c.pc.getStats()).forEach((r) => { if (r.type === 'remote-candidate') n++; });
-          max = Math.max(max, n);
-        }
-        return max;
-      };
       const good = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: sdp, size: 4, easyAddr: '203.0.113.9:40000' });
       await sleep(400);
       ok(good.conns.every((c) => !/a=candidate:inj/.test(c.pc.remoteDescription.sdp)), "the offer's 20 injected candidates are stripped from every fleet connection");
@@ -121,6 +122,65 @@ try {
       await sleep(300);
       ok(!/a=candidate:inj/.test(easy.pc.remoteDescription.sdp), "the answer's 20 injected candidates are stripped");
       ok((await remoteCands([easy])) === 2, 'the easy side checks only its 2 sprayed guesses');
+      easy.pc.close(); hard.conns.forEach((c) => c.pc.close());
+    }
+
+    // NB48b-3: candidate lines whose line endings a regex line model misses, but Chrome
+    // still parses (it splits on `\n` only), are stripped too: a hostile offer leaves the
+    // fleet 0 remote candidates, a hostile answer leaves the easy side only its sprayed
+    // guesses. And if a candidate ever got past the strip, the call fails and closes.
+    {
+      const cert = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+      const creds = randomCredentials();
+      const cand = (k) => `a=candidate:inj${k} 1 udp 1 127.0.0.1 ${23000 + k} typ host`;
+      const variants = {
+        'CRLF': (k) => `${cand(k)}\r\n`,
+        'LF': (k) => `${cand(k)}\n`,
+        'CR CR LF': (k) => `${cand(k)}\r\r\n`,
+        'stray CR': (k) => `${cand(k)} generation 0\r\r\n`,
+        'U+2028': (k) => `${cand(k)}\u2028x\r\n`,
+      };
+      const probe = new RTCPeerConnection();
+      probe.createDataChannel('x');
+      await probe.setLocalDescription(await probe.createOffer());
+      const base = probe.localDescription.sdp;
+      probe.close();
+      for (const [name, line] of Object.entries(variants)) {
+        let fleet = null, why = '';
+        try {
+          fleet = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: base + [0, 1, 2, 3, 4].map(line).join(''), size: 2 });
+        } catch (e) { why = ` (refused: ${e.message})`; }
+        await sleep(300);
+        const fleetN = fleet ? await remoteCands(fleet.conns) : -1;
+        ok(fleetN === 0, `NB48b-3, ${name}: a hostile offer with 5 candidates opens the fleet with ${fleetN} remote candidates${why}`);
+        fleet?.conns.forEach((c) => c.pc.close());
+
+        const easy = await openSpray({ RTCPeerConnection, advertise: false });
+        const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: easy.offerSdp, size: 1 });
+        why = '';
+        await easy.applyAnswer(hard.answerSdp + [5, 6, 7, 8, 9].map(line).join(''), '127.0.0.1', [1500, 1501]).catch((e) => (why = ` (refused: ${e.message})`));
+        await sleep(300);
+        const easyN = easy.pc.signalingState === 'closed' ? -1 : await remoteCands([easy]);
+        ok(easyN === 2, `NB48b-3, ${name}: a hostile answer with 5 candidates leaves the easy side ${easyN} remote candidates, its 2 sprayed guesses${why}`);
+        easy.pc.close(); hard.conns.forEach((c) => c.pc.close());
+      }
+
+      // The backstop: a connection whose remote description still holds a candidate after
+      // the strip (here one the browser adds itself) closes the fleet / easy side and fails.
+      const made = [];
+      class Leaky extends RTCPeerConnection {
+        constructor(...a) { super(...a); made.push(this); }
+        setRemoteDescription(d) { return super.setRemoteDescription({ type: d.type, sdp: `${d.sdp}${cand(30)}\r\n` }); }
+      }
+      let err = null;
+      await openFleet({ RTCPeerConnection: Leaky, cert, creds, offerSdp: base, size: 3 }).catch((e) => (err = e.message));
+      ok(err && made.length === 3 && made.every((pc) => pc.signalingState === 'closed'), `a candidate left in the fleet's remote description fails openFleet and closes all ${made.length} connections (${err})`);
+      made.length = 0;
+      err = null;
+      const easy = await openSpray({ RTCPeerConnection: Leaky, advertise: false });
+      const hard = await openFleet({ RTCPeerConnection, cert, creds, offerSdp: easy.offerSdp, size: 1 });
+      await easy.applyAnswer(hard.answerSdp, '127.0.0.1', [1500, 1501]).catch((e) => (err = e.message));
+      ok(err && easy.pc.signalingState === 'closed', `a candidate left in the easy side's remote description fails applyAnswer and closes it (${err})`);
       easy.pc.close(); hard.conns.forEach((c) => c.pc.close());
     }
 
