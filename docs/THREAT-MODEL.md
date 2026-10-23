@@ -75,7 +75,8 @@ that needs a change is tracked as an NB card.
 | NB44-2, NB44-3 (Low) | **Fixed** by `a16072e` (NB-044b: authenticated routes, fd reserve), re-checked 2026-10-23; residuals NB44c-1, NB44c-2 |
 | NB48b-2 (Low) | **Fixed** by `de9efea` (the busy slot is held per peer), re-checked 2026-10-24 |
 | NB48b-1, NB48b-3 (Low) | **Fixed** by `de9efea` (the answer is stripped) and `695b38b` (Chrome's line model, checked after apply), re-checked 2026-10-24 |
-| NB44c-1, NB44c-2, NB46-1, NB48b-4 (Low) | Open, same section |
+| NB48b-4, NB48b-7 (Low) | **Fixed** by `4b6c0f7` and `46a5da3` (relay-only dials through a relay stay relayed, also when switched on mid-dial), re-checked 2026-10-24 |
+| NB44c-1, NB44c-2, NB46-1 (Low) | Open, same section |
 | NB45-I1, NB44-I2, NB46-I1, NB44b-I1 (Info) | Optional hardening or accepted, same section; NB44-I2 folds into NB44c-2 |
 | NB48b-5, NB48b-6 (Info) | Open (robustness and hardening of the carried channel), same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
@@ -638,6 +639,27 @@ reveals our address to whoever is there, which relay-only promises not to do.
   the relay, and JS rooms refuse relay-only.
 - Fix: while dialling, skip Direct targets when relay-only and the dial has a relay.
 - Test: the repro sends 0 datagrams to the candidate in both states.
+- **Status: fixed** by `4b6c0f7` and `46a5da3`, re-checked 2026-10-24.
+  - `4b6c0f7`: a dial through a relay takes no Direct path added while relay-only
+    (`add_candidates`, `connect`, `connect_with`). Tests in the core and the C ABI.
+  - `46a5da3`: turning relay-only on while such a dial is pending drops its Direct
+    targets, port guesses and spray, and the dial ignores a handshake answer that
+    arrives at our own address (NB48b-7). It completes through the relay only.
+  - Probes: candidates, guesses and sweeps on a relay-only relayed dial send nothing
+    direct, and a simultaneous direct handshake from the peer is dropped.
+  - Residual (Info, accepted): a *direct* dial made while relay-only that later also
+    names a relay keeps its direct target, so it can still go live direct. The host
+    chose to dial that address, so nothing new is revealed.
+
+**NB48b-7 — Relay-only: a relayed dial takes the peer's answer at our own address
+(Low).** Found in the NB48b-4 re-check. The handshake answer (HS2) set the link's path
+to wherever it arrived from, with no relay-only check, unlike an incoming HS1. So the
+peer being dialled, if it already knew or guessed our address and our NAT let it in,
+could answer there: the link went live direct and our traffic confirmed the address.
+- Fix: a relay-only dial through a relay drops an HS2 that arrives direct, before
+  reading it, and waits for the relayed answer.
+- **Status: fixed** by `46a5da3`, with a core test (an answer to an HS1 sent direct
+  before the switch is dropped; the link comes up through the relay).
 
 **NB48b-5 — A route reads `direct` while a relayed link waits to fall back (Info).**
 After a carried channel that replaced a relayed link closes, the core keeps the dead
