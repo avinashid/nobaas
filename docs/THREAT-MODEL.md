@@ -852,6 +852,29 @@ and what it accepted. Values are from main `7b716a2`.
   is defence in depth. Suggested: send the same CSP from `crew-server.mjs`.
 - Net Lab caps its event log at 500, the DOM log at 300 and chat at 200. The
   per-peer route history has no cap.
+- **Microphone permission (Net Lab's "Use microphone" button, `e450baf`).** Chrome
+  hides a page's local addresses (mDNS names, the default route only) until the
+  origin has microphone or camera permission. After that, every new connection lists
+  every interface (RFC 8828 mode 1). The button asks only for that permission and
+  stops the tracks at once: nothing keeps the stream or uses the audio (checked in
+  Chromium). Presence carries a `mic` boolean, to room members only.
+  - **MIC-1 (Low, privacy):** after a grant, new links give every room member the
+    device's real local addresses (LAN, hotspot, VPN tunnel, container bridges). Each
+    interface's STUN mapping can also show the public address of a network other than
+    the default route, such as the connection under a VPN, or mobile data while on
+    Wi-Fi. In the global room that is anyone. The grant is stored per origin, so
+    later visits and the other demos on that origin do the same without a tap.
+    `privacy: 'public-only'` drops the local (`host`) candidates but not the
+    per-interface mappings. Any app that asks for the microphone or camera (voice,
+    video) gets the same under `privacy: 'direct'`, the default. Suggested: Net Lab
+    joins the global room with `privacy: 'public-only'` while the microphone is
+    allowed, and the button says that local addresses go to room members until the
+    permission is removed in the site settings.
+  - **MIC-2 (Info):** a birthday punch closed while its `openFleet`, `openSpray` or
+    certificate is still pending (a rejoin, its timeout, the peer's abort) throws
+    when that resolves. The connections it just opened are left open, and the
+    one-fleet slot is already free. Nothing is sent. Suggested: after each await,
+    check that the punch is still the current one, and close what was opened if not.
 
 ---
 
