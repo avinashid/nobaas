@@ -13,6 +13,11 @@ scripts/gate.sh --strict    # clippy with -D warnings, and the fuzz tests again 
 scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a change touches signaling
 ```
 
+**Who runs what** (details in `AGENTS.md`): the author runs `--quick` (with `--strict` after a Rust change) plus
+the browser tests next to the change. A reviewer reads the diff and re-runs a test only to reproduce a problem.
+The lead runs `--strict` once on the merged `main` before a push. CI runs the Rust and Node steps but not the
+browser tests.
+
 | Step | Command | Passes when |
 |---|---|---|
 | Rust tests | `cargo test --workspace --release` | every test passes (ignored tests are known gaps, below) |
@@ -43,8 +48,9 @@ scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a chan
 | Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `relay.damus.io` / `nos.lol` / `relay.primal.net` and connect over public STUN |
 
 The script runs every step even after a failure, prints a PASS/FAIL/SKIP summary and exits non-zero if any step
-failed. A full run takes about 2.5 minutes on the 4-core aarch64 dev host (Rust tests ~65 s, wasm build ~20 s,
-browser + arena ~30 s).
+failed. A full `--strict` run takes about 5 minutes on the 4-core aarch64 dev host with a warm build (on
+`a4651c0`: Rust tests 98 s, debug fuzz 37 s, Node tests ~55 s, browser tests ~110 s); a fresh worktree compiles
+the workspace first and takes several times that.
 
 **Release gate:** `scripts/gate.sh --strict` green on `main`, plus `--nostr` once per release, plus the CI matrix
 (below) green on all three OSes.

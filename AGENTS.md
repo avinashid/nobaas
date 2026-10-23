@@ -32,13 +32,24 @@ godot --version          # Godot 4.7.2 (user-local in ~/.local/opt/godot); use -
 Do not install toolchains, `cargo install` tools or system packages without asking. Adding crates.io
 dependencies is fine; keep them few and justify them in the commit message.
 
-## Gate: run before saying a change is done
+## Gate: who runs what
 
-```sh
-cargo test --workspace --release
-cargo clippy --workspace
-./packages/js/build.sh && node packages/js/test/node_pair.mjs   # wasm must stay ~300 KB with 0 imports
-```
+The full gate runs once per change, by the lead on the merged `main`. Each worktree builds from scratch and parallel
+runs share this host's 4 cores, so running it on every branch as well costs more than it catches.
+
+- **Before you hand a branch over** (author):
+
+  ```sh
+  scripts/gate.sh --quick            # Rust tests, clippy, wasm build, size and imports, Node tests; no browser tests
+  scripts/gate.sh --quick --strict   # the same with clippy -D warnings and the debug fuzz run: use it if you changed Rust
+  node packages/js/test/<name>.mjs   # each browser test next to what you changed, e.g. netlab_*.mjs for Net Lab
+  ```
+
+  A change comes with its test; run it. A change to docs or comments only needs no run: say so on the card.
+- **Reviewing** (security, QA): read the diff against the code. Re-run a test only to reproduce a problem or try a
+  mutant, and say which.
+- **After merging** (the lead): `scripts/gate.sh --strict` once on the merged `main`, before asking to push. CI runs
+  the Rust and Node steps on push but not the browser tests, so this is their only full run.
 
 Browser tests use headless Chromium through Playwright (already installed; do not install it):
 `node packages/js/test/browser.mjs [tabs]` and `node packages/js/test/arena.mjs` run on loopback only.
