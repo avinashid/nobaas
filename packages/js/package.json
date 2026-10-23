@@ -1,6 +1,6 @@
 {
   "name": "@peerwire/js",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Peer-to-peer rooms for the browser and Node with no backend: the Peerwire core as a zero-import wasm, WebRTC DataChannels and Nostr signaling.",
   "license": "MIT OR Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/avinashid/peerwire.git", "directory": "packages/js" },
