@@ -43,6 +43,10 @@ For native nodes the `peerwire` crate automates steps 1 and 2: STUN for the publ
 over a signaling carrier, and simultaneous dials. See [NAT-TRAVERSAL.md](NAT-TRAVERSAL.md).
 4. **Upgrade to direct.** If the link is relayed, it keeps punching candidates (with port spraying for
    sequential NATs). It moves to a direct path only after an echoed PUNCH_ACK.
+5. **Rank paths.** Paths rank slow address, then relay, then direct. A host marks an address slow
+   (`set_slow`: a browser room's signalling pipe) and offers relays for it (`add_relay`). The link then
+   sends a sealed PUNCH through each relay and moves to the first whose PUNCH_ACK comes back through it. The far
+   end answers only if it would use that relay too. When the relay goes, the link goes back to the slow address.
 
 ## Lanes
 

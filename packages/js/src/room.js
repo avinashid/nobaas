@@ -23,7 +23,9 @@
 // peers) and over the signalling channel itself (a pipe, see webrtc.js), at once,
 // and the first path to answer wins. Every path carries the same Noise session,
 // so relays and signalling only ever see sealed datagrams. room.route(peer) says
-// which path a peer is on. `fallback: 'peers'` skips the pipe, 'off' both. A peer
+// which path a peer is on; a link over the pipe moves to a member that links to
+// both later, once the core sees it relay both ways, and back to the pipe if that
+// member goes. `fallback: 'peers'` skips the pipe, 'off' both. A peer
 // behind our own public IPv4 (a laptop on a phone's hotspot) falls back after
 // sameNatFallbackMs, not fallbackMs. The link's own DataChannel opening later takes
 // the link back (webrtc.js), and one found by other means (a birthday punch,
@@ -366,7 +368,7 @@ export class Room {
       const peer = e.peer;
       this.linked.add(peer);
       this.paths.set(peer, e.path);
-      this.routes.set(peer, this.routeOf(e.path));
+      this.setRoute(peer, e.path);
       this.fallingBack.delete(peer);
       // Prove the room key first; presence follows once the peer has proved it too.
       this.proofSent.set(peer, this.proof.pair('pw-link', this.self, peer).then((p) => {
@@ -444,6 +446,7 @@ export class Room {
       this.deadlines.delete(peer);
       this.proven.add(peer);
       this.relayPending(peer);
+      this.offerRelays();
       // Our presence goes after our own proof, or the peer drops it as unproven and never
       // lists us: signing that proof can finish after this check (WebCrypto keeps no order).
       const sent = this.proofSent.get(peer);
@@ -460,11 +463,31 @@ export class Room {
     return { kind: this.transport.isPipe?.(path.direct) ? 'signaling' : 'direct' };
   }
 
+  // The route to `peer` on `path`. The core learns whether a direct path is the slow
+  // signalling pipe, which a member relay beats (offerRelays).
+  setRoute(peer, path) {
+    const r = this.routeOf(path);
+    this.routes.set(peer, r);
+    if (path.direct !== undefined) this.endpoint.setSlow(peer, r.kind === 'signaling' ? path.direct : null);
+  }
+
   // The route to a linked `peer` again: its path changed, or an adopted channel took
   // its link or gave it back.
   reroute(peer) {
     const path = this.paths.get(peer);
-    if (path && this.linked.has(peer)) this.routes.set(peer, this.routeOf(path));
+    if (!path || !this.linked.has(peer)) return;
+    this.setRoute(peer, path);
+    this.offerRelays();
+  }
+
+  // Every proven member linked to us directly is offered as a relay for every proven
+  // peer we reach over signalling: the core probes through it and moves the link there
+  // once the peer answers, which it does only if it would use that member too.
+  offerRelays() {
+    const members = [...this.routes].filter(([p, r]) => r.kind === 'direct' && this.proven.has(p)).map(([p]) => p);
+    for (const [p, r] of this.routes) {
+      if (r.kind === 'signaling' && this.proven.has(p)) for (const m of members) this.endpoint.addRelay(m, p);
+    }
   }
 
   // A DataChannel closed: the peer is lost if that was its path, or if no fallback
@@ -514,6 +537,9 @@ export class Room {
     this.routes.delete(peer);
     this.paths.delete(peer);
     this.fallingBack.delete(peer);
+    // Its sealed close may never come now that its transport is gone: end the session
+    // here, so links it relayed go back to signalling at once.
+    if (reason === 'left') this.endpoint.disconnect(peer);
     if (this.members.delete(peer)) this.emit('peer-leave', peer, reason);
   }
 
