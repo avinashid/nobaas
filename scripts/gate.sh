@@ -2,7 +2,8 @@
 # The release gate: every check a change must pass before merge (see docs/TEST-PLAN.md).
 # Runs every step even after a failure, prints a summary and exits non-zero if any step failed.
 #
-#   scripts/gate.sh             Rust tests, clippy, wasm build and checks, Node glue, browser tests (loopback)
+#   scripts/gate.sh             Rust tests, clippy, wasm build and checks, @peerwire/react build and types, Node glue,
+#                               browser tests (loopback)
 #   scripts/gate.sh --quick     skip the browser tests: an author's run before handing a branch over (see AGENTS.md)
 #   scripts/gate.sh --strict    clippy with -D warnings, and the fuzz tests again in a debug build (overflow checks):
 #                               the lead's one full run on the merged main, before a push
@@ -72,6 +73,8 @@ NODE=(
   "node nat prediction|node packages/js/test/nat_predict.mjs"
   "node late ice|node packages/js/test/late_ice.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
+  "node react store|node packages/react/test/store.mjs"
+  "node react hooks|node packages/react/test/hooks.mjs"
 )
 NODE_FIRST='^node (room adopt|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
 # Browser tests (headless Chromium on loopback): one at a time, as WebRTC timing suffers under load.
@@ -92,11 +95,12 @@ BROWSER=(
   "netlab rooms|node packages/js/test/netlab_rooms.mjs"
   "netlab mic|node packages/js/test/netlab_mic.mjs"
   "netlab punch close|node packages/js/test/netlab_punch_close.mjs"
+  "react example|node packages/react/test/example.mjs"
 )
 
 # Paths that cannot change a Rust test, clippy or fmt result. Anything else runs the Rust steps: a new crate,
 # Cargo.lock, scripts/, examples/, a crate README (they run as doctests).
-NOT_RUST='^(packages/js/|docs/|\.github/|docker/|[^/]+\.md$|LICENSE-|Dockerfile$|docker-compose\.yml$|\.dockerignore$)'
+NOT_RUST='^(packages/js/|packages/react/|docs/|\.github/|docker/|[^/]+\.md$|LICENSE-|Dockerfile$|docker-compose\.yml$|\.dockerignore$)'
 
 slug() { printf '%s' "${1,,}" | tr -cs 'a-z0-9' '-' | sed 's/-$//'; }
 
@@ -140,6 +144,18 @@ wasm_check() {
     for (const i of imports) console.log(`  import ${i.module}.${i.name} (${i.kind})`);
     process.exit(bytes.length <= max && imports.length === 0 ? 0 : 1);
   ' "$WASM" "$WASM_MAX_BYTES"
+}
+
+# @peerwire/react: its dev dependencies (npm ci, again only when package-lock.json changes), then tsc: the build
+# its tests load, and the types of the package, its example and test/types.tsx.
+react_build() {
+  local d=packages/react lock
+  lock=$(sha256sum "$d/package-lock.json" | cut -d' ' -f1)
+  if [ "$(cat "$d/node_modules/.gate-lock" 2>/dev/null)" != "$lock" ]; then
+    (cd "$d" && npm ci --no-audit --no-fund) || return 1
+    echo "$lock" >"$d/node_modules/.gate-lock"
+  fi
+  (cd "$d" && npm run --silent build && npm run --silent typecheck)
 }
 
 nextest=0
@@ -234,6 +250,7 @@ echo "logs: $LOGS/   rust tests: $([ $nextest = 1 ] && echo cargo-nextest || ech
 # 1. Builds, one after another: they share target/ and cargo's lock.
 step "wasm build" ./packages/js/build.sh
 step "wasm size+imports" wasm_check
+step "react build+types" react_build
 if [ -n "$rust_skip" ]; then
   echo "==> Rust steps skipped: $rust_skip (pass --full to run them)"
   skip "cargo test" "$rust_skip"
@@ -269,7 +286,7 @@ fi
 # The summary, in the order of the old one-at-a-time gate.
 order=("cargo test" "cargo clippy")
 [ $strict = 0 ] || order+=("fuzz (debug)")
-order+=("cargo fmt" "wasm build" "wasm size+imports")
+order+=("cargo fmt" "wasm build" "wasm size+imports" "react build+types")
 for s in "${NODE[@]}" "${BROWSER[@]}"; do order+=("${s%%|*}"); done
 order+=("nostr" "nostr (rust)")
 

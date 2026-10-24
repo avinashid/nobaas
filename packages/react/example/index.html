@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Peerwire React example</title>
+    <style>
+      body { font: 15px/1.4 system-ui, sans-serif; margin: 0; padding: 12px; color: #1d2433; background: #f6f7f9; }
+      header { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+      main { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+      section { background: #fff; border: 1px solid #dde1e8; border-radius: 8px; padding: 10px 12px; }
+      h2 { font-size: 14px; margin: 0 0 8px; color: #5a6475; }
+      ul { margin: 0; padding-left: 18px; }
+      #log { height: 160px; overflow-y: auto; list-style: none; padding: 0; }
+      #count { font-size: 28px; font-weight: 600; margin-right: 8px; }
+      #board { position: relative; height: 180px; background: #eef1f6; border-radius: 6px; overflow: hidden; touch-action: none; }
+      .cursor { position: absolute; transform: translate(-5px, -50%); font-size: 12px; white-space: nowrap; pointer-events: none; }
+      .cursor::before { content: ''; display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #3b6fe0; margin-right: 4px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

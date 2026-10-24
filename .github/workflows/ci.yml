@@ -55,6 +55,7 @@ jobs:
       - name: Size (<= WASM_MAX_BYTES) and zero imports
         run: node .github/scripts/wasm-check.mjs packages/js/pkg/peerwire_ffi.wasm "$WASM_MAX_BYTES"
       - run: node packages/js/test/node_pair.mjs
+      - run: node packages/js/test/wasm_source.mjs
       - run: node packages/js/test/privacy.mjs
       - run: node packages/js/test/room_node.mjs
       - run: node packages/js/test/peer_id.mjs
@@ -73,6 +74,11 @@ jobs:
       - run: node packages/js/test/nat_predict.mjs
       - run: node packages/js/test/late_ice.mjs
       - run: node packages/js/test/birthday.mjs
+      - name: '@peerwire/react: install, build, types'
+        working-directory: packages/react
+        run: npm ci --no-audit --no-fund && npm run build && npm run typecheck
+      - run: node packages/react/test/store.mjs
+      - run: node packages/react/test/hooks.mjs
 
   docker:
     name: docker build
