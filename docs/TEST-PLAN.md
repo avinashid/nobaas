@@ -11,6 +11,7 @@ scripts/gate.sh             # everything below that stays on loopback
 scripts/gate.sh --quick     # skip the browser tests (no Playwright needed)
 scripts/gate.sh --strict    # clippy with -D warnings, and the fuzz tests again in a debug build
 scripts/gate.sh --nostr     # also the public-relay Nostr test; only when a change touches signaling
+scripts/gate.sh --full      # the Rust steps even when no Rust changed since origin/main (GATE_BASE)
 ```
 
 **Who runs what** (details in `AGENTS.md`): the author runs `--quick` (with `--strict` after a Rust change) plus
@@ -20,9 +21,9 @@ browser tests.
 
 | Step | Command | Passes when |
 |---|---|---|
-| Rust tests | `cargo test --workspace --release` | every test passes (ignored tests are known gaps, below) |
+| Rust tests | `cargo nextest run --workspace --release --profile gate` and `cargo test --doc --workspace --release` (`cargo test --workspace --release` without cargo-nextest) | every test passes (ignored tests are known gaps, below) |
 | Lints | `cargo clippy --workspace --all-targets` (`-- -D warnings` with `--strict`) | no errors; `--strict` is clean today |
-| Fuzz, debug build (`--strict`) | `cargo test --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz` | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
+| Fuzz, debug build (`--strict`) | `cargo nextest run --profile gate --lib -p peerwire-core -p peerwire -p peerwire-ffi -p peerwire-sim fuzz` (or `cargo test` with the same arguments) | the parser fuzzers (below) pass where integer overflow panics; release builds wrap and hide it |
 | Format | `cargo fmt --all -- --check` | no diff (skipped if rustfmt is not installed) |
 | wasm build | `packages/js/build.sh` | builds `packages/js/pkg/peerwire_ffi.wasm` |
 | wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
@@ -51,9 +52,13 @@ browser tests.
 | Nostr (opt-in) | `node packages/js/test/nostr.mjs` | two browser contexts on this host find each other via `relay.damus.io` / `nos.lol` / `relay.primal.net` and connect over public STUN |
 
 The script runs every step even after a failure, prints a PASS/FAIL/SKIP summary and exits non-zero if any step
-failed. A full `--strict` run takes about 5 minutes on the 4-core aarch64 dev host with a warm build (on
-`a4651c0`: Rust tests 98 s, debug fuzz 37 s, Node tests ~55 s, browser tests ~110 s); a fresh worktree compiles
-the workspace first and takes several times that.
+failed. It builds first (wasm, clippy, the Rust tests with `--no-run`), then runs the Rust tests beside the Node
+tests (four at a time) and, once those are done, beside the browser tests (one at a time). Each step logs to
+`target/gate-logs/<step>.log`. A full `--strict` run takes about 3 minutes on the 4-core aarch64 dev host with a
+warm build: 163–174 s over four runs on `f253797`, against 273 s for the old one-step-at-a-time script on the same
+commit. The Rust tests take 27 s under cargo-nextest and the debug fuzz run about 30 s; the Node tests take 22 s,
+set by `room_adopt.mjs`; the browser tests take 130–145 s and set the total. A fresh worktree compiles the
+workspace first and takes several times that. With no Rust change since `origin/main`, the Rust steps are skipped.
 
 **Release gate:** `scripts/gate.sh --strict` green on `main`, plus `--nostr` once per release, plus the CI matrix
 (below) green on all three OSes.
@@ -236,4 +241,4 @@ On Linux CI, `scripts/gate.sh --strict` alone covers every job except the macOS 
 Each backlog task's acceptance criteria get a named test before the task moves to review: unit or crate
 integration for an API, a simulator test for anything that crosses the network, a browser test for anything in
 `packages/js` or `examples/`. The task card lists the test names and the gate output. When reviewing a branch, QA
-runs `scripts/gate.sh --strict` on it and posts the summary block plus any failing output on the card.
+reads the diff against the code and re-runs a test only to reproduce a problem or try a mutant (see `AGENTS.md`).
