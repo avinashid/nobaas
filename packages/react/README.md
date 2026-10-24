@@ -73,6 +73,7 @@ member whose presence fails is left out of `usePeers`. A shared value that fails
 member alike. `useSharedState` checks even without `accept`: a value must be of the kind `initial` is (the same
 `typeof`, an array for an array, a non-array object for an object; anything when `initial` is null). The check
 should be a plain function of the value; when it changes, the new one applies from the next change in the room.
+A check that throws counts as failed.
 
 ### Shared state
 

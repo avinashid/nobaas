@@ -103,6 +103,8 @@ function Probe({ out }) {
   const { room, status } = useRoom();
   const peers = usePeers();
   const named = usePeers({ accept: (p) => typeof p?.name === 'string' });
+  // A check that throws on a member's input (an object has no toUpperCase) must count as failed, not crash.
+  const shouty = usePeers({ accept: (p) => p.name.toUpperCase() !== '' });
   const [me, setMe] = usePresence();
   const { messages, send } = useMessages({ limit: 5 });
   const { messages: texts } = useMessages({ accept: (d) => typeof d === 'string' });
@@ -115,7 +117,7 @@ function Probe({ out }) {
   // A new handler every render: the latest one must be called.
   useRoomEvent('message', (data) => out.raw.push([tick, data]));
   out.maxPeers = Math.max(out.maxPeers ?? 0, peers.length);
-  Object.assign(out, { room, status, peers, named, me, messages, texts, count, late, big, cursors, points });
+  Object.assign(out, { room, status, peers, named, shouty, me, messages, texts, count, late, big, cursors, points });
   Object.assign(out, { setMe, send, setCount, setCursor, setTick, tick });
   return null;
 }
@@ -264,6 +266,7 @@ for (const m of [A, B, C, D]) {
   const e = m.out.peers.find((p) => p.id === E.self);
   if (typeof e?.presence?.name !== 'object' || m.out.named.some((p) => p.id === E.self)) fail(`${m.name}: presence check`);
   if (m.out.named.length !== m.out.peers.length - 1) fail(`${m.name}: the check dropped a well-named member`);
+  if (m.out.shouty.map((p) => p.id).join() !== m.out.named.map((p) => p.id).join()) fail(`${m.name}: a throwing check`);
   if (!m.out.messages.some((x) => x.data?.x === 1) || m.out.texts.some((x) => typeof x.data !== 'string')) fail(`${m.name}: message check`);
   if (m.out.texts.at(-1)?.data !== 'after the wrong types') fail(`${m.name}: the message check dropped text`);
   if (m.out.count !== 0) fail(`${m.name}: an object in a number's shared state read as ${JSON.stringify(m.out.count)}, not initial`);

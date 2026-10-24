@@ -166,6 +166,16 @@ export interface RoomOption {
  */
 export type Accept<T> = ((value: unknown) => value is T) | ((value: unknown) => boolean);
 
+// Runs an app's check on what a member sent. One that throws counts as failed: it runs during render, so a throw
+// would unmount the app.
+function passes<A extends unknown[]>(check: (...args: A) => boolean, ...args: A): boolean {
+  try {
+    return check(...args) === true;
+  } catch {
+    return false;
+  }
+}
+
 function useTarget(room: Room | null | undefined): Room | null {
   const state = useContext(RoomContext);
   return room === undefined ? (state?.room ?? null) : room;
@@ -205,7 +215,7 @@ export function usePeers<P = Presence>(options: { accept?: Accept<P> } & RoomOpt
   );
   return useMemo(() => {
     const ok = accept.current;
-    return (ok ? all.filter((p) => ok(p.presence)) : all) as readonly Peer<P>[];
+    return (ok ? all.filter((p) => passes(ok, p.presence)) : all) as readonly Peer<P>[];
   }, [all, accept]);
 }
 
@@ -275,7 +285,7 @@ export function useMessages<T = any>(options: UseMessagesOptions<T> = {}): UseMe
     setMessages((list) => (list.length ? [] : list));
     if (!r) return;
     return r.on('message', (data, peer, info) => {
-      if (isInternal(data) || (accept.current && !accept.current(data, info))) return;
+      if (isInternal(data) || (accept.current && !passes(accept.current, data, info))) return;
       add({ id: ++nextId, peer, data, lane: info.lane, kind: info.kind, at: Date.now(), mine: false });
     });
   }, [r, add, accept]);
@@ -324,12 +334,12 @@ export function useSharedState<T>(key: string, initial: T, options: { accept?: A
     (next) => {
       if (!store) return;
       const cur = store.getShared(key);
-      const prev = cur && latest.current.ok(cur.v) ? (cur.v as T) : latest.current.initial;
+      const prev = cur && passes(latest.current.ok, cur.v) ? (cur.v as T) : latest.current.initial;
       store.setShared(key, typeof next === 'function' ? (next as (prev: T) => T)(prev) : next);
     },
     [store, key, latest],
   );
-  return [entry && ok(entry.v) ? (entry.v as T) : initial, set];
+  return [entry && passes(ok, entry.v) ? (entry.v as T) : initial, set];
 }
 
 /**
@@ -362,7 +372,7 @@ export function usePeerState<T = any>(
     const ok = accept.current;
     if (!ok) return all;
     const kept: Record<PeerId, unknown> = {};
-    for (const [peer, v] of Object.entries(all)) if (ok(v)) kept[peer] = v;
+    for (const [peer, v] of Object.entries(all)) if (passes(ok, v)) kept[peer] = v;
     return Object.freeze(kept);
   }, [all, accept]) as Readonly<Record<PeerId, T>>;
   const set = useCallback((value: T) => store?.setLive(key, value), [store, key]);
