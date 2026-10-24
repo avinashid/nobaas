@@ -5,7 +5,11 @@
 //   relay both ways (route says { kind: 'peer', via: c } on both sides), with no
 //   'peer-leave' or 'peer-join', and messages flow through c;
 // - c leaves: the link goes back to the pipe at once, again with no leave or join, and
-//   messages flow over signalling.
+//   messages flow over signalling;
+// - with Fast lane 1: d joins and the link moves to d; then a and b's ICE works again and
+//   a retry (retryDirect) opens a channel: the link goes 'direct', the same session with
+//   no leave or join, the room clears the pipe's slow mark, d relays nothing more for it,
+//   and d leaving changes nothing.
 //
 //   node packages/js/test/room_relay_move.mjs
 import { joinRoom } from '../src/index.js';
@@ -121,6 +125,24 @@ if (!same(a.route(b.self), { kind: 'signaling' }) || !same(b.route(a.self), { ki
 const joins = log.length;
 console.log('a|b blocked: linked over signalling');
 
+// What the core hears from each room about the other: its last setSlow, its new sessions
+// and its path changes.
+const slow = new Map(); // room -> last setSlow address for the other (a pipe handle, or null)
+const seen = new Map(); // room -> { connected, paths }
+for (const [r, p] of [[a, b.self], [b, a.self]]) {
+  const set = r.endpoint.setSlow.bind(r.endpoint);
+  r.endpoint.setSlow = (peer, addr) => (peer === p && slow.set(r, addr), set(peer, addr));
+  const s = { connected: 0, paths: 0 };
+  seen.set(r, s);
+  const ev = r.endpoint.onEvent;
+  r.endpoint.onEvent = (e) => {
+    if (e.peer === p && e.type === 'connected') s.connected++;
+    if (e.peer === p && e.type === 'pathChanged') s.paths++;
+    ev(e);
+  };
+}
+const sessions = () => [...seen.values()].map((s) => s.connected).join();
+
 // Messages each way between a and b; resolves once both arrived.
 const both = async (what, tag) => {
   const got = [];
@@ -151,8 +173,33 @@ await c.leave();
 const back = await until('a and b back on signalling', () => same(a.route(b.self), { kind: 'signaling' }) && same(b.route(a.self), { kind: 'signaling' }), 30000);
 if (back > 1000) fail(`back on signalling only after ${back} ms`);
 if (bLog().length || !a.peers.includes(b.self) || !b.peers.includes(a.self)) fail(`a and b lost each other: ${bLog()}`);
+if (![a, b].every((r) => typeof slow.get(r) === 'number')) fail(`the pipe isn't marked slow again: ${[...slow.values()]}`);
 await both('back over signalling', 'pipe again');
 console.log(`c leaves: a and b back on signalling ${back} ms later, same link, messages flow`);
+
+// Fast lane 1 and 2 together: the link moves to d, then a retry takes it direct.
+const d = await room('d');
+const viaD = { kind: 'peer', via: d.self };
+await until('a and b moving to d', () => same(a.route(b.self), viaD) && same(b.route(a.self), viaD), 30000);
+blocked.clear();
+if (a.retryDirect(b.self) !== 1) fail('retryDirect(b) on a link relayed by d is not 1');
+const direct = await until('a and b direct after the retry', () => a.route(b.self)?.kind === 'direct' && b.route(a.self)?.kind === 'direct', 30000);
+if (bLog().length || sessions() !== '0,0') fail(`a new session or a leave: ${bLog()}, connected ${sessions()}`);
+if (slow.get(a) !== null || slow.get(b) !== null) fail(`the slow mark wasn't cleared: ${[...slow.values()]}`);
+await sleep(200); // what d had in flight
+const relayedD = d.stats().relayed;
+await both('over the retry', 'direct');
+await sleep(1200); // past two rounds of relay probes (500 ms)
+if (d.stats().relayed !== relayedD) fail(`d relayed ${d.stats().relayed - relayedD} more datagrams after a and b went direct`);
+const paths = [...seen.values()].map((s) => s.paths).join();
+await d.leave();
+await sleep(300);
+if ([...seen.values()].map((s) => s.paths).join() !== paths || a.route(b.self)?.kind !== 'direct' || b.route(a.self)?.kind !== 'direct') {
+  fail(`d leaving moved the link: ${JSON.stringify([a.route(b.self), b.route(a.self)])}`);
+}
+await both('after d left', 'direct again');
+if (bLog().length || sessions() !== '0,0') fail(`a new session or a leave: ${bLog()}, connected ${sessions()}`);
+console.log(`d joins, the link moves to d, a retry takes it direct ${direct} ms later: same link, slow mark cleared, nothing more through d, d leaving changes nothing`);
 
 await Promise.all([a.leave(), b.leave()]);
 console.log('room_relay_move: ok');
