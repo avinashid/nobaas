@@ -22,7 +22,9 @@
 //     one answer (WebRtcTransport.retryAnswerMs); a copy of the one taken is answered again;
 // 11. a 'retry' ask sent to the larger id is ignored: it doesn't ask back, nobody retries;
 // 12. a retry whose createOffer throws ends as a failed one: its link goes, and the next
-//     retry goes direct.
+//     retry goes direct;
+// 13. the same floor when the answering side holds no link (its retry link failed): of 2
+//     proven retry offers within retryAnswerMs, one makes a connection.
 //
 //   node packages/js/test/room_retry.mjs
 import { joinRoom } from '../src/index.js';
@@ -438,6 +440,38 @@ for (const privacy of ['public-only', 'direct']) {
   await until('direct on the next retry', () => routes(a, b).join() === 'direct,direct', 5000);
   if (a.transport.retried !== 2 || a.seen.leaves || b.seen.leaves) fail(`retries ${a.transport.retried}, ${JSON.stringify([a.seen, b.seen])}`);
   console.log("12. a retry whose createOffer threw failed quietly and left no link; the next went direct");
+  await Promise.all([a.leave(), b.leave()]);
+}
+
+// 13. The floor when the answering side holds no link (its last retry link failed and
+// went): a retry offer that finds none takes the slot too, so a second within
+// retryAnswerMs makes no connection.
+{
+  DirectRetries.firstMs = 60000;
+  const [a, b] = await pair(1);
+  await until('a link over signalling', () => routes(a, b).join() === 'signaling,signaling');
+  const p = await a.transport.offerProof.sign(b.self);
+  const offer = () => ({ kind: 'offer', sdp: { type: 'offer', sdp: sdpOf(new (fakePc(`x${n}`))().token) }, p, retry: true });
+  // A first retry offer makes a link that never opens: at b's fallbackMs (300 ms here)
+  // it ends as 'retry-failed' and goes, leaving b no link to a.
+  a.transport.signal(b.self, offer());
+  await until("b's retry link failed", () => b.seen.retryFailed === 1, 5000);
+  if (b.transport.has(a.self)) fail('the failed retry link is still there');
+  // Once its slot is over, two retry offers within one floor: the first finds no link.
+  const floor = WebRtcTransport.retryAnswerMs;
+  await sleep(Math.max(0, b.transport.retryTaken.get(a.self) + floor - Date.now()) + 50);
+  if (b.transport.has(a.self)) fail('b has a link to a before the two offers');
+  const answers = () => sent.filter((s) => s.from === b.self && s.to === a.self && s.body?.kind === 'answer').length;
+  const [made0, answers0, bad0] = [made.get(b.owner), answers(), b.transport.badSignals];
+  a.transport.signal(b.self, offer());
+  await sleep(50);
+  a.transport.signal(b.self, offer());
+  await until('both offers handled', () => b.transport.badSignals - bad0 + answers() - answers0 >= 2, 5000);
+  await sleep(300);
+  const [conns, ans, bad] = [made.get(b.owner) - made0, answers() - answers0, b.transport.badSignals - bad0];
+  if (conns !== 1 || ans !== 1 || bad !== 1) fail(`2 retry offers to a side with no link made ${conns} connections and ${ans} answers (${bad} refused), want 1, 1 and 1`);
+  if (a.seen.leaves || b.seen.leaves) fail(`a leave: ${JSON.stringify([a.seen, b.seen])}`);
+  console.log(`13. with no link on the answering side, 2 proven retry offers after the last slot's ${floor} ms made 1 connection and 1 answer (1 refused)`);
   await Promise.all([a.leave(), b.leave()]);
 }
 

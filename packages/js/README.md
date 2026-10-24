@@ -434,7 +434,8 @@ Run these with Node and the Playwright install on this host:
   dialling side. A `'public-only'` retry carries no host candidate. A microphone grant retries in a
   `'direct'` room only (not with `retryOnGrant: false`); so do `online` and a new connection type.
   20 proven retry offers 50 ms apart make one connection and one answer (a copy of that offer is
-  answered again), the larger id ignores a request, and a retry whose `createOffer` throws fails
+  answered again), and so do 2 to an answering side whose last retry link failed and went; the
+  larger id ignores a request, and a retry whose `createOffer` throws fails
   quietly so the next one goes direct.
 - `node packages/js/test/retry_backoff.mjs`: the retry schedule on a fake clock: the backoff and its
   jitter, one retry at a time, 2 s apart, peers in turn, requests once per 20 s; 20 failing peers
