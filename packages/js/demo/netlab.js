@@ -215,14 +215,17 @@ function presence() {
 // offers only its mobile-data addresses, not its hotspot one) unless the page has mic
 // or camera permission: then a new connection offers every interface's real address,
 // so a laptop on a phone's hotspot may link to the phone directly. A connection made
-// before the grant stays hidden, so a grant re-runs the network test and rejoins the
-// room, which makes every link a new connection. Only the permission is needed: the
-// microphone is closed at once. The grant is the site's, for later visits too, and anyone
-// can open the global room: while the microphone is allowed, the global room is joined
-// with privacy 'public-only', so its members never get the local addresses (MIC-1).
+// before the grant stays hidden, so a grant re-runs the network test and, in named and
+// private rooms, has the room retry WebRTC with every peer it reaches by fallback
+// (room.retryDirect: a new connection, the same session; direct links stay as they are).
+// Only the permission is needed: the microphone is closed at once. The grant is the
+// site's, for later visits too, and anyone can open the global room: while the microphone
+// is allowed, the global room is joined with privacy 'public-only', so its members never
+// get the local addresses (MIC-1); a grant while in it rejoins it that way, and it never
+// retries because of a grant (retryOnGrant: false).
 let micState = typeof navigator.mediaDevices?.getUserMedia === 'function' ? 'prompt' : 'unsupported';
 let micChecked = Promise.resolve(); // watchMic()'s first query
-let askingMic = false; // the button's own request, which rejoins by itself
+let askingMic = false; // the button's own request, which rejoins (or retries) by itself
 let roomPrivacy = null; // the privacy the room was joined with
 async function watchMic() {
   if (micState !== 'unsupported') {
@@ -272,11 +275,14 @@ async function useMic() {
   }
   renderMic();
   $('mic').disabled = true; // until the room is joined again
-  log('info', `microphone allowed (closed again at once): new links in named and private rooms offer this device's local addresses (never the global room's); ${room ? 'rejoining the room and ' : ''}re-testing the network`);
+  const what = !room ? '' : roomKind === 'global' ? 'rejoining the room and ' : 'retrying WebRTC with the peers on a fallback and ';
+  log('info', `microphone allowed (closed again at once): new links in named and private rooms offer this device's local addresses (never the global room's); ${what}re-testing the network`);
   try {
-    // Rejoin first: until then the global room is still joined with the local addresses,
-    // and the re-test takes seconds (MIC-4). reprobe() sends the new reading as presence.
-    await rejoin();
+    // The global room rejoins first: until then it is still joined with the local addresses,
+    // and the re-test takes seconds (MIC-4). Other rooms keep their links: those on a
+    // fallback get a new connection. reprobe() sends the new reading as presence.
+    if (roomKind === 'global') await rejoin();
+    else if (room) log('info', `${room.retryDirect()} peer(s) on a fallback to retry, one at a time`);
     await reprobe();
   } finally {
     askingMic = false;
@@ -391,6 +397,8 @@ async function enter(kind, key) {
       signaling,
       privacy,
       presence: { ...presence(), name: clip($('name').value.trim(), 20) || 'guest' },
+      // The global room never makes new connections because of a grant: it rejoins (MIC-1).
+      retryOnGrant: kind !== 'global',
       ...(relays?.length && { relays }),
       ...(params.get('rtc') === 'off' && { RTCPeerConnection: NoIcePc }),
     });
@@ -500,9 +508,12 @@ function addrText(d) {
   return parts.length ? parts.join(', ') : 'no addresses';
 }
 
+const offerText = (d) => (d.restart ? 'ICE restart offer' : d.retry ? 'retry offer (a new connection)' : 'offer');
 const SIG_TEXT = {
-  'offer-sent': (d) => d.resend ? 'no answer yet: offer sent again' : `${d.restart ? 'ICE restart offer' : 'offer'} sent (${addrText(d)})`,
-  'offer-received': (d) => `${d.restart ? 'ICE restart offer' : 'offer'} received (${addrText(d)})`,
+  'offer-sent': (d) => d.resend ? 'no answer yet: offer sent again' : `${offerText(d)} sent (${addrText(d)})`,
+  'offer-received': (d) => `${offerText(d)} received (${addrText(d)})`,
+  retry: (d) => d.dialer ? 'trying WebRTC again with a new connection (the link stays on its fallback meanwhile)' : 'asked them to try WebRTC again',
+  'retry-failed': () => 'the retry did not connect: the link stays on its fallback, and is retried later',
   'answer-sent': (d) => d.resend ? 'their offer came again (our answer lost?): answer sent again' : `answer sent (${addrText(d)})`,
   'ice-restart': (d) => d.dialer ? `ICE lost (${d.reason}): restarting, try ${d.n}` : `ICE lost (${d.reason}): asked them to restart, try ${d.n}`,
   guesses: (d) => `their NAT is sequential symmetric: trying ${d.n} ports around ${d.ip}:${d.next} (step ${d.step})`,
@@ -1141,7 +1152,7 @@ async function render() {
       const piped = room.transport?.piped;
       if (piped) relayHtml += `<dt>Fallback route</dt><dd>${piped.sent} batches sent · ${piped.received} datagrams received${piped.dropped ? ` · ${piped.dropped} dropped` : ''}${piped.stale ? ` · ${piped.stale} late (the WebRTC link took over)` : ''}</dd>`;
       const tr = room.transport;
-      if (tr) relayHtml += `<dt>WebRTC signals</dt><dd>${tr.resent ?? 0} resent · ${tr.restarts ?? 0} ICE restarts${tr.badSignals ? ` · ${tr.badSignals} refused` : ''}</dd>`;
+      if (tr) relayHtml += `<dt>WebRTC signals</dt><dd>${tr.resent ?? 0} resent · ${tr.restarts ?? 0} ICE restarts · ${tr.retried ?? 0} retries${tr.badSignals ? ` · ${tr.badSignals} refused` : ''}</dd>`;
       relayHtml += '</dl>';
     } else relayHtml = '<p class="dim" style="margin:0">Local (BroadcastChannel): tabs of this browser only.</p>';
     $('relays').innerHTML = relayHtml;
@@ -1240,7 +1251,7 @@ function report() {
       signaling: room.signaling.sockets
         ? { relays: room.signaling.sockets.map((ws) => ({ url: ws.relayUrl, state: ['connecting', 'open', 'closing', 'closed'][ws.readyState] })), stats: room.signaling.stats }
         : 'local',
-      piped: room.transport?.piped ?? null, core: room.stats(),
+      piped: room.transport?.piped ?? null, retried: room.transport?.retried ?? 0, core: room.stats(),
     },
     peers: [...peers.values()].map((p) => ({
       id: p.id, name: nameOf(p.id), presence: p.presence, linked: !!room?.peers.includes(p.id), route: p.route, routeLog: p.routeLog,

@@ -56,6 +56,7 @@ room.send(bytes, { to: peer });                 // one peer, or an array of them
 room.setPresence({ name: 'Ana', typing: true });
 room.peers; room.self; room.getPresence(peer); room.rtt(peer);
 room.route(peer);                               // { kind: 'direct' (adopted?) | 'peer' (via) | 'signaling' }
+room.retryDirect();                             // try WebRTC again with peers on a fallback (see Through any NAT)
 await room.leave();                             // peers see 'peer-leave' at once
 ```
 
@@ -226,8 +227,32 @@ link moves onto it, and `room.route(peer)` says `'direct'` again:
 - **A relayed link** punches over the channel and moves there once the punch is answered.
 - **A link over signalling** sends its datagrams over the channel. The far end's core, hearing
   them there, moves the link onto it, and then ours does: an authenticated datagram from a
-  new address moves a direct path. Datagrams that still come over signalling after that were
-  sent before the channel opened. They are dropped, so the link doesn't move back.
+  new address moves a direct path. The room sends one at once (an empty reliable frame),
+  so an idle link moves too, not at the next keepalive. Datagrams still queued for
+  signalling when the channel opens go over the channel instead. Those that still come over
+  signalling after that were sent before it opened. They are dropped, so the link doesn't
+  move back.
+
+**WebRTC is tried again.** While a peer is on a fallback, the room retries WebRTC with a
+new connection and leaves the working link alone. If the new DataChannel opens, the link
+moves onto it as above: `route(peer)` becomes `'direct'`, the same session, with no
+`peer-leave` or `peer-join`. A retry that doesn't open within `fallbackMs` closes quietly;
+the fallback and the peer stay as they are. The room retries:
+- **on a backoff:** 20 s after the peer went on a fallback, then 40, 80 and 160 s, then every
+  5 min, each ±20 %;
+- **after a network change:** `online`, or a new `navigator.connection.type` (a new speed
+  estimate doesn't count);
+- **after a microphone or camera grant**, with privacy `'direct'`: browsers show their local
+  addresses (mDNS hides them, Android Chrome lists only mobile data) only to connections
+  made after one, so a laptop on a phone's hotspot can then link to the phone directly.
+  `retryOnGrant: false` turns this off. With `'public-only'`, retries offer no local
+  address, as first dials don't;
+- **when the app asks:** `room.retryDirect(peer?)`, for every peer on a fallback or one.
+
+Only the dialling side (the smaller id) offers; the other side asks it to. Each retry is
+an offer and an answer over the signalling relays, so a room keeps them rare: one at a time,
+at least 2 s apart, peers in turn, and a peer's requests count once per 20 s. A 20-peer room
+whose retries all fail makes about one per peer per 5 min, a few a minute at most.
 
 **A direct channel found later.** A DataChannel to the peer opened outside the room (a
 browser birthday punch's, `src/birthday.js`, as Net Lab runs one) can take a fallback
@@ -322,6 +347,18 @@ Run these with Node and the Playwright install on this host:
   arrives with nothing over signalling, or the member relays nothing more. When the
   channel closes, the link goes back to its fallback route and carries on. A channel
   only one end adopts is refused after 5 s, and a direct link isn't moved.
+- `node packages/js/test/room_retry.mjs`: retries on the same fake, whose first attempts fail. A
+  pair over signalling, or relayed by a member, goes direct on the backoff's retry, the same session
+  (one `connected`, no leave), with data over the channel and none over the pipe. A failed retry
+  closes quietly and the next, twice as late, goes direct. The larger id's `retryDirect()` asks the
+  dialling side. A `'public-only'` retry carries no host candidate. A microphone grant retries in a
+  `'direct'` room only (not with `retryOnGrant: false`); so do `online` and a new connection type.
+- `node packages/js/test/retry_backoff.mjs`: the retry schedule on a fake clock: the backoff and its
+  jitter, one retry at a time, 2 s apart, peers in turn, requests once per 20 s; 20 failing peers
+  for an hour stay within a few retries a minute.
+- `node packages/js/test/retry_direct.mjs`: in Chromium, two tabs whose first connection gets no
+  candidates link over signalling, then go direct on the retry with no leave; with the microphone
+  granted and `'public-only'`, no signal, retries included, names a local address.
 - `node packages/js/test/room_same_nat.mjs`: members behind one public IPv4, on a fake whose
   descriptions name it (or trickle it 1 s late, on either side) and whose ICE never
   connects. The pair traces `same-nat`, falls back 3 s after the offer, not 8, and links
@@ -336,8 +373,9 @@ Run these with Node and the Playwright install on this host:
   to signalling. Net Lab's transport hook passes a closed link's handle on to the room.
 - `node packages/js/test/netlab_mic.mjs [shot-prefix]`: Net Lab's "Use microphone" button, with fake
   media and the browser's mDNS hiding on. Before, the local addresses are `.local`; after a grant the
-  report says `granted`, the network test lists real local addresses and reads the same NAT, the room
-  is joined again, and the other tab sees `mic` and real local addresses and links direct. The global
+  report says `granted`, the network test lists real local addresses and reads the same NAT, and the
+  pair, over signalling until then, retries WebRTC without rejoining (the same ids, no leave): the other
+  tab sees `mic` and real local addresses on the new connection, which links direct. The global
   room, with the grant stored before the tabs open or given while they're in it, gives the other tab
   no local address and still links, and a birthday punch's offer carries no candidate. Pressed in the
   global room, the button rejoins before it re-tests the network, so a tab joining meanwhile hears no

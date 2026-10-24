@@ -29,7 +29,9 @@
 // behind our own public IPv4 (a laptop on a phone's hotspot) falls back after
 // sameNatFallbackMs, not fallbackMs. The link's own DataChannel opening later takes
 // the link back (webrtc.js), and one found by other means (a birthday punch,
-// birthday.js) can take a fallback link over: room.adoptChannel().
+// birthday.js) can take a fallback link over: room.adoptChannel(). Meanwhile the room
+// tries WebRTC again now and then, and on a network change or a microphone or camera
+// grant (retry.js); a retry whose DataChannel opens takes the link over the same way.
 //
 // Hosts that can't take callbacks well (Godot's JavaScriptBridge) pull instead:
 // room.poll() / room.receive() return queued events as plain objects (strings,
@@ -40,10 +42,12 @@ import { WebRtcTransport, BroadcastSignaling } from './webrtc.js';
 import { NostrSignaling } from './nostr.js';
 import { LocalTransport } from './local.js';
 import { RoomProof } from './proof.js';
+import { DirectRetries } from './retry.js';
 
 export const DEFAULT_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
 const LANES = { reliable: Lane.Reliable, unreliable: Lane.Unreliable, urgent: Lane.Urgent };
-const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5 };
+// Nudge carries nothing (peers ignore tags they don't know): see the 'open' handler.
+const T = { Bytes: 0, Text: 1, Json: 2, Presence: 3, Bye: 4, Proof: 5, Nudge: 6 };
 // Presence is re-announced this often, so a lost hello only delays a join.
 const HELLO_EVERY_MS = 15000;
 // A link must prove the room key this soon after it connects.
@@ -111,6 +115,7 @@ export async function joinRoom({
   fallback = 'auto',
   fallbackMs,
   sameNatFallbackMs,
+  retryOnGrant = true,
   RTCPeerConnection = globalThis.RTCPeerConnection,
 } = {}) {
   if (!appId || !roomId) throw new TypeError('joinRoom needs an appId and a roomId');
@@ -147,7 +152,8 @@ export async function joinRoom({
     sig.close();
     throw new Error('no WebRTC in this runtime: pass RTCPeerConnection (e.g. from node-datachannel) or use signaling: \'local\'');
   }
-  const room = new Room(endpoint, sig, transport, presence, proof, { fallback });
+  // A grant shows local addresses only to new connections, and only 'direct' offers them.
+  const room = new Room(endpoint, sig, transport, presence, proof, { fallback, grants: privacy === 'direct' && retryOnGrant });
   if (queue) room.queue = [];
   await sig.ready;
   await room.hello();
@@ -157,7 +163,7 @@ export async function joinRoom({
 export class Room {
   static proofMs = PROOF_MS; // tests shorten it
   static peerFirstMs = PEER_FIRST_MS;
-  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off' } = {}) {
+  constructor(endpoint, signaling, makeTransport, presence, proof, { fallback = 'off', grants = false } = {}) {
     this.endpoint = endpoint;
     this.signaling = signaling;
     this.self = endpoint.id;
@@ -182,7 +188,17 @@ export class Room {
       if (state === 'closed') this.rtcClosed(peer, handle);
       else if (state === 'failed') this.rtcFailed(peer);
       else if (state === 'carrier') this.reroute(peer);
+      else if (state === 'open' || state === 'retry-failed') this.retries.done(peer);
+      // A link over signalling moves onto a channel that opened late (a retry's, say) with
+      // its first datagram there: one now (its ACK moves the far end's too), not at the next
+      // keepalive, up to 10 s on.
+      if (state === 'open' && this.routes.get(peer)?.kind === 'signaling' && this.proven.has(peer)) this.write(peer, Uint8Array.of(T.Nudge), Lane.Reliable);
+      else if (state === 'retry') this.retries.ask(peer);
     });
+    // Peers on a fallback: WebRTC is tried again now and then (see retryDirect).
+    this.retries = new DirectRetries((peer) => this.retryNow(peer), { holdMs: (this.transport.fallbackMs ?? 8000) + 10000 });
+    this.unwatch = []; // removes the permission listeners
+    if (grants) this.watchGrants();
     endpoint.onEvent = (e) => this.onEvent(e);
     // ACKs free send window: flush the outbox as they arrive (the timer is a fallback).
     endpoint.onDrain = () => this.outbox.size && this.flush('drain');
@@ -198,8 +214,15 @@ export class Room {
     };
     globalThis.addEventListener?.('pagehide', this.onPageHide);
     // A network switch: links whose ICE dropped restart it now (only those, so a new
-    // speed estimate, which fires 'change' too, costs nothing).
-    this.onNetwork = () => this.transport.networkChanged?.();
+    // speed estimate, which fires 'change' too, costs nothing), and peers on a fallback
+    // are retried (only on a new network: 'online', or a new connection type).
+    this.netType = globalThis.navigator?.connection?.type;
+    this.onNetwork = (e) => {
+      this.transport.networkChanged?.();
+      const type = globalThis.navigator?.connection?.type;
+      if (e?.type === 'online' || type !== this.netType) this.retries.soon();
+      this.netType = type;
+    };
     globalThis.addEventListener?.('online', this.onNetwork);
     globalThis.navigator?.connection?.addEventListener?.('change', this.onNetwork);
   }
@@ -281,6 +304,38 @@ export class Room {
     return this.routes.get(peer) ?? null;
   }
 
+  // Tries WebRTC again, now, with `peer` (or every peer) that the room reaches only by
+  // fallback: a new connection, so one made after a microphone or camera grant offers the
+  // local addresses (privacy 'direct'), and one after a network change its addresses.
+  // If its DataChannel opens, the link moves onto it (route() says 'direct'), the same
+  // session; if not, nothing changes. Retries take turns: one at a time per room, at
+  // least 2 s apart. Returns how many peers are to be retried.
+  retryDirect(peer) {
+    return this.left ? 0 : this.retries.soon(peer);
+  }
+
+  // Begins a retry with `peer`: the dialling side dials it afresh, the other asks it to.
+  retryNow(peer) {
+    if (this.left || !this.linked.has(peer)) return false;
+    if (this.self < peer) return !!this.transport.retry?.(peer);
+    this.transport.askRetry?.(peer);
+    return false;
+  }
+
+  // Browsers show their local addresses only to connections made after a microphone or
+  // camera grant, so on one, peers on a fallback are retried.
+  watchGrants() {
+    for (const name of ['microphone', 'camera']) {
+      (async () => {
+        const st = await globalThis.navigator?.permissions?.query?.({ name });
+        if (!st?.addEventListener || this.left) return;
+        const on = () => st.state === 'granted' && this.retries.soon();
+        st.addEventListener('change', on);
+        this.unwatch.push(() => st.removeEventListener('change', on));
+      })().catch(() => {}); // a permission this browser can't query
+    }
+  }
+
   // Moves `peer`'s link onto `dc`, an open DataChannel to it made outside the room
   // (`pc` its connection; a birthday punch's, say), when the room reaches `peer` only by
   // fallback (relayed by a member, or over signalling) and the peer adopts its end too.
@@ -320,6 +375,8 @@ export class Room {
     globalThis.removeEventListener?.('pagehide', this.onPageHide);
     globalThis.removeEventListener?.('online', this.onNetwork);
     globalThis.navigator?.connection?.removeEventListener?.('change', this.onNetwork);
+    this.retries.close();
+    for (const off of this.unwatch) off();
     const bye = Uint8Array.of(T.Bye);
     for (const p of this.linked) this.endpoint.send(p, bye, Lane.Unreliable);
     this.endpoint.pump();
@@ -368,7 +425,7 @@ export class Room {
       const peer = e.peer;
       this.linked.add(peer);
       this.paths.set(peer, e.path);
-      this.setRoute(peer, e.path);
+      this.reroute(peer);
       this.fallingBack.delete(peer);
       // Prove the room key first; presence follows once the peer has proved it too.
       this.proofSent.set(peer, this.proof.pair('pw-link', this.self, peer).then((p) => {
@@ -468,6 +525,7 @@ export class Room {
   setRoute(peer, path) {
     const r = this.routeOf(path);
     this.routes.set(peer, r);
+    this.retries.track(peer, r.kind !== 'direct', this.self < peer); // the dialling side keeps the backoff
     if (path.direct !== undefined) this.endpoint.setSlow(peer, r.kind === 'signaling' ? path.direct : null);
   }
 
@@ -537,6 +595,7 @@ export class Room {
     this.routes.delete(peer);
     this.paths.delete(peer);
     this.fallingBack.delete(peer);
+    this.retries.forget(peer);
     // Its sealed close may never come now that its transport is gone: end the session
     // here, so links it relayed go back to signalling at once.
     if (reason === 'left') this.endpoint.disconnect(peer);
