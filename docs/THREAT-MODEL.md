@@ -83,6 +83,7 @@ that needs a change is tracked as an NB card.
 | MIC-2 (Info) | **Fixed** by `9282d36` (a punch that ended closes what it opened) and `691dec0` (one offer and one answer per punch, which also closes a Low NB48-1 bypass), reviewed 2026-10-24 |
 | MIC-4 (Low) | **Fixed** by `134fed3` (the button rejoins before it re-tests the network), reviewed 2026-10-24 |
 | MIC-5 (Info) | Open, same section |
+| FL1-1 (Info), FL1-2 (Low) | Open, [WebRTC retries](#webrtc-retries-fast-lane-1--fl1-1-fl1-2) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -238,7 +239,10 @@ a room already).
 a per-session `seen` set of event ids, which does not survive a reconnect and does
 not stop a relay from re-delivering an old sealed offer with a fresh event id. An
 observer can replay a captured sealed offer later; the effect is limited (it
-triggers a redundant answer / ICE churn, feeding SEC-3) but non-zero.
+triggers a redundant answer / ICE churn, feeding SEC-3) but non-zero. A re-sent
+retry offer (`retry: true`, Fast lane 1) also closes the recipient's pending connection
+to that peer, one that never opened, and so cancels an upgrade; the fallback link
+carries on.
 
 **Fix.** Put a `created_at`/nonce inside the sealed body and reject stale or
 duplicate (sender, nonce) at the adapter. The Nostr `created_at` is unauthenticated
@@ -739,6 +743,52 @@ security model for remote candidates (RFC 8826), but the cost is cheap to tighte
 Fix: require `nat.ip` to match one of the peer's server-reflexive addresses, take one
 prediction per description, and cap remote candidates per link (for example at 128).
 
+### WebRTC retries (Fast lane 1) — FL1-1, FL1-2
+
+While a link runs on a fallback (a member relay or the signalling pipe), the room tries
+WebRTC again with a new RTCPeerConnection (`9acde3d`…`0e984ea`, `retry.js`): on a
+backoff (20 s doubling to 5 min), after a network change, after a microphone or camera
+grant (privacy `'direct'`, `retryOnGrant`) and on `room.retryDirect()`. Only the
+dialling side (the smaller id) offers; the other asks it with a `retry` signal. Reviewed
+2026-10-24 by reading the code, with two scratch repros:
+- A retry offer (`retry: true`) must prove the room key even on an existing link. It
+  replaces only an answering link that never opened, and closing that link clears its
+  `onclose` first. The fallback carrying the session (pipe, member relay or adopted
+  channel) and the session are untouched, and a link whose channel opened is never
+  replaced. Over Nostr `from` is bound by the seal, so a member can't retry in another's
+  name. A relay re-sending an old retry offer (SEC-6) can close a pending connection, as
+  dropping signals could.
+- The room acts on a `retry` ask only for a linked peer on a fallback, once per 20 s per
+  peer. Its own retries go one at a time, at least 2 s apart, and a failing one holds the
+  slot for about 10 s (gathering plus `fallbackMs`). So asks raise one room to about 6
+  retries a minute, each an offer, an answer and late candidates.
+- Retries describe the connection with the same `description()`, host filter and
+  `outgoing()` as a first dial, so `public-only` gives out no local address (MIC-1,
+  MIC-3). MIC-5 is unchanged.
+- The new `Nudge` room frame (tag 6, empty) goes only to proven peers. Rooms on main and
+  in 0.1.1 drop unknown tags after the proof.
+- A pipe's queued datagrams go over the channel that now carries the link (the live
+  adopted one, else the peer's own open one), in the same order as `onTransmit`. The core
+  seals them either way.
+
+**FL1-2 — Retry offers are answered without limit, each with a new connection (Low).**
+This is NB46-1's per-peer gap for retries. While our link to a peer hasn't opened, each
+proven retry offer from that peer with a new description closes the link, builds a new
+RTCPeerConnection (gathering from the STUN servers) and publishes an answer. The room's
+budget limits only the retries we begin. Repro (scratch, `room_retry.mjs` harness): a
+member sent 20 proven retry offers 100 ms apart to a pair on the pipe. The other built
+20 connections and published 20 answers, and the link stayed on the pipe. Fix: take at
+most one new retry offer per peer per ~2 s, checked after the proof (a copy still gets
+its answer resent), plus NB46-1's answer budget. A prototype of the floor made 1
+connection and 1 answer.
+
+**FL1-1 — The answering side acts on a `retry` ask (Info).** The larger id queues the
+asker and asks it back, though only the dialling side should act on an ask. A
+legitimate dialler never asks, and the ask goes back only to its sender, once per 20 s,
+so nothing is amplified. Repro: one ask to the larger id on a pipe pair made it ask back
+once, and the dialler retried once. Fix: act on `retry` only when `self < peer`; with
+it, neither happened.
+
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
 This section records what each earlier review established about resource bounds,
@@ -928,6 +978,18 @@ and what it accepted. Values are from main `7b716a2`.
     never sent. Accepted residual: the grant is stored before `getUserMedia`
     resolves, so during the device's open time a member joining the old room could
     still be described with the local addresses, if gathering also finishes in it.
+  - **Retries (Fast lane 1, `9acde3d`, `d888522`; reviewed 2026-10-24).** When the
+    page gets microphone or camera permission, a `'direct'` room now retries WebRTC
+    with each peer it reaches by fallback (`retryOnGrant`, default true). So those peers
+    get the local addresses within seconds too, not only peers that link later.
+    `'public-only'` retries leave them out, as first dials do (`retry_direct.mjs`
+    checks this in Chromium with a stored grant). In named and private rooms, Net Lab's
+    button now retries (`room.retryDirect()`) instead of rejoining. Only peers on a
+    fallback get a new connection, and ids stay the same. The global room joins with
+    `retryOnGrant: false` and still rejoins first. MIC-4's accepted window also covers
+    a retry begun in it (by the backoff, a network change or the peer's ask). Leaving
+    the old room closes such a retry, as it closes a first dial, unless gathering
+    finishes first.
 
 ---
 
