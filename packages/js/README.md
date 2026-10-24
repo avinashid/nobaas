@@ -219,9 +219,10 @@ link moves onto it, and `room.route(peer)` says `'direct'` again:
 - **A link over signalling** sends its datagrams over the channel. The far end's core, hearing
   them there, moves the link onto it, and then ours does: an authenticated datagram from a
   new address moves a direct path. The room sends one at once (an empty reliable frame),
-  so an idle link moves too, not at the next keepalive. Datagrams that still come over
-  signalling after that were sent before the channel opened. They are dropped, so the link
-  doesn't move back.
+  so an idle link moves too, not at the next keepalive. Datagrams still queued for
+  signalling when the channel opens go over the channel instead. Those that still come over
+  signalling after that were sent before it opened. They are dropped, so the link doesn't
+  move back.
 
 **WebRTC is tried again.** While a peer is on a fallback, the room retries WebRTC with a
 new connection and leaves the working link alone. If the new DataChannel opens, the link

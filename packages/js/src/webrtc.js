@@ -762,6 +762,16 @@ export class WebRtcTransport {
   pipeFlush(p) {
     p.timer = null;
     if (this.pipes.get(p.handle) !== p || !p.q.length) return;
+    // A channel carries the peer's datagrams now (an adopted one, or its own that opened
+    // late; see onTransmit): those queued before it opened go there too, not over signalling.
+    const c = this.carried.get(p.handle);
+    const own = this.links.get(this.byPeer.get(p.peer));
+    const dc = c?.dc.readyState === 'open' ? c.dc : own?.dc.readyState === 'open' ? own.dc : null;
+    if (dc) {
+      for (const [s] of p.q.splice(0)) this.dcSend(dc, unb64(s));
+      p.bytes = 0;
+      return;
+    }
     const now = Date.now();
     this.pipeTokens = Math.min(PIPE_BURST, this.pipeTokens + ((now - this.pipeRefilled) / 1000) * PIPE_RATE);
     this.pipeRefilled = now;
