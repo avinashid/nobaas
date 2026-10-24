@@ -370,7 +370,8 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_proof.mjs`: an attacker that knows only the room topic
   gets no dial, no answer to its offers and, on a link it dials itself, nothing but
   the link proof before it is dropped; the hello proof matches Rust's; a room that signs
-  its own link proof after checking the peer's still joins on both sides.
+  its own link proof after checking the peer's still joins on both sides, and one whose
+  link is lost before that proof is sent leaves the peer unproven, with no `peer-join`.
 - `node packages/js/test/fuzz.mjs`: seeded random and mutated input to the JS parsers (Nostr
   events and relay messages, hex and peer ids, room hello proofs, room frames): nothing throws
   out of a handler of untrusted input and no promise is left rejected.
