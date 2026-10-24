@@ -63,24 +63,42 @@ hooks an `accept` check. A type guard there also gives the hook its type, with n
 
 ```tsx
 const isPoint = (v: unknown): v is { x: number; y: number } => Number.isFinite((v as any)?.x) && Number.isFinite((v as any)?.y);
+const isTodos = (v: unknown): v is { text: string }[] => Array.isArray(v) && v.every((t) => typeof t?.text === 'string');
 
 const { messages } = useMessages({ accept: (data) => typeof data === 'string' }); // Message<string>[]
 const [cursors] = usePeerState('cursor', { accept: isPoint });                    // { [peer]: { x, y } }
+const [todos, setTodos] = useSharedState('todos', [], { accept: isTodos });       // { text: string }[]
 ```
 
 What fails the check is kept out: a message isn't added, a member's value is left out of `usePeerState`, and a
 member whose presence fails is left out of `usePeers`. A shared value that fails reads as `initial`, on every
-member alike. `useSharedState` checks even without `accept`: a value must be of the kind `initial` is (the same
-`typeof`, an array for an array, a non-array object for an object; anything when `initial` is null). The check
-should be a plain function of the value; when it changes, the new one applies from the next change in the room.
-A check that throws counts as failed.
+member alike. Check every field you render, however deep: an array of todos whose `text` is an object throws as
+surely as an object in place of the array.
+
+- `useSharedState` can leave out `accept` only when `initial` is a string, number or boolean: then a value must
+  have its `typeof`. For an array, an object or null, `accept` is required (TypeScript says so, and the hook
+  throws a `TypeError` without it).
+- With no check, member data is `unknown` to TypeScript (`useMessages()`, `usePeerState(key)`, `usePeers()`), so
+  rendering it unchecked doesn't compile. A type argument (`usePeerState<Point>(key)`) asserts the type without
+  checking it.
+- A check should be a plain function of the value; when it changes, the new one applies from the next change in
+  the room. A check that throws counts as failed.
+- Put an [error boundary](https://react.dev/reference/react/Component#catching-rendering-errors-with-an-error-boundary)
+  **inside** `RoomProvider`, around your app. Then a render error that a check missed shows the boundary's fallback
+  instead of unmounting the provider, which would leave the room. The example has one.
 
 ### Shared state
 
 `useSharedState('count', 0)` works like `useState`, for the whole room. A write goes to every member, and one
 who joins later catches up from the others. When two members write at once, every member settles on the same
-one: each write carries a logical clock and the highest wins, then the higher member id. Values travel as JSON.
-Until the room is joined the value is `initial`, and setting it does nothing.
+one: each write carries a clock and the latest wins, then the higher member id. The clock is the writer's time in
+milliseconds, or one past the value it replaces when that is later, so a member whose clock is behind still
+writes over the current value. Values travel as JSON. Until the room is joined the value is `initial`, and
+setting it does nothing.
+
+A write stamped more than 5 minutes ahead of a member's clock (`MAX_CLOCK_DRIFT`) is ignored by that member, so
+no one can stamp a key out of reach. A member whose clock is that far ahead of the others has its writes
+ignored, and doesn't agree with them until its clock is right.
 
 ### Per-peer state
 
@@ -94,14 +112,20 @@ joins gets everyone's current value. A value over one datagram (about 1 KB) goes
 
 - Members are trusted alike, as in the room itself: any member can write any shared key. A check keeps out values
   of the wrong type, not a member who writes well-typed nonsense.
-- Each store keeps at most 1024 shared keys and 1024 per-peer keys (`MAX_KEYS`), up to 256 characters each.
-  Keys past that from other members are ignored.
-- A value is at most 64 KiB as JSON (`MAX_VALUE_LENGTH`): setting a larger one throws a `RangeError`, and a
-  larger one from a member is ignored. For more, split it across keys. A store holds at most 16 MiB of values in
-  all (`MAX_STORE_LENGTH`); past that, members' new values are ignored. A member that leaves frees its per-peer
-  values; shared values stay.
-- A store answers at most 4 catch-up requests from a member while it stays, so no member can make it send its
-  whole state over and over.
+- Keys are up to 256 characters. A value is at most 64 KiB as JSON (`MAX_VALUE_LENGTH`): setting a larger one
+  throws a `RangeError`, and a larger one from a member is ignored. For more, split it across keys.
+- Shared state: at most 1024 keys (`MAX_KEYS`) and 1 MiB of values in all, as JSON (`MAX_STORE_LENGTH`). When
+  it's full, a member's new key is ignored, unless a mounted hook reads it: then it takes the room of the oldest
+  keys no hook reads. So does our own write, and one that still doesn't fit throws a `RangeError`. Shared values
+  stay after their writer leaves.
+- Per-peer state: each member, us included, can have 64 keys (`MAX_PEER_KEYS`) and 256 KiB of values
+  (`MAX_PEER_LENGTH`). A member's values past that are ignored, and ours throw a `RangeError`. A member that
+  leaves frees its own.
+- A member that joins gets each member's shared and per-peer state, once: first a list of the versions each side
+  holds, then the values the other lacks. So a join costs each member about its state, up to 1 MiB and its 256
+  KiB of per-peer values, which is slow over a relayed link. Keep shared state small.
+- A store answers at most 4 catch-up requests from a member while it stays, and never sends it the same value
+  twice.
 - Shared and per-peer state travel as messages with a `$peerwire` field. The hooks hide them, but code that calls
   `room.on('message')` directly sees them.
 - `useMessages` holds messages from when it mounted. It does not fetch history: a room has none.
@@ -127,9 +151,13 @@ const peers = usePeers({ room });
 - `npm run typecheck`: the package, the example and `test/types.tsx`, whose `@ts-expect-error` lines must stay
   errors.
 - `node test/hooks.mjs`: the hooks in Node, in react-dom over jsdom, with members of one room over
-  BroadcastChannel. It covers server rendering, StrictMode with no ghost member, presence both ways, messages and their limit, shared
-  state (concurrent writes converge, a late joiner catches up), per-peer values, leaving, switching rooms, a
-  failed join, a member that sends malformed or flooding state messages, the value and memory caps, the limit on
-  catch-up answers, and `accept` keeping a member's wrongly typed values out. Needs `packages/js/build.sh` first.
+  BroadcastChannel. It covers server rendering, StrictMode with no ghost member, presence both ways, messages and
+  their limit, shared state (concurrent writes converge, a late joiner catches up), per-peer values, leaving,
+  switching rooms, a failed join, a member that sends malformed, flooding or far-ahead state messages, catch-up
+  answers, and `accept` keeping a member's wrongly typed values out, nested ones too. Needs
+  `packages/js/build.sh` first.
+- `node test/store.mjs`: the store on fake rooms: the caps and quotas, keys a hook reads pushing out keys none
+  reads, the clock and its drift limit, and catching up (each value sent once, a lost first message, repeated
+  asks, crossing writes).
 - `node test/example.mjs [screenshot-prefix]`: builds the example with Vite and plays it in three tabs of
   headless Chromium on loopback, with a fourth member outside React that sends the wrong types.

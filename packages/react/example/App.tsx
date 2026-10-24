@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import type { FormEvent, PointerEvent } from 'react';
+import { Component, useState } from 'react';
+import type { FormEvent, PointerEvent, ReactNode } from 'react';
 import { RoomProvider, useMessages, usePeers, usePeerState, useRoom, useSharedState } from '@peerwire/react';
 
 type Me = { name: string };
@@ -20,14 +20,28 @@ export function App({ roomId, signaling, initialName }: { roomId: string; signal
         </label>
         <Status />
       </header>
-      <main>
-        <Members />
-        <Counter />
-        <Chat />
-        <Board />
-      </main>
+      <Boundary>
+        <main>
+          <Members />
+          <Counter />
+          <Chat />
+          <Board />
+        </main>
+      </Boundary>
     </RoomProvider>
   );
+}
+
+// Inside RoomProvider: a render error the checks missed shows this instead of unmounting the provider, which
+// would leave the room.
+class Boundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  render() {
+    return this.state.error ? <p id="error">Something went wrong: {String(this.state.error)}</p> : this.props.children;
+  }
 }
 
 function Status() {
