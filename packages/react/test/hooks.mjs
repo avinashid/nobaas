@@ -1,8 +1,9 @@
 // @peerwire/react in Node: React components rendered with react-dom into jsdom, members of one room over
 // BroadcastChannel (signaling 'local'). Checks server rendering (initial values, no room), joining under StrictMode with no ghost member, presence both
 // ways, messages and their limit, shared state (concurrent writes converge, a late joiner catches up), per-peer
-// values, leaving, switching rooms, a failed join, a member that sends malformed or flooding state messages, and
-// `accept` keeping a member's wrongly typed presence, messages, shared and per-peer values out.
+// values, leaving, switching rooms, a failed join, a member that sends malformed or flooding state messages, the
+// value and memory caps and the limit on catch-up answers, and `accept` keeping a member's wrongly typed
+// presence, messages, shared and per-peer values out.
 // Needs the build: `npm run build` (packages/react) and packages/js/build.sh.
 //
 //   node packages/react/test/hooks.mjs
@@ -33,6 +34,47 @@ const { RoomProvider, useRoom, usePeers, usePresence, useMessages, useRoomEvent,
 
 const appId = 'peerwire-react-test';
 const roomId = `hooks-${process.pid}`;
+
+// The store's memory caps, on a fake room: a value over MAX_VALUE_LENGTH is ignored, values past
+// MAX_STORE_LENGTH in all are ignored, replacing or dropping values frees room, and a local write over the cap throws.
+{
+  const { RoomStore, MAX_VALUE_LENGTH, MAX_STORE_LENGTH } = await import('../dist/store.js');
+  const on = {};
+  const fake = { self: 'a'.repeat(64), peers: [], on: (e, fn) => ((on[e] = fn), () => {}), getPresence() {}, send() {} };
+  const st = new RoomStore(fake);
+  const x = 'b'.repeat(64);
+  const full = 'x'.repeat(MAX_VALUE_LENGTH - 2); // MAX_VALUE_LENGTH as JSON, with its quotes
+  on.message({ $peerwire: 'set', k: 'over', v: `${full}x`, c: 1 }, x);
+  if (st.getShared('over')) fail('a value over MAX_VALUE_LENGTH was kept');
+  for (let i = 0; i < 300; i++) on.message({ $peerwire: 'set', k: `b${i}`, v: full, c: 1 }, x);
+  const kept = () => Array.from({ length: 301 }, (_, i) => i).filter((i) => st.getShared(`b${i}`)).length;
+  const fit = MAX_STORE_LENGTH / MAX_VALUE_LENGTH;
+  if (kept() !== fit) fail(`kept ${kept()} values of ${MAX_VALUE_LENGTH}, not ${fit}`);
+  for (const k of ['b0', 'b1']) on.message({ $peerwire: 'set', k, v: 'small', c: 2 }, x);
+  on.message({ $peerwire: 'set', k: 'b300', v: full, c: 1 }, x);
+  if (!st.getShared('b300') || kept() !== fit + 1) fail('replacing values did not free room');
+  on.message({ $peerwire: 'set', k: 'b301', v: full, c: 1 }, x);
+  if (st.getShared('b301')) fail('a value past MAX_STORE_LENGTH was kept');
+  // Per-peer values count too, and a member that leaves frees its own.
+  const y = 'c'.repeat(64);
+  on.message({ $peerwire: 'live', k: 'p0', v: full, n: 1 }, y);
+  if (st.getLive('p0')[y]) fail('a per-peer value past MAX_STORE_LENGTH was kept');
+  for (const k of ['b2', 'b3']) on.message({ $peerwire: 'set', k, v: 'small', c: 2 }, x);
+  for (const k of ['p1', 'p2']) on.message({ $peerwire: 'live', k, v: full, n: 1 }, y);
+  if (!st.getLive('p1')[y] || !st.getLive('p2')[y]) fail('per-peer values in freed room were not kept');
+  on.message({ $peerwire: 'set', k: 'b301', v: full, c: 1 }, x);
+  if (st.getShared('b301')) fail('a value past MAX_STORE_LENGTH was kept, with per-peer values');
+  on['peer-leave'](y);
+  on.message({ $peerwire: 'set', k: 'b301', v: full, c: 1 }, x);
+  if (!st.getShared('b301') || st.getLive('p1')[y]) fail('a member that left still holds room');
+  try {
+    st.setShared('mine', `${full}x`);
+    fail('a local value over MAX_VALUE_LENGTH was sent');
+  } catch (e) {
+    if (!(e instanceof RangeError)) throw e;
+  }
+  console.log(`store caps: values over ${MAX_VALUE_LENGTH} ignored, ${fit} of that size fill ${MAX_STORE_LENGTH}, replacing frees room`);
+}
 
 // Server rendering, before there is any DOM: every hook renders its initial value and nothing joins.
 function OnServer() {
@@ -66,13 +108,14 @@ function Probe({ out }) {
   const { messages: texts } = useMessages({ accept: (d) => typeof d === 'string' });
   const [count, setCount] = useSharedState('count', 0);
   const [late] = useSharedState('k1099', 'none');
+  const [big] = useSharedState('big', '');
   const [cursors, setCursor] = usePeerState('cursor');
   const [points] = usePeerState('cursor', { accept: (v) => typeof v?.x === 'number' });
   const [tick, setTick] = useState(0);
   // A new handler every render: the latest one must be called.
   useRoomEvent('message', (data) => out.raw.push([tick, data]));
   out.maxPeers = Math.max(out.maxPeers ?? 0, peers.length);
-  Object.assign(out, { room, status, peers, named, me, messages, texts, count, late, cursors, points });
+  Object.assign(out, { room, status, peers, named, me, messages, texts, count, late, big, cursors, points });
   Object.assign(out, { setMe, send, setCount, setCursor, setTick, tick });
   return null;
 }
@@ -186,7 +229,21 @@ for (const m of bad) E.send(m);
 E.send({ $peerwire: 'live', k: 'cursor', v: { x: 7 }, n: 5 });
 await until('the valid value after the malformed ones', () => A.out.cursors[E.self]?.x === 7);
 if ([A, B, C, D].some((m) => m.out.count !== won + 1)) fail(`a malformed write took: ${[A, B, C, D].map((m) => m.out.count)}`);
-// Keys past MAX_KEYS (1024) are ignored: 'count' and 'k1099' make 1100 offered; 'k1099' must not take.
+// A value over MAX_VALUE_LENGTH is ignored; a smaller one for the key takes.
+E.send({ $peerwire: 'set', k: 'big', v: 'x'.repeat(lib.MAX_VALUE_LENGTH), c: 1 });
+E.send({ $peerwire: 'set', k: 'big', v: 'small', c: 2 });
+await until('the small value', () => [A, B, C, D].every((m) => m.out.big === 'small'));
+// Asking for a catch-up again and again: each member answers at most 4 times while E stays.
+const answers = new Map();
+E.on('message', (d, from) => {
+  if (d?.$peerwire === 'sync' && d.ask === false && d.s.some((e) => e[0] === 'count')) answers.set(from, (answers.get(from) ?? 0) + 1);
+});
+for (let i = 0; i < 20; i++) E.send({ $peerwire: 'sync', ask: true, s: [], p: [] });
+await until('answers from every member', () => [A, B, C, D].every((m) => answers.get(id(m)) >= 1));
+await sleep(500);
+if ([A, B, C, D].some((m) => answers.get(id(m)) > 4)) fail(`catch-up answers: ${[...answers.values()]}`);
+console.log(`20 catch-up asks answered ${[A, B, C, D].map((m) => answers.get(id(m))).join(', ')} times`);
+// Keys past MAX_KEYS (1024) are ignored: 'count', 'big' and 1100 more offered; 'k1099' must not take.
 for (let i = 0; i < 1100; i++) E.send({ $peerwire: 'set', k: `k${i}`, v: `v${i}`, c: 1 });
 E.send({ $peerwire: 'live', k: 'cursor', v: { x: 8 }, n: 6 });
 await until('the flood', () => A.out.cursors[E.self]?.x === 8);

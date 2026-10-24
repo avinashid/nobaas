@@ -21,7 +21,7 @@ import type { Peer } from './store.js';
 
 export { randomRoomId } from '@peerwire/js';
 export type { JoinRoomOptions, MessageInfo, PeerId, Presence, Room, RoomEvents, SendOptions } from '@peerwire/js';
-export { MAX_KEYS, MAX_KEY_LENGTH, SETTLE_MS } from './store.js';
+export { MAX_KEYS, MAX_KEY_LENGTH, MAX_STORE_LENGTH, MAX_VALUE_LENGTH, SETTLE_MS } from './store.js';
 export type { Peer } from './store.js';
 
 /** `idle`: no options, so no room. `joining`, then `joined` or `error`. */

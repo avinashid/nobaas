@@ -14,6 +14,13 @@ export const MAX_KEY_LENGTH = 256;
 /** A per-peer value goes on the unreliable lane, then once more on the reliable one when it has been still
  * this long, so the last value of a burst always arrives. */
 export const SETTLE_MS = 250;
+/** The largest value, as JSON text: one from a member past this is ignored, and setting one throws. */
+export const MAX_VALUE_LENGTH = 64 * 1024;
+/** What a store holds of shared and per-peer values in all, as JSON text: past this, a member's new value is
+ * ignored. With MAX_KEYS, it bounds the memory members can make a store use. */
+export const MAX_STORE_LENGTH = 16 * 1024 * 1024;
+/** Catch-ups a store answers per member while it stays, so a member can't make it send its state over and over. */
+const MAX_ANSWERS = 4;
 /** Entries per catch-up message. */
 const CHUNK = 64;
 
@@ -22,8 +29,9 @@ export interface Peer<P = Presence> {
   presence: P;
 }
 
-type Shared = { v: unknown; c: number; w: PeerId };
-type Live = { v: unknown; n: number };
+// `len`: the value's length as JSON text.
+type Shared = { v: unknown; c: number; w: PeerId; len: number };
+type Live = { v: unknown; n: number; len: number };
 type Entry = unknown[];
 
 const EMPTY: Readonly<Record<PeerId, unknown>> = Object.freeze({});
@@ -35,7 +43,13 @@ export const isInternal = (data: unknown): boolean =>
 const validKey = (k: unknown): k is string => typeof k === 'string' && k.length <= MAX_KEY_LENGTH;
 const counter = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) >= 1;
 // What a peer will see: values go as JSON, so ours are kept as JSON gives them back.
-const asJson = (v: unknown): unknown => (v === undefined ? null : JSON.parse(JSON.stringify(v)));
+function asJson(value: unknown): { v: unknown; len: number } {
+  const text = JSON.stringify(value === undefined ? null : value);
+  if (text.length > MAX_VALUE_LENGTH) throw new RangeError(`value of ${text.length} characters as JSON; at most ${MAX_VALUE_LENGTH}`);
+  return { v: JSON.parse(text), len: text.length };
+}
+// The length of a value a member sent (already parsed from JSON, so it serializes).
+const jsonLength = (v: unknown): number => JSON.stringify(v).length;
 
 export class RoomStore {
   readonly room: Room;
@@ -46,6 +60,8 @@ export class RoomStore {
   private settling = new Map<string, ReturnType<typeof setTimeout>>();
   private listeners = new Map<string, Set<() => void>>();
   private peerList: readonly Peer[] | null = null;
+  private answers = new Map<PeerId, number>();
+  private held = 0;
   private clock = 0;
   private seq = 0;
   private started = false;
@@ -125,19 +141,29 @@ export class RoomStore {
     if (!validKey(key)) throw new RangeError(`shared state key longer than ${MAX_KEY_LENGTH}`);
     const c = Math.max(this.clock, this.shared.get(key)?.c ?? 0) + 1;
     if (!counter(c)) throw new RangeError('shared state clock exhausted');
-    const v = asJson(value);
+    const { v, len } = asJson(value);
     // Sent first: a value too large to send throws before anything changes here.
     this.send({ $peerwire: 'set', k: key, v, c });
     this.clock = c;
-    this.shared.set(key, { v, c, w: this.room.self });
+    this.held += len - (this.shared.get(key)?.len ?? 0);
+    this.shared.set(key, { v, c, w: this.room.self, len });
     this.notify(`s:${key}`);
+  }
+
+  // Whether a member's value of `len` can replace one of `was` within MAX_VALUE_LENGTH and MAX_STORE_LENGTH.
+  private fits(len: number, was = 0): boolean {
+    return len <= MAX_VALUE_LENGTH && this.held - was + len <= MAX_STORE_LENGTH;
   }
 
   private merge(k: unknown, v: unknown, c: unknown, w: PeerId): void {
     if (!validKey(k) || !counter(c)) return;
     const cur = this.shared.get(k);
     if (cur ? c < cur.c || (c === cur.c && w <= cur.w) : this.shared.size >= MAX_KEYS) return;
-    this.shared.set(k, { v: v ?? null, c, w });
+    const value = v ?? null;
+    const len = jsonLength(value);
+    if (!this.fits(len, cur?.len)) return;
+    this.held += len - (cur?.len ?? 0);
+    this.shared.set(k, { v: value, c, w, len });
     this.clock = Math.max(this.clock, c);
     this.notify(`s:${k}`);
   }
@@ -160,7 +186,7 @@ export class RoomStore {
   setLive(key: string, value: unknown): void {
     if (!validKey(key)) throw new RangeError(`per-peer state key longer than ${MAX_KEY_LENGTH}`);
     if (this.closed) return;
-    const e = { v: asJson(value), n: ++this.seq };
+    const e = { ...asJson(value), n: ++this.seq };
     const m = { $peerwire: 'live', k: key, v: e.v, n: e.n };
     this.mine.set(key, e);
     clearTimeout(this.settling.get(key));
@@ -194,14 +220,25 @@ export class RoomStore {
     }
     const cur = byPeer.get(peer);
     if (cur && n <= cur.n) return;
-    byPeer.set(peer, { v: v ?? null, n });
+    const value = v ?? null;
+    const len = jsonLength(value);
+    if (!this.fits(len, cur?.len)) {
+      if (!byPeer.size) this.live.delete(k);
+      return;
+    }
+    this.held += len - (cur?.len ?? 0);
+    byPeer.set(peer, { v: value, n, len });
     this.liveViews.delete(k);
     this.notify(`p:${k}`);
   }
 
   private dropPeer(peer: PeerId): void {
+    this.answers.delete(peer);
     for (const [k, byPeer] of this.live) {
-      if (!byPeer.delete(peer)) continue;
+      const e = byPeer.get(peer);
+      if (!e) continue;
+      byPeer.delete(peer);
+      this.held -= e.len;
       if (!byPeer.size) this.live.delete(k);
       this.liveViews.delete(k);
       this.notify(`p:${k}`);
@@ -244,7 +281,11 @@ export class RoomStore {
       if (!Array.isArray(s) || !Array.isArray(p) || s.length > MAX_KEYS || p.length > MAX_KEYS) return;
       for (const e of s) if (Array.isArray(e) && e.length === 4 && isPeerId(e[3])) this.merge(e[0], e[1], e[2], e[3]);
       for (const e of p) if (Array.isArray(e) && e.length === 3) this.mergeLive(peer, e[0], e[1], e[2]);
-      if (m.ask === true && this.started) this.sync(peer, false);
+      const answered = this.answers.get(peer) ?? 0;
+      if (m.ask === true && this.started && answered < MAX_ANSWERS) {
+        this.answers.set(peer, answered + 1);
+        this.sync(peer, false);
+      }
     }
   }
 

@@ -95,6 +95,12 @@ joins gets everyone's current value. A value over one datagram (about 1 KB) goes
   of the wrong type, not a member who writes well-typed nonsense.
 - Each store keeps at most 1024 shared keys and 1024 per-peer keys (`MAX_KEYS`), up to 256 characters each.
   Keys past that from other members are ignored.
+- A value is at most 64 KiB as JSON (`MAX_VALUE_LENGTH`): setting a larger one throws a `RangeError`, and a
+  larger one from a member is ignored. For more, split it across keys. A store holds at most 16 MiB of values in
+  all (`MAX_STORE_LENGTH`); past that, members' new values are ignored. A member that leaves frees its per-peer
+  values; shared values stay.
+- A store answers at most 4 catch-up requests from a member while it stays, so no member can make it send its
+  whole state over and over.
 - Shared and per-peer state travel as messages with a `$peerwire` field. The hooks hide them, but code that calls
   `room.on('message')` directly sees them.
 - `useMessages` holds messages from when it mounted. It does not fetch history: a room has none.
@@ -122,7 +128,7 @@ const peers = usePeers({ room });
 - `node test/hooks.mjs`: the hooks in Node, in react-dom over jsdom, with members of one room over
   BroadcastChannel. It covers server rendering, StrictMode with no ghost member, presence both ways, messages and their limit, shared
   state (concurrent writes converge, a late joiner catches up), per-peer values, leaving, switching rooms, a
-  failed join, a member that sends malformed or flooding state messages, and `accept` keeping a member's wrongly
-  typed values out. Needs `packages/js/build.sh` first.
+  failed join, a member that sends malformed or flooding state messages, the value and memory caps, the limit on
+  catch-up answers, and `accept` keeping a member's wrongly typed values out. Needs `packages/js/build.sh` first.
 - `node test/example.mjs [screenshot-prefix]`: builds the example with Vite and plays it in three tabs of
   headless Chromium on loopback, with a fourth member outside React that sends the wrong types.
