@@ -136,7 +136,8 @@ export function useRoom(appId, roomId) {
       const sync = () => setPeers([...r.peers]);
       r.on('peer-join', sync);
       r.on('peer-leave', sync);
-      r.on('message', (data, peer) => setMessages((m) => [...m, { peer, data }]));
+      r.on('message', (data, peer) =>
+        typeof data === 'string' && setMessages((m) => [...m.slice(-99), { peer, data }]));
       setRoom(r);
       sync();
     }, (e) => gone || setError(e));
@@ -175,6 +176,11 @@ function Chat() {
   `import wasmUrl from '@peerwire/js/peerwire_ffi.wasm?url'` (Vite), then
   `joinRoom({ appId, roomId, wasm: wasmUrl })`. Root-relative URLs work too, such as
   `wasm: '/peerwire_ffi.wasm'` for a copy in Vite's `public/`.
+- **Check what a member sent:** a message is whatever a member chose to send: text,
+  bytes or any JSON. Check its type before you store or render it. React throws on an
+  object child, and unmounting the app runs the cleanup, which leaves the room. The
+  hook keeps strings only, and only the last 100, so a member who floods the room
+  can't grow the list without bound.
 - **Messages in state** suit a chat. For a game, handle `message` in a ref or a store
   outside React, and render from it each frame.
 
