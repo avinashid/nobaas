@@ -83,8 +83,9 @@ that needs a change is tracked as an NB card.
 | MIC-2 (Info) | **Fixed** by `9282d36` (a punch that ended closes what it opened) and `691dec0` (one offer and one answer per punch, which also closes a Low NB48-1 bypass), reviewed 2026-10-24 |
 | MIC-4 (Low) | **Fixed** by `134fed3` (the button rejoins before it re-tests the network), reviewed 2026-10-24 |
 | MIC-5 (Info) | Open, same section |
-| FL1-1 (Info), FL1-2 (Low) | Open, [WebRTC retries](#webrtc-retries-fast-lane-1--fl1-1-fl1-2) |
+| FL1-1 (Info), FL1-2 (Low) | **Fixed** by `4b131ee` (at most one new connection per peer per 2 s from retry offers; only the dialling side acts on a `retry` ask), reviewed 2026-10-24, [WebRTC retries](#webrtc-retries-fast-lane-1--fl1-1-fl1-2) |
 | FL2-1 (Low), FL2-2 (Low) | Open, [Member relays for pipe links](#member-relays-for-pipe-links-fast-lane-2--fl2-1-fl2-2) |
+| RX-1 (Low), RX-2 (Info) | **Fixed** by `b0d354b` (the README's React example keeps string messages only, and only the last 100), reviewed 2026-10-24, [Demos](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -782,13 +783,30 @@ member sent 20 proven retry offers 100 ms apart to a pair on the pipe. The other
 most one new retry offer per peer per ~2 s, checked after the proof (a copy still gets
 its answer resent), plus NB46-1's answer budget. A prototype of the floor made 1
 connection and 1 answer.
+**Fixed** by `4b131ee` (merged `a3f40d4`). After the proof, and after the check that
+ignores an offer for a link we dial or one that opened, a retry offer that would make a
+new connection (it replaces our link, or there is none) is taken at most once per peer
+per `WebRtcTransport.retryAnswerMs` (2 s). The rest are counted in `badSignals` and leave
+the current link alone. A copy of the current offer gets its answer resent, with no new
+connection. Every other way a peer gets a new connection on the answering side is
+already bounded, so a peer can keep at most about one connection gathering, made at most
+once per 2 s, and each new one closes the last. A legitimate retry the floor refuses is
+taken on its resend 3 s later, while the dialler's link waits 8 s (`fallbackMs`).
+`room_retry.mjs` (test 10): 20 offers made 1 connection and 1 answer, and 19 were
+refused. Still open: NB46-1's answer budget for restart offers on an open link, and a
+relay replaying a proven retry offer (SEC-6), which can take the 2 s slot. Test gap
+FL-T1 (Info): test 10 starts while the answering side still holds its failed link, so
+it didn't reach the no-link case. Closed by `e451fc4` (merged `147537d`): in test 13,
+2 proven retry offers within the floor to a side with no link made 1 connection and 1
+answer, and 1 was refused.
 
 **FL1-1 — The answering side acts on a `retry` ask (Info).** The larger id queues the
 asker and asks it back, though only the dialling side should act on an ask. A
 legitimate dialler never asks, and the ask goes back only to its sender, once per 20 s,
 so nothing is amplified. Repro: one ask to the larger id on a pipe pair made it ask back
 once, and the dialler retried once. Fix: act on `retry` only when `self < peer`; with
-it, neither happened.
+it, neither happened. **Fixed** by `4b131ee`: the room acts on a `retry` ask only when
+`self < peer` (`room_retry.mjs` test 11: no ask back, no retry).
 
 ### Member relays for pipe links (Fast lane 2) — FL2-1, FL2-2
 
@@ -991,6 +1009,19 @@ and what it accepted. Values are from main `7b716a2`.
   is defence in depth. Suggested: send the same CSP from `crew-server.mjs`.
 - Net Lab caps its event log at 500, the DOM log at 300 and chat at 200. The
   per-peer route history has no cap.
+- **README examples (`9e4640b`, reviewed 2026-10-24).** "Using with React" in
+  `packages/js/README.md` joins in an effect and leaves in its cleanup. A room `message`
+  is whatever the member chose to send: text, bytes or any JSON.
+  - **RX-1 (Low):** the example's hook stored every message and rendered `{m.data}`. A
+    member who sent an object made React throw while rendering, which unmounted the
+    app, and the cleanup then left the room. So one broadcast object took every other
+    member running the example out of the room. Reproduced on loopback (Vite dev server,
+    BroadcastChannel). **Fixed** by `b0d354b`: the hook keeps string messages only, and
+    a bullet tells apps to check a message's type before they store or render it.
+  - **RX-2 (Info):** the message list had no cap, so a member flooding the room grew it
+    without bound. **Fixed** by `b0d354b`: the hook keeps the last 100.
+  - The ten-line chat writes messages with `textContent`, so an object only shows as
+    text.
 - **Microphone permission (Net Lab's "Use microphone" button, `e450baf`).** Chrome
   hides a page's local addresses (mDNS names, the default route only) until the
   origin has microphone or camera permission. After that, every new connection lists
