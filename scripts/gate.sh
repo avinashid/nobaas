@@ -63,11 +63,13 @@ NODE=(
   "node room fallback|node packages/js/test/room_fallback.mjs"
   "node room adopt|node packages/js/test/room_adopt.mjs"
   "node room same nat|node packages/js/test/room_same_nat.mjs"
+  "node room retry|node packages/js/test/room_retry.mjs"
+  "node retry backoff|node packages/js/test/retry_backoff.mjs"
   "node nat prediction|node packages/js/test/nat_predict.mjs"
   "node late ice|node packages/js/test/late_ice.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
 )
-NODE_FIRST='^node (room adopt|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
+NODE_FIRST='^node (room adopt|room retry|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
 # Browser tests (headless Chromium on loopback): one at a time, as WebRTC timing suffers under load.
 BROWSER=(
   "browser|node packages/js/test/browser.mjs 2"
@@ -76,6 +78,7 @@ BROWSER=(
   "poll|node packages/js/test/poll.mjs 3"
   "webrtc signals|node packages/js/test/webrtc_signals.mjs"
   "ice restart|node packages/js/test/ice_restart.mjs"
+  "retry direct|node packages/js/test/retry_direct.mjs"
   "birthday fleet|node packages/js/test/birthday_fleet.mjs 32"
   "netlab birthday|node packages/js/test/netlab_birthday.mjs"
   "netlab carry|node packages/js/test/netlab_carry.mjs"
