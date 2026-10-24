@@ -721,8 +721,9 @@ answers each restart and lets ICE reconnect can make us publish about 3 offers
 Independently, and already true on main, every distinct offer from a linked peer is
 answered, and every copy of the last offer gets the answer resent, with no per-peer
 limit. The publishes land on our Nostr relays, which rate-limit and ban busy IPs:
-relay.damus.io banned a shared hotspot IP in testing (see `86119f4`). Losing the
-relays cuts signalling for the whole room.
+relay.damus.io banned a shared hotspot IP in testing (see `86119f4`), and `2d40bc6`
+dropped it from the defaults for that. Losing the relays cuts signalling for the
+whole room.
 
 Fix: honour `restart` only while our own ICE is not `connected` or `completed`, and
 allow at most 3 restarts per minute per link whether or not ICE reconnects. Put the
