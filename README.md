@@ -162,6 +162,10 @@ room.send('hello');                     // every joined peer; room.poll() for ga
 [`packages/js/README.md`](packages/js/README.md) has the full API, the privacy modes and the lower layers
 (`loadPeerwire`, `WebRtcTransport`, `NostrSignaling`).
 
+For React, [`@peerwire/react`](packages/react/README.md) wraps a room in hooks, with TypeScript types:
+`<RoomProvider>`, `usePeers`, `useMessages`, `useSharedState` (one value for the whole room) and `usePeerState`
+(each member's live value, such as a cursor).
+
 ## How it works
 
 Two peers that have never met connect in four steps. Signaling only carries addresses, and the link itself is
@@ -445,6 +449,7 @@ the theoretical models and the commands to reproduce them are in [docs/PERFORMAN
 | [`crates/peerwire-game`](crates/peerwire-game) | Fixed-point maths, Hilbert-curve islands, desync detection, lockstep timing constants |
 | [`crates/peerwire-peer`](crates/peerwire-peer) | Optional always-on peer (binary): one identity across restarts, relays for linked peers; see [docs/DOCKER.md](docs/DOCKER.md) |
 | [`packages/js`](packages/js) | JavaScript package: wasm glue, WebRTC transport, Nostr signaling, browser demos |
+| [`packages/react`](packages/react) | React hooks over `@peerwire/js`, in TypeScript: rooms, members, chat, shared and per-peer state |
 | [`examples`](examples) | Rust examples (echo, async echo, a local Nostr relay) and the Godot demo |
 | [`docs`](docs) | Architecture, NAT traversal, Godot, Docker, performance, test plan, comparison |
 | [`scripts/gate.sh`](scripts/gate.sh) | The release gate: every check a change must pass |

@@ -18,6 +18,7 @@ WebAssembly module with a small JS package, and a C ABI. Status: early developme
 | `crates/peerwire-ffi` | C ABI (`pw_*` symbols, `PW_ERR_*`), the one surface for wasm and native bindings |
 | `crates/peerwire-game` | Deterministic fixed-point maths, Hilbert-curve islands, desync detection |
 | `packages/js` | `@peerwire/js`: `src/room.js` (`joinRoom`), `src/peerwire.js` (`loadPeerwire`, class `Peerwire`), WebRTC transport, Nostr signaling, types in `src/index.d.ts`, demos, tests |
+| `packages/react` | `@peerwire/react`: React hooks in TypeScript (`src/`, built by `tsc` to `dist/`), a Vite example, tests. Its dev dependencies come from `npm ci` there; the gate runs it |
 | `examples/` | Live examples (in progress) |
 | `docs/` | Architecture, performance model, comparison with other libraries |
 
