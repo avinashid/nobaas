@@ -61,6 +61,7 @@ NODE=(
   "node room drain|node packages/js/test/room_drain.mjs"
   "node fuzz|node packages/js/test/fuzz.mjs"
   "node room leave|node packages/js/test/room_leave.mjs"
+  "node room welcome|node packages/js/test/room_welcome.mjs"
   "node room fallback|node packages/js/test/room_fallback.mjs"
   "node room relay move|node packages/js/test/room_relay_move.mjs"
   "node room adopt|node packages/js/test/room_adopt.mjs"

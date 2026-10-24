@@ -66,6 +66,7 @@ jobs:
       - run: node packages/js/test/room_drain.mjs
       - run: node packages/js/test/fuzz.mjs
       - run: node packages/js/test/room_leave.mjs
+      - run: node packages/js/test/room_welcome.mjs
       - run: node packages/js/test/room_fallback.mjs
       - run: node packages/js/test/room_adopt.mjs
       - run: node packages/js/test/room_same_nat.mjs

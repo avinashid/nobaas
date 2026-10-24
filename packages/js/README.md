@@ -69,6 +69,10 @@ await room.leave();                             // peers see 'peer-leave' at onc
   Reliable sends past the send window queue up instead of failing.
 - **Presence** travels over the encrypted links, not through signalling. A peer
   counts as joined once its presence has arrived, so `peer-join` always has it.
+  A `peer-join` handler can send to the newcomer, to hand it the room's state, say:
+  `room.send(state, { to: peer })` arrives after our own presence, so the newcomer
+  already lists us. Send it on the `reliable` lane (the default): a peer drops what a
+  member sends before its presence, and an `urgent` message can overtake it.
 - **Closed rooms:** the roomId is the room's secret. Relays see only a hash of it
   (the topic); every hello, WebRTC offer and link carries an HMAC under a key
   derived from it (`sha256("peerwire/room-key/<appId>/<roomId>")`, as in Rust). A peer
@@ -396,6 +400,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_leave.mjs`: a room leaving with a full send window reaches
   its peers at once, before `leave()` returns; with the Bye lost, the core's close still does;
   the `pagehide` handler holds the page 20 ms after it, only if it had peers.
+- `node packages/js/test/room_welcome.mjs`: a message a `peer-join` handler sends to the
+  newcomer reaches it, also when the newcomer's presence came while its link proof was
+  being checked (forced in 20 joins); 200 two-member joins and 30 third members lose none.
 - `node packages/js/test/room_throttled.mjs --ab=<other packages/js>`: benchmark, not a test.
   Room send throughput when the sender's timers are throttled like a background tab's.
 - `node packages/js/test/crew.mjs [tabs=4] [shot-prefix]`: plays `demo/crew.html` in four tabs: a kill,
