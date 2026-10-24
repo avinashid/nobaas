@@ -50,6 +50,7 @@ trap 'trap - INT TERM; kill 0' INT TERM
 # Node tests, no browser: "step name|command". They run GATE_JOBS at a time, so none may use a fixed port or file.
 NODE=(
   "node glue|node packages/js/test/node_pair.mjs"
+  "node wasm source|node packages/js/test/wasm_source.mjs"
   "node privacy|node packages/js/test/privacy.mjs"
   "node room|node packages/js/test/room_node.mjs"
   "node peer ids|node packages/js/test/peer_id.mjs"
@@ -75,6 +76,7 @@ BROWSER=(
   "browser|node packages/js/test/browser.mjs 2"
   "arena|node packages/js/test/arena.mjs 8 10"
   "readme chat|node packages/js/test/readme.mjs"
+  "wasm url|node packages/js/test/wasm_url.mjs"
   "poll|node packages/js/test/poll.mjs 3"
   "webrtc signals|node packages/js/test/webrtc_signals.mjs"
   "ice restart|node packages/js/test/ice_restart.mjs"
