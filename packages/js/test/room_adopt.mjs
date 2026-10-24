@@ -157,6 +157,13 @@ block('a1', 'b1');
   if (!took[0] || !took[1]) fail(`adoptChannel over signalling: ${took}`);
   if (!isAdopted(a.route(b.self)) || !isAdopted(b.route(a.self))) fail(`routes ${JSON.stringify([a.route(b.self), b.route(a.self)])}`);
   if (a.transport.carrier(b.self)?.dc !== x.dc) fail('carrier(peer) is not the adopted channel');
+  // A datagram the endpoint queued for the pipe before the adoption (an ACK, say) still
+  // goes over signalling at the pipe's next flush, PIPE_FLUSH_MS later or more on a busy
+  // host. Count from once that queue is empty: a datagram queued or batch sent after that
+  // went to the pipe after the adoption.
+  const pipe = a.transport.pipes.get(a.transport.pipeByPeer.get(b.self));
+  if (!pipe) fail('no pipe to b');
+  await until("a's pipe flushed", () => !pipe.q.length && !pipe.timer, 3000);
   const big = new Uint8Array(100 * 1024).map((_, i) => i * 13);
   const got = [];
   b.on('message', (m) => got.push(m));
@@ -165,7 +172,8 @@ block('a1', 'b1');
   a.send(big);
   await until('100 KB over the adopted channel', () => got.length === 1, 10000);
   if (got[0].length !== big.length || got[0].some((v, i) => v !== big[i])) fail('100 KB corrupted');
-  if (a.transport.piped.sent !== piped) fail(`${a.transport.piped.sent - piped} batches still went over signalling`);
+  // Neither flushed since, nor waiting for the next flush.
+  if (a.transport.piped.sent !== piped || pipe.q.length) fail(`${a.transport.piped.sent - piped} batches still went over signalling, ${pipe.q.length} datagrams wait for it`);
   console.log(`over signalling: both ends adopted; 100 KB in ${Date.now() - t0} ms over the channel (${x.dc.sent - onDc} datagrams), none over signalling`);
   // The channel closes: back on signalling at once, and the link carries on.
   x.pc.close();
