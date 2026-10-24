@@ -68,6 +68,10 @@ await room.leave();                             // peers see 'peer-leave' at onc
   Reliable sends past the send window queue up instead of failing.
 - **Presence** travels over the encrypted links, not through signalling. A peer
   counts as joined once its presence has arrived, so `peer-join` always has it.
+  A `peer-join` handler can send to the newcomer, to hand it the room's state, say:
+  `room.send(state, { to: peer })` arrives after our own presence, so the newcomer
+  already lists us. Send it on the `reliable` lane (the default): a peer drops what a
+  member sends before its presence, and an `urgent` message can overtake it.
 - **Closed rooms:** the roomId is the room's secret. Relays see only a hash of it
   (the topic); every hello, WebRTC offer and link carries an HMAC under a key
   derived from it (`sha256("peerwire/room-key/<appId>/<roomId>")`, as in Rust). A peer
