@@ -795,8 +795,10 @@ taken on its resend 3 s later, while the dialler's link waits 8 s (`fallbackMs`)
 `room_retry.mjs` (test 10): 20 offers made 1 connection and 1 answer, and 19 were
 refused. Still open: NB46-1's answer budget for restart offers on an open link, and a
 relay replaying a proven retry offer (SEC-6), which can take the 2 s slot. Test gap
-(FL-T1, Info): test 10 starts while the answering side still holds its failed link, so
-it doesn't reach the no-link case; a test for it is planned.
+FL-T1 (Info): test 10 starts while the answering side still holds its failed link, so
+it didn't reach the no-link case. Closed by `e451fc4` (merged `147537d`): in test 13,
+2 proven retry offers within the floor to a side with no link made 1 connection and 1
+answer, and 1 was refused.
 
 **FL1-1 — The answering side acts on a `retry` ask (Info).** The larger id queues the
 asker and asks it back, though only the dialling side should act on an ask. A
