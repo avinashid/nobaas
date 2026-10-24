@@ -1152,7 +1152,7 @@ async function render() {
       const piped = room.transport?.piped;
       if (piped) relayHtml += `<dt>Fallback route</dt><dd>${piped.sent} batches sent · ${piped.received} datagrams received${piped.dropped ? ` · ${piped.dropped} dropped` : ''}${piped.stale ? ` · ${piped.stale} late (the WebRTC link took over)` : ''}</dd>`;
       const tr = room.transport;
-      if (tr) relayHtml += `<dt>WebRTC signals</dt><dd>${tr.resent ?? 0} resent · ${tr.restarts ?? 0} ICE restarts${tr.badSignals ? ` · ${tr.badSignals} refused` : ''}</dd>`;
+      if (tr) relayHtml += `<dt>WebRTC signals</dt><dd>${tr.resent ?? 0} resent · ${tr.restarts ?? 0} ICE restarts · ${tr.retried ?? 0} retries${tr.badSignals ? ` · ${tr.badSignals} refused` : ''}</dd>`;
       relayHtml += '</dl>';
     } else relayHtml = '<p class="dim" style="margin:0">Local (BroadcastChannel): tabs of this browser only.</p>';
     $('relays').innerHTML = relayHtml;
@@ -1251,7 +1251,7 @@ function report() {
       signaling: room.signaling.sockets
         ? { relays: room.signaling.sockets.map((ws) => ({ url: ws.relayUrl, state: ['connecting', 'open', 'closing', 'closed'][ws.readyState] })), stats: room.signaling.stats }
         : 'local',
-      piped: room.transport?.piped ?? null, core: room.stats(),
+      piped: room.transport?.piped ?? null, retried: room.transport?.retried ?? 0, core: room.stats(),
     },
     peers: [...peers.values()].map((p) => ({
       id: p.id, name: nameOf(p.id), presence: p.presence, linked: !!room?.peers.includes(p.id), route: p.route, routeLog: p.routeLog,
