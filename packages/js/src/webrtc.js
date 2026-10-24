@@ -192,7 +192,8 @@ export class WebRtcTransport {
   // `onPeer(peer, state, handle)`: 'open' and 'closed' for a DataChannel (with its
   //   link's endpoint handle), and 'failed' once when one isn't open `fallbackMs`
   //   after its offer or answer (`sameNatFallbackMs` for a peer behind our public
-  //   IPv4), or ICE failed.
+  //   IPv4), or ICE failed. For a retry (see retry()): 'retry-failed' instead, and 'retry'
+//   when the other side asks us, the dialling side, for one.
   // `pipes`: carry datagrams over signalling for peers allowed with allowPipe().
   // `trace(peer, what, detail)`, settable later: diagnostics of each link's
   //   signalling ('offer-sent', 'offer-received', 'answer-sent', 'answer-received',
@@ -215,6 +216,7 @@ export class WebRtcTransport {
     this.badSignals = 0; // signals refused as malformed or unproven (see onSignal)
     this.resent = 0; // offers and answers sent again (OFFER_RESEND_MS)
     this.restarts = 0; // ICE restarts begun (as the dialling side)
+    this.retried = 0; // retries begun (as the dialling side), see retry()
     this.trace = null;
     this.sig = signaling;
     this.iceServers = iceServers;
@@ -283,11 +285,11 @@ export class WebRtcTransport {
     const l = { pc, dc, peer, handle: h, dialer: false, timer: null, watchedAt: 0, failed: false, described: false, late: [], lateTimer: null,
       held: [], offerMsg: null, offerSdp: null, answerMsg: null, resends: [],
       lateSent: 0, opened: false, restarts: 0, restartTimer: null, guessed: null,
-      mine: new Set(), theirs: new Set(), sameNat: false, heard: false };
+      mine: new Set(), theirs: new Set(), sameNat: false, heard: false, retry: false };
     dc.onopen = () => {
       clearTimeout(l.timer);
       l.opened = true;
-      // Opened after the room fell back (ICE went on checking): a link relayed by a
+      // Opened after the room fell back (ICE went on checking, or a retry): a link relayed by a
       // member punches over it and moves there; a pipe's datagrams go over it (see
       // onTransmit). Else the dialler's handshake goes over it, joining a dial under way.
       // (An endpoint stand-in with only connect and receive gets the dial alone.)
@@ -336,7 +338,7 @@ export class WebRtcTransport {
   watch(l, again = false) {
     if (!again) l.watchedAt = Date.now();
     clearTimeout(l.timer);
-    const ms = l.sameNat ? this.sameNatMs : this.fallbackMs;
+    const ms = l.sameNat && !l.retry ? this.sameNatMs : this.fallbackMs; // nothing waits on a retry
     if (l.dc.readyState !== 'open') l.timer = setTimeout(() => this.failed(l), Math.max(0, l.watchedAt + ms - Date.now()));
   }
 
@@ -358,7 +360,11 @@ export class WebRtcTransport {
     if (l.opened) return this.restartSoon(l, 0); // was linked: try to get it back
     if (l.failed || l.dc.readyState === 'open' || this.links.get(l.handle) !== l) return;
     l.failed = true;
-    this.onPeer(l.peer, 'failed');
+    if (!l.retry) return this.onPeer(l.peer, 'failed');
+    // A retry that didn't open closes quietly: the link stays on its fallback.
+    this.dropRtc(l.peer);
+    this.tr(l.peer, 'retry-failed', {});
+    this.onPeer(l.peer, 'retry-failed');
   }
 
   // ICE state of a link whose DataChannel was open: connected again resets the
@@ -528,21 +534,45 @@ export class WebRtcTransport {
   }
 
   // Opens a DataChannel to `peer` and, once open, runs the Peerwire handshake.
-  async dial(peer) {
+  async dial(peer, { retry = false } = {}) {
     if (!isPeerId(peer)) throw new TypeError('dial: not a peer id (64 lowercase hex characters)');
     if (!this.allowed(peer)) throw new Error('relay-only: reach this peer with endpoint.connectVia(relay, peer)');
     if (this.byPeer.has(peer)) return;
     const l = this.link(peer);
     l.dialer = true;
+    l.retry = retry;
     await l.pc.setLocalDescription(await l.pc.createOffer());
     await this.gathered(l.pc);
     const p = this.offerProof ? await this.offerProof.sign(peer) : undefined;
     if (this.links.get(l.handle) !== l) return; // dropped meanwhile
-    l.offerMsg = { kind: 'offer', sdp: this.describe(l), p, ...this.prediction(l) };
+    const again = retry ? { retry: true } : {};
+    l.offerMsg = { kind: 'offer', sdp: this.describe(l), p, ...this.prediction(l), ...again };
     this.signal(peer, l.offerMsg);
-    this.tr(peer, 'offer-sent', candidateSummary(l.offerMsg.sdp.sdp));
+    this.tr(peer, 'offer-sent', { ...candidateSummary(l.offerMsg.sdp.sdp), ...again });
     this.watch(l);
     this.resendOffer(l);
+  }
+
+  // Dials `peer` again with a new RTCPeerConnection, as the dialling side, while the room
+  // reaches it by fallback: the link's own, which never opened, is closed, and the offer
+  // says `retry`, so the other side drops its own too. If the new DataChannel opens, the
+  // link moves onto it (see dc.onopen); if not, it closes quietly ('retry-failed', never
+  // 'failed'). False if the link is open or a retry is under way.
+  retry(peer) {
+    const l = this.links.get(this.byPeer.get(peer));
+    if (!isPeerId(peer) || !this.allowed(peer) || l?.opened || l?.dc.readyState === 'open' || (l?.retry && !l.failed)) return false;
+    this.dropRtc(peer);
+    this.retried++;
+    this.tr(peer, 'retry', { dialer: true });
+    this.dial(peer, { retry: true }).catch(() => {}); // a retry that can't start just ends (the room's hold)
+    return true;
+  }
+
+  // Asks `peer`, the dialling side, for a retry (only the dialling side offers).
+  askRetry(peer) {
+    if (!isPeerId(peer) || !this.allowed(peer)) return;
+    this.signal(peer, { kind: 'retry' });
+    this.tr(peer, 'retry', { dialer: false });
   }
 
   async onSignal(from, msg) {
@@ -550,9 +580,11 @@ export class WebRtcTransport {
     if (!isPeerId(from) || !msg) return void this.badSignals++;
     if (!this.allowed(from)) return;
     if (msg.kind === 'dg') return this.pipeReceive(from, msg.d);
+    if (msg.kind === 'retry') return void this.onPeer(from, 'retry'); // the room decides
     const held = this.checking.get(from);
     if (held) return void held.push(msg);
-    if (msg.kind === 'offer' && this.offerProof && !this.byPeer.has(from)) {
+    // A first offer, or a retry's (which replaces our link): only one that proves the key.
+    if (msg.kind === 'offer' && this.offerProof && (!this.byPeer.has(from) || msg.retry === true)) {
       // Hold what follows (trickled candidates) until the proof is checked.
       this.checking.set(from, []);
       const ok = await this.offerProof.check(from, msg.p).catch(() => false);
@@ -570,8 +602,16 @@ export class WebRtcTransport {
     // Only an offer opens a link; answers and candidates for a dropped one are stale.
     if (msg.kind !== 'offer' && !this.byPeer.has(from)) return;
     if (msg.kind === 'offer') {
-      const fresh = !this.byPeer.has(from);
       const sdp = typeof msg.sdp?.sdp === 'string' ? msg.sdp.sdp : null;
+      const old = msg.retry === true ? this.links.get(this.byPeer.get(from)) : null;
+      if (old && old.offerSdp !== sdp) {
+        // A retry (see retry()): the dialling side closed its link, which never opened, and
+        // offers afresh, so ours goes too. Not one that opened (it carries the link, or is
+        // about to) or that we dial.
+        if (old.dialer || old.opened || old.dc.readyState === 'open') return;
+        this.dropRtc(from);
+      }
+      const fresh = !this.byPeer.has(from);
       if (!fresh) {
         // The same offer again: our answer was lost (or is still being made). Send it again.
         const l = this.links.get(this.byPeer.get(from));
@@ -586,6 +626,7 @@ export class WebRtcTransport {
       }
       const l = this.link(from);
       l.offerSdp = sdp; // a copy that comes while this one is answered is ignored
+      if (fresh) l.retry = msg.retry === true;
       try {
         await l.pc.setRemoteDescription(msg.sdp);
         await l.pc.setLocalDescription(await l.pc.createAnswer());
@@ -594,7 +635,7 @@ export class WebRtcTransport {
         if (fresh && this.links.get(l.handle) === l) this.drop(from);
         return void this.badSignals++;
       }
-      this.tr(from, 'offer-received', { ...candidateSummary(sdp), restart: !fresh });
+      this.tr(from, 'offer-received', { ...candidateSummary(sdp), restart: !fresh, ...(l.retry && { retry: true }) });
       this.sameNat(l, l.theirs, sdp);
       await this.addHeld(l);
       if (!fresh) Object.assign(l, { described: false, late: [], lateSent: 0 });
@@ -721,6 +762,16 @@ export class WebRtcTransport {
   pipeFlush(p) {
     p.timer = null;
     if (this.pipes.get(p.handle) !== p || !p.q.length) return;
+    // A channel carries the peer's datagrams now (an adopted one, or its own that opened
+    // late; see onTransmit): those queued before it opened go there too, not over signalling.
+    const c = this.carried.get(p.handle);
+    const own = this.links.get(this.byPeer.get(p.peer));
+    const dc = c?.dc.readyState === 'open' ? c.dc : own?.dc.readyState === 'open' ? own.dc : null;
+    if (dc) {
+      for (const [s] of p.q.splice(0)) this.dcSend(dc, unb64(s));
+      p.bytes = 0;
+      return;
+    }
     const now = Date.now();
     this.pipeTokens = Math.min(PIPE_BURST, this.pipeTokens + ((now - this.pipeRefilled) / 1000) * PIPE_RATE);
     this.pipeRefilled = now;

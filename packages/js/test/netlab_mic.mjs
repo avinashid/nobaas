@@ -3,9 +3,10 @@
 // - before: the report says mediaPermission 'prompt' and the network test's local
 //   addresses are hidden (.local);
 // - the button: 'granted', the network test lists real local addresses (and reads the
-//   same NAT, though each interface now has its own public port), the room is joined
-//   again (a new id, so new connections), and the other tab sees mic allowed and this
-//   tab's real local addresses on the new link; nothing throws;
+//   same NAT, though each interface now has its own public port); the pair, linked over
+//   signalling (no mDNS here), retries WebRTC (room.retryDirect) with no rejoin (the same
+//   ids, no leave), and the other tab sees mic allowed and this tab's real local
+//   addresses on the retry's new connection, which is direct; nothing throws;
 // - the global room (MIC-1): with the grant stored before the tabs open, or given while
 //   they are in it, the other tab gets no local address, and the pair still links;
 //   the button pressed there rejoins before its network re-test, so a tab joining
@@ -62,6 +63,7 @@ try {
   ok(before.me.mediaPermission === 'prompt', `before: mediaPermission ${before.me.mediaPermission}`);
   ok(hosts0.length > 0 && hosts0.every(hidden), `before: local addresses hidden (${hosts0.join(', ')})`);
   const bBefore = (await report(b)).peers.find((p) => p.id === before.me.id);
+  const routeBefore = await b.evaluate((id) => window.netlab.peers().find((q) => q.id === id)?.route, before.me.id);
   ok(bBefore?.presence?.mic === false, `before: the other tab sees mic ${bBefore?.presence?.mic}`);
   if (shot) await card(a).screenshot({ path: `${shot}-before.png` });
 
@@ -69,8 +71,8 @@ try {
   // does (Chrome shows local addresses only with a stored grant), so store it too.
   await ctx.grantPermissions(['microphone'], { origin });
   await a.click('#mic');
-  // The room is joined again first, then the network re-tested (MIC-4): wait for both.
-  await wait(a, ([id, at]) => window.netlab.self && window.netlab.self !== id && window.netlab.peers().length === 1
+  // The network re-tested, the room kept (no rejoin in a named room).
+  await wait(a, ([id, at]) => window.netlab.self === id && window.netlab.peers().length === 1
     && window.netlab.report().me.network?.at !== at, [before.me.id, before.me.network.at]);
   const after = await report(a);
   const hosts1 = after.me.network.host.map((c) => c.address);
@@ -78,7 +80,8 @@ try {
   ok(after.me.network.at !== before.me.network.at && hosts1.length > 0 && !hosts1.some(hidden), `the network test ran again: local addresses ${hosts1.join(', ')}`);
   // Each interface now has its own socket and public port: still the same NAT reading.
   ok(after.me.network.nat === before.me.network.nat, `and reads the same NAT (${before.me.network.nat} → ${after.me.network.nat}, ${after.me.network.srflx.length} public candidates)`);
-  ok(after.me.id !== before.me.id, `rejoined the room as a new member (${before.me.id.slice(0, 6)} → ${after.me.id.slice(0, 6)})`);
+  ok(after.me.id === before.me.id, `kept the room: the same id (${after.me.id.slice(0, 6)}), no rejoin`);
+  ok(routeBefore === 'signaling', `before: the pair linked over signalling (${routeBefore}), as mDNS names don't resolve here`);
   ok(after.log.some((e) => e.msg.startsWith('microphone allowed')), 'the log says the microphone was allowed');
   // The other tab: the new link offers this tab's real local addresses.
   await wait(b, (id) => {
@@ -89,6 +92,10 @@ try {
   ok(seen?.presence?.mic === true, `the other tab sees mic ${seen?.presence?.mic}`);
   ok(seen?.theirHosts.length > 0 && !seen.theirHosts.some(hidden), `and the new link's local addresses: ${seen?.theirHosts.join(', ')}`);
   ok(seen?.route === 'direct', `and links direct (${seen?.route})`);
+  // The link moved, the same session: a retry in the log, no leave on either side.
+  const logs = [after, await report(b)].map((r) => r.log.map((e) => e.msg));
+  ok(logs.flat().some((m) => /retry offer \(a new connection\) (sent|received)/.test(m)), 'by a retry: a retry offer in the log');
+  ok(!logs.flat().some((m) => / left: /.test(m)) && seen?.left === null, 'with no leave on either side');
   const errors = [a, b].map(async (p) => (await report(p)).log.filter((e) => e.level === 'error').map((e) => e.msg));
   const errs = (await Promise.all(errors)).flat();
   ok(!errs.length, `nothing thrown or unhandled${errs.length ? `: ${errs.join(' | ')}` : ''}`);

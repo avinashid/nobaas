@@ -86,6 +86,12 @@ export interface JoinRoomOptions {
    * Default 3000 ms (at most `fallbackMs`). ICE goes on checking: if the link's DataChannel opens later (two
    * desktops on one Wi-Fi), the link moves onto it and `route(peer)` says `'direct'` again. */
   sameNatFallbackMs?: number;
+  /** While a peer is reached by fallback, the room tries WebRTC again with a new connection (see `retryDirect`),
+   * and also when the page is granted the microphone or camera: browsers show their local addresses only to
+   * connections made after such a grant, so with privacy `'direct'` the retry offers them to that peer. `false`
+   * keeps a grant from making new connections (Net Lab's global room rejoins as `'public-only'` instead). Has no
+   * effect with `'public-only'`, which never offers them. Default true. */
+  retryOnGrant?: boolean;
   /** A WebRTC implementation for runtimes without one (Node: node-datachannel's polyfill).
    * Without WebRTC, `'local'` rooms send datagrams over the BroadcastChannel. */
   RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
@@ -147,8 +153,19 @@ export declare class Room {
   setPresence(presence: Presence): void;
   /** Smoothed round-trip time to a peer in ms, or null before the first sample. */
   /** How `peer` is reached: its own WebRTC link, a channel handed to `adoptChannel` (`adopted`), relayed by
-   * member `via`, or over the signalling relays; null while it isn't linked. */
+   * member `via`, or over the signalling relays; null while it isn't linked. A `'peer'` or `'signaling'` route
+   * can become `'direct'` later, with the same session (no `peer-leave` or `peer-join`): ICE goes on checking,
+   * the room retries WebRTC (see `retryDirect`), or a channel is adopted. */
   route(peer: PeerId): { kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' } | null;
+  /** Tries WebRTC again, now, with `peer` (or every peer) the room reaches only by fallback: a new connection,
+   * so one made after a network change, or a microphone or camera grant (privacy `'direct'`), offers the new
+   * addresses. If its DataChannel opens, the link moves onto it and `route(peer)` says `'direct'`; if not, it
+   * closes quietly and the link stays on its fallback. The room also retries on its own: 20 s after a peer goes
+   * on a fallback, then 40, 80, 160 s, then every 5 min (each ±20 %), and on `online`, a new connection type
+   * and a grant (see `retryOnGrant`). Retries take turns, one at a time per room, at least 2 s apart; only
+   * the dialling side (the smaller id) offers, so the other side asks it. Returns how many peers are to be
+   * retried. */
+  retryDirect(peer?: PeerId): number;
   /** Moves `peer`'s link onto `dc`, an open DataChannel to it made outside the room (`pc` its connection; a
    * birthday punch's, say), when the room reaches `peer` only by fallback and the peer adopts its end too.
    * True once the channel carries the link; false, leaving the channel to the caller, if the link is direct
@@ -322,8 +339,10 @@ export declare class WebRtcTransport implements Transport {
        * peer behind our public IPv4), or ICE failed; ICE goes on checking, and a channel that opens later takes
        * over a link the endpoint made by other means (a relayed one punches over it; a pipe's datagrams go over it,
        * and the far end's core moves the link there). `'carrier'`: an adopted channel started or stopped carrying
-       * the peer's link (see `adopt`). With `'closed'`, `handle` is the closed link's endpoint handle. */
-      onPeer?: (peer: PeerId, state: 'open' | 'closed' | 'failed' | 'carrier', handle?: number) => void;
+       * the peer's link (see `adopt`). With `'closed'`, `handle` is the closed link's endpoint handle.
+       * `'retry-failed'`: a retry's connection (see `retry`) didn't open; `'retry'`: the other side asks us, the
+       * dialling side, for one. */
+      onPeer?: (peer: PeerId, state: 'open' | 'closed' | 'failed' | 'carrier' | 'retry-failed' | 'retry', handle?: number) => void;
       /** Default 8000 ms. */
       fallbackMs?: number;
       /** Default 3000 ms, at most `fallbackMs`. */
@@ -353,10 +372,13 @@ export declare class WebRtcTransport implements Transport {
   readonly resent: number;
   /** ICE restarts begun as the dialling side (a link that was open lost ICE). */
   readonly restarts: number;
+  /** Retries begun as the dialling side (see `retry`). */
+  readonly retried: number;
   /**
    * Diagnostics: called for each link's signalling (`offer-sent`, `offer-received`, `answer-sent`, `answer-received`,
    * `ice-batch-sent`, `ice-batch-received`, with `candidateSummary` counts, `resend: true` on a copy and
-   * `restart: true` for an ICE restart), ICE (`ice-state` with `state`, `candidate-error` with the STUN server `url`,
+   * `restart: true` for an ICE restart, `retry: true` for a retry's offer), retries (`retry` with `dialer`,
+   * `retry-failed`), ICE (`ice-state` with `state`, `candidate-error` with the STUN server `url`,
    * `code`, `text`, `address`, `ice-restart` with `n`, `reason`, `dialer`), port prediction (`guesses` with the
    * peer's `ip`, `next`, `step` and the `n` candidates added) and `same-nat` (the peer's candidates name our
    * public IPv4 `ip`, so the link falls back after `ms`).
@@ -378,7 +400,16 @@ export declare class WebRtcTransport implements Transport {
   adopt(peer: PeerId, pc: RTCPeerConnection, dc: RTCDataChannel, options?: { pipe?: boolean }): Promise<number>;
   /** The adopted channel carrying `peer`'s link now, or null. */
   carrier(peer: PeerId): { pc: RTCPeerConnection; dc: RTCDataChannel } | null;
-  dial(peer: PeerId): Promise<void>;
+  /**
+   * As the dialling side, dials `peer` again with a new RTCPeerConnection while its link runs by other means:
+   * the link's own connection, which never opened, is closed, and the offer says `retry`, so the other side
+   * drops its own (only one that never opened). If the new DataChannel opens, the link moves onto it; if not,
+   * it closes quietly (`'retry-failed'`, never `'failed'`). False if the link is open or a retry is under way.
+   */
+  retry(peer: PeerId): boolean;
+  /** Asks `peer`, the dialling side, for a retry (it gets `onPeer(peer, 'retry')`). */
+  askRetry(peer: PeerId): void;
+  dial(peer: PeerId, options?: { retry?: boolean }): Promise<void>;
   has(peer: PeerId): boolean;
   drop(peer: PeerId): void;
   close(): void;
