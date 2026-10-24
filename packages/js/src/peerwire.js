@@ -14,6 +14,9 @@ const WOULD_BLOCK = -3;
 const SEND_SCRATCH = 16 * 1024;
 const encoder = new TextEncoder();
 const IN_NODE = typeof globalThis.process?.versions?.node === 'string';
+// In a variable, with the bundlers' ignore comments below, so a browser build doesn't try to
+// resolve it: Vite warned that it was "externalized for browser compatibility" and emitted a stub.
+const NODE_FS = 'node:fs/promises';
 
 // Only Node reads from disk: file: URLs and absolute paths. Anything else is fetched, and in a
 // browser that includes root-relative paths such as the '/assets/…wasm' bundlers emit.
@@ -22,7 +25,7 @@ export async function loadPeerwire(source) {
   if (typeof source === 'string' || source instanceof URL) {
     const s = String(source);
     if (IN_NODE && (s.startsWith('file:') || s.startsWith('/'))) {
-      const { readFile } = await import('node:fs/promises');
+      const { readFile } = await import(/* webpackIgnore: true */ /* @vite-ignore */ NODE_FS);
       bytes = await readFile(s.startsWith('file:') ? new URL(s) : s);
     } else {
       const res = await fetch(source);
