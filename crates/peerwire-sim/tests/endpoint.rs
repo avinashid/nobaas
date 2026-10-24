@@ -1,6 +1,6 @@
 //! Endpoint scenarios run in the deterministic simulator.
 #![allow(clippy::needless_range_loop)]
-use peerwire_core::{Config, DisconnectReason, Event, Lane, MAX_DATAGRAM};
+use peerwire_core::{Config, DisconnectReason, Event, Lane, Path, MAX_DATAGRAM};
 use peerwire_sim::{NetConfig, Sim, SimAddr};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -586,4 +586,68 @@ fn urgent_flood_does_not_starve_reliable() {
         share * 100.0
     );
     assert!(share > 0.25, "reliable keeps a fair share under an urgent flood: {:.0}%", share * 100.0);
+}
+
+/// Fast lane 2 under 10% loss and 5 ms jitter: a link between a and b on a slow
+/// address (a signalling pipe) moves through c once a probe and its answer get
+/// through, and back when c closes its links (or, if those closes are lost, once
+/// c has carried nothing for `direct_timeout`). A reliable stream from a to b
+/// throughout arrives whole and in order, on the one link.
+#[test]
+fn slow_link_moves_through_a_relay_and_back_under_loss() {
+    let net = NetConfig { loss: 0.1, jitter: Duration::from_millis(5), ..NetConfig::default() };
+    let mut sim = Sim::new(net, 7);
+    for _ in 0..3 {
+        sim.add_node(Config::default());
+    }
+    sim.connect(0, 1).unwrap();
+    sim.connect(2, 0).unwrap();
+    sim.connect(2, 1).unwrap();
+    let linked = |s: &mut Sim| connected(s, 0, 1) && connected(s, 2, 0) && connected(s, 2, 1);
+    assert!(sim.run_until(Duration::from_secs(20), linked), "trio never linked");
+    let (a, b, c) = (sim.peer_id(0), sim.peer_id(1), sim.peer_id(2));
+    let (at_a, at_b) = (sim.addr(0), sim.addr(1));
+    sim.nodes[0].endpoint.set_slow(&b, Some(at_b));
+    sim.nodes[1].endpoint.set_slow(&a, Some(at_a));
+    let now = sim.now;
+    sim.nodes[0].endpoint.add_relay(now, c, &b);
+    link_events(&mut sim, 0);
+    link_events(&mut sim, 1);
+
+    let mut sent = 0u32;
+    let mut until = |sim: &mut Sim, what: &str, done: &dyn Fn(&Sim) -> bool| {
+        for _ in 0..200 {
+            if done(sim) {
+                return;
+            }
+            sim.send(0, 1, Lane::Reliable, &sent.to_le_bytes()).unwrap();
+            sent += 1;
+            sim.run_for(Duration::from_millis(100));
+        }
+        panic!("{what} after 20 s: {:?} {:?}", sim.path(0, 1), sim.path(1, 0));
+    };
+    let via_c = Some(Path::Via(c));
+    until(&mut sim, "not through c", &|s| s.path(0, 1) == via_c && s.path(1, 0) == via_c);
+    let relayed = sim.nodes[2].endpoint.stats().relayed;
+    sim.run_for(Duration::from_secs(1));
+    assert!(sim.nodes[2].endpoint.stats().relayed > relayed, "c relays the link");
+    sim.nodes[2].endpoint.disconnect(&a);
+    sim.nodes[2].endpoint.disconnect(&b);
+    let back = |s: &Sim| s.path(0, 1) == Some(Path::Direct(at_b)) && s.path(1, 0) == Some(Path::Direct(at_a));
+    until(&mut sim, "not back on the slow address", &back);
+    sim.run_for(Duration::from_secs(5));
+
+    let (ea, eb) = (link_events(&mut sim, 0), link_events(&mut sim, 1));
+    let moves = |e: &[Event<_>], peer| {
+        e.iter().filter(|e| matches!(e, Event::PathChanged { peer: p, .. } if *p == peer)).count()
+    };
+    assert_eq!((moves(&ea, b), moves(&eb, a)), (2, 2), "one move there and one back each: {ea:?} {eb:?}");
+    let lost_link = |e: &[Event<_>], peer| {
+        e.iter()
+            .any(|e| matches!(e, Event::Connected { peer: p, .. } | Event::Disconnected { peer: p, .. } if *p == peer))
+    };
+    assert!(!lost_link(&ea, b) && !lost_link(&eb, a), "the same link throughout");
+    let got: Vec<u32> =
+        messages(&eb, Lane::Reliable).iter().map(|m| u32::from_le_bytes(m[..4].try_into().unwrap())).collect();
+    assert_eq!(got, (0..sent).collect::<Vec<_>>(), "every message once, in order");
 }

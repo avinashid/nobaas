@@ -39,7 +39,7 @@ CI and `scripts/gate.sh` fail the wasm build if it grows past 350 KiB (`WASM_MAX
 |---|---|
 | Memory | `pw_alloc`, `pw_free` |
 | Endpoint | `pw_endpoint_new` (from a secret key, or a new identity from a 32-byte seed), `pw_endpoint_free`, `pw_secret` |
-| Links | `pw_connect`, `pw_connect_via`, `pw_add_candidate` (a direct address for a relayed peer: punch to it, move there once it answers), `pw_set_relay_only`, `pw_disconnect`, `pw_is_connected`, `pw_rtt_us`, `pw_stats` |
+| Links | `pw_connect`, `pw_connect_via`, `pw_add_candidate` (a direct address for a relayed peer: punch to it, move there once it answers), `pw_set_slow` (a slow address of a linked peer, such as a signalling pipe), `pw_add_relay` (a relay for a link on its slow address: probe through it, move there once it answers), `pw_set_relay_only`, `pw_disconnect`, `pw_is_connected`, `pw_rtt_us`, `pw_stats` |
 | Data | `pw_send` (lane 0 reliable, 1 unreliable, 2 urgent) |
 | Host loop | `pw_handle_datagram`, `pw_handle_timeout`, `pw_poll_timeout`, `pw_poll_transmit`, `pw_poll_event` |
 | Sealed messages | `pw_seal`, `pw_open` |

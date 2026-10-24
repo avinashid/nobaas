@@ -163,6 +163,27 @@ pub unsafe extern "C" fn pw_add_candidate(h: *mut PwEndpoint, now_us: u64, addr:
     0
 }
 
+/// Marks `addr` as a slow address of the linked peer `peer_id` (a signalling
+/// pipe, say), or clears the mark (`on` 0): on it the link takes a relay that
+/// `pw_add_relay` offers once a probe through it is answered, and goes back to
+/// it when that relay goes. See `Endpoint::set_slow`.
+#[no_mangle]
+pub unsafe extern "C" fn pw_set_slow(h: *mut PwEndpoint, peer_id: *const u8, addr: u32, on: u32) {
+    if let Some(p) = peer(peer_id) {
+        (*h).ep.set_slow(&p, (on != 0).then_some(addr));
+    }
+}
+
+/// Offers the directly linked peer `relay` to carry the link to `peer_id` while
+/// that link is on its slow address: probes go through it, and the link moves
+/// there (PATH_CHANGED) once `peer_id` answers. See `Endpoint::add_relay`.
+#[no_mangle]
+pub unsafe extern "C" fn pw_add_relay(h: *mut PwEndpoint, now_us: u64, relay: *const u8, peer_id: *const u8) -> i32 {
+    let (Some(r), Some(p)) = (peer(relay), peer(peer_id)) else { return PW_ERR_INVALID };
+    (*h).ep.add_relay(now(now_us), r, &p);
+    0
+}
+
 /// Relay-only (`on` != 0): relayed links stay relayed (no punching, no direct
 /// path), dials through a relay alone (given the relay before any direct address
 /// of their own, or with a relay when this is turned on) send nothing direct,
@@ -620,6 +641,88 @@ mod tests {
         }
     }
 
+    /// The paths `h` reported in PATH_CHANGED events since the last call, encoded.
+    unsafe fn path_changes(h: *mut PwEndpoint) -> Vec<Vec<u8>> {
+        let (mut buf, mut out) = (vec![0u8; 4096], Vec::new());
+        loop {
+            let n = pw_poll_event(h, buf.as_mut_ptr(), buf.len());
+            if n <= 0 {
+                return out;
+            }
+            if buf[0] == 5 {
+                out.push(buf[33..n as usize].to_vec());
+            }
+        }
+    }
+
+    /// pw_set_slow and pw_add_relay: a link a and b made over a slow handle (a
+    /// signalling pipe) moves through r once r answers, at both ends, and goes
+    /// back to the pipe when r goes. Without the mark, nothing moves.
+    #[test]
+    fn add_relay_moves_a_slow_link_through_a_relay_and_back() {
+        unsafe {
+            for slow in [true, false] {
+                let mut ids = [[0u8; 32]; 3];
+                let eps: Vec<_> = (0..3)
+                    .map(|i| pw_endpoint_new(std::ptr::null(), [i as u8 + 1; 32].as_ptr(), 0, ids[i].as_mut_ptr()))
+                    .collect();
+                let (a, b, r) = (eps[0], eps[1], eps[2]);
+                // As above (a sees r at 10, ...), with a and b linked over a pipe: a sees b at 11, b sees a at 21.
+                let routes = [
+                    ((0, 10), (2, 30)),
+                    ((1, 20), (2, 31)),
+                    ((2, 30), (0, 10)),
+                    ((2, 31), (1, 20)),
+                    ((0, 11), (1, 21)),
+                    ((1, 21), (0, 11)),
+                ];
+                let mut t = 1000u64;
+                assert_eq!(pw_connect(a, t, 10, ids[2].as_ptr()), 0);
+                assert_eq!(pw_connect(b, t, 20, ids[2].as_ptr()), 0);
+                assert_eq!(pw_connect(a, t, 11, ids[1].as_ptr()), 0);
+                route(&eps, &routes, t);
+                assert_eq!((pw_is_connected(a, ids[1].as_ptr()), pw_is_connected(b, ids[0].as_ptr())), (1, 1));
+                pw_set_slow(a, ids[1].as_ptr(), 11, slow as u32);
+                pw_set_slow(b, ids[0].as_ptr(), 21, slow as u32);
+                assert_eq!(pw_add_relay(a, t, std::ptr::null(), ids[1].as_ptr()), PW_ERR_INVALID);
+                assert_eq!(pw_add_relay(a, t, ids[2].as_ptr(), ids[1].as_ptr()), 0);
+                let run = |t: &mut u64| {
+                    let (mut pa, mut pb) = (Vec::new(), Vec::new());
+                    for _ in 0..40 {
+                        *t += 50_000;
+                        for &h in &eps {
+                            pw_handle_timeout(h, *t);
+                        }
+                        route(&eps, &routes, *t);
+                        pa.extend(path_changes(a));
+                        pb.extend(path_changes(b));
+                    }
+                    (pa, pb)
+                };
+                let via_r = [&[1u8][..], &ids[2]].concat();
+                let (pa, pb) = run(&mut t);
+                if slow {
+                    assert_eq!((pa, pb), (vec![via_r.clone()], vec![via_r]), "both moved through r");
+                } else {
+                    assert!(pa.is_empty() && pb.is_empty(), "not slow, no move: {pa:?} {pb:?}");
+                }
+                pw_disconnect(r, ids[0].as_ptr());
+                pw_disconnect(r, ids[1].as_ptr());
+                let (pa, pb) = run(&mut t);
+                if slow {
+                    let pipe = |h: u32| [&[0u8][..], &h.to_le_bytes()].concat();
+                    assert_eq!((pa, pb), (vec![pipe(11)], vec![pipe(21)]), "both back on the pipe");
+                } else {
+                    assert!(pa.is_empty() && pb.is_empty());
+                }
+                assert_eq!((pw_is_connected(a, ids[1].as_ptr()), pw_is_connected(b, ids[0].as_ptr())), (1, 1));
+                for h in eps {
+                    pw_endpoint_free(h);
+                }
+            }
+        }
+    }
+
     /// NB48b-4: relay-only, a dial through relay r sends nothing to a direct
     /// address of the peer added while it is pending (pw_add_candidate, or
     /// pw_connect) or once the link is up, though that path would work: the link
@@ -813,9 +916,11 @@ mod tests {
                                 || r >= 0 && r as usize <= s.len()
                         );
                     }
-                    6 => match rng.below(5) {
+                    6 => match rng.below(7) {
                         0 => pw_disconnect(h, target.as_ptr()),
                         1 => assert_eq!(pw_add_candidate(h, t, *rng.pick(&[1, 2, 3]), target.as_ptr()), 0),
+                        2 => pw_set_slow(h, target.as_ptr(), *rng.pick(&[1, 2, 3]), rng.below(2) as u32),
+                        3 => assert_eq!(pw_add_relay(h, t, rng.pick(&ids).as_ptr(), target.as_ptr()), 0),
                         _ => assert!([0, PW_ERR_INVALID].contains(&pw_connect(h, t, 2 - x as u32, target.as_ptr()))),
                     },
                     7 => {

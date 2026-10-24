@@ -30,6 +30,11 @@ pub const MAX_SPRAY: u16 = 4096;
 /// Sprayed ports: `SPRAY_LOW` and up, where NATs hand ports out.
 const SPRAY_LOW: u32 = 1024;
 const SPRAY_RANGE: u32 = 65536 - SPRAY_LOW;
+/// A link on its slow address probes the relays offered for it ([`Endpoint::add_relay`])
+/// every this many punch rounds: a relay path works or doesn't, no NAT needs opening.
+const RELAY_ROUNDS: u32 = 5;
+/// Most relays probed at once for one link.
+const MAX_RELAYS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -354,11 +359,16 @@ impl<A: Address> Spray<A> {
     }
 }
 
+/// Probes of better paths: direct candidates while relayed, or the relays offered
+/// for a link on its slow address. Each is a sealed PUNCH, answered with a PUNCH_ACK
+/// along the same path.
 struct Punch {
     token: u64,
     next_at: Instant,
     until: Instant,
     round: u32,
+    /// Relays to probe through ([`Endpoint::add_relay`]).
+    relays: Vec<PeerId>,
 }
 
 struct Link {
@@ -454,9 +464,31 @@ struct Session<A> {
     /// A birthday spray under way ([`Endpoint::spray`]).
     spray: Option<Spray<A>>,
     punch: Option<Punch>,
-    last_direct: Instant,
+    /// When a packet last came over `path`: a direct path silent for
+    /// `direct_timeout` falls back to the relay, a relay to the slow address.
+    last_path: Instant,
     /// The address this peer last said it sees us at.
     seen_as: Option<A>,
+    /// A slow address of the peer's ([`Endpoint::set_slow`]), which ranks below
+    /// a relay: the link leaves it for a relay that answers a probe, and goes back
+    /// to it when that relay goes.
+    slow: Option<A>,
+    /// On a relay: the newest nonce of a packet other than a probe that came
+    /// through it, so the peer is on it too. Only probes leave a path, so a newer
+    /// one over the slow address means the peer went back there.
+    relay_nonce: Option<u64>,
+}
+
+impl<A: Address> Session<A> {
+    /// Whether the link is on its slow address.
+    fn on_slow(&self) -> bool {
+        on_slow(&self.path, &self.slow)
+    }
+}
+
+/// Whether `path` is the slow address `slow` (for borrows that can't take the session).
+fn on_slow<A: Address>(path: &Path<A>, slow: &Option<A>) -> bool {
+    slow.is_some() && path.direct() == slow.as_ref()
 }
 
 /// A sans-IO P2P endpoint: one identity, any number of encrypted links.
@@ -519,7 +551,10 @@ impl<A: Address> Endpoint<A> {
     /// links and dials, such as those to the relay, are unaffected, and so is a
     /// direct dial later given a relay: it keeps its direct addresses and may
     /// complete direct, though it takes no new ones. Links already up keep their
-    /// path.
+    /// path, and none moves between a slow address and a relay
+    /// ([`add_relay`](Endpoint::add_relay)): relays offered are ignored, probes
+    /// through them stop and aren't answered, and a relayed link doesn't fall back
+    /// to its slow address.
     pub fn set_relay_only(&mut self, on: bool) {
         self.relay_only = on;
         if !on {
@@ -532,6 +567,7 @@ impl<A: Address> Endpoint<A> {
                     d.targets.push(Path::Via(r)); // the relay was named when the targets were full
                 }
             } else if !matches!(sess.path, Path::Via(_)) {
+                sess.punch = None; // on a direct link, a probe of relays
                 continue;
             }
             sess.punch = None;
@@ -765,8 +801,10 @@ impl<A: Address> Endpoint<A> {
                 guess_probes: 0,
                 spray: None,
                 punch: None,
-                last_direct: now,
+                last_path: now,
                 seen_as: None,
+                slow: None,
+                relay_nonce: None,
             },
         );
         self.dialing.insert(peer, idx);
@@ -790,7 +828,9 @@ impl<A: Address> Endpoint<A> {
     fn add_candidate(&mut self, now: Instant, idx: u32, a: A) {
         let (max, relay_only) = (self.config.max_candidates, self.relay_only);
         let Some(sess) = self.sessions.get_mut(&idx) else { return };
-        if sess.path.direct() == Some(&a) || (relay_only && matches!(sess.path, Path::Via(_))) {
+        // The slow address isn't punched to: a relay beats it.
+        let known = sess.path.direct() == Some(&a) || sess.slow.as_ref() == Some(&a);
+        if known || (relay_only && matches!(sess.path, Path::Via(_))) {
             return;
         }
         if !sess.candidates.contains(&a) {
@@ -815,8 +855,80 @@ impl<A: Address> Endpoint<A> {
         }
         match &mut sess.punch {
             Some(p) => p.until = until,
-            None => sess.punch = Some(Punch { token, next_at: now, until, round: 0 }),
+            None => sess.punch = Some(Punch { token, next_at: now, until, round: 0, relays: Vec::new() }),
         }
+    }
+
+    /// Marks `addr` as a slow address of the linked `peer`, or clears the mark
+    /// (`None`): a path that relaying through another peer beats, such as a
+    /// signalling channel carrying datagrams. Paths rank slow address, then relay,
+    /// then direct path. On its slow address a link takes a relay offered with
+    /// [`add_relay`](Endpoint::add_relay) once a probe through it is answered, and
+    /// goes back to it, with a `PathChanged` event, when that relay's link goes,
+    /// when the peer's traffic comes over it again (newer than any through the
+    /// relay: the peer went back), or when the relay has carried nothing from the
+    /// peer for `direct_timeout`. A slow address is never punched to, and a relay
+    /// never forwards to a peer linked only over its slow address. Ignored for a
+    /// peer that isn't linked.
+    pub fn set_slow(&mut self, peer: &PeerId, addr: Option<A>) {
+        let Some(sess) = self.peers.get(peer).and_then(|i| self.sessions.get_mut(i)) else { return };
+        sess.candidates.retain(|c| Some(c) != addr.as_ref()); // a dial's own target is one
+        sess.slow = addr;
+        if matches!(sess.path, Path::Direct(_)) && !sess.on_slow() {
+            sess.punch = None; // a probe of relays, and the path isn't slow any more
+        }
+    }
+
+    /// Offers `relay`, a peer linked directly, to carry the link to `peer` while
+    /// that link is on its slow address ([`set_slow`](Endpoint::set_slow)). A
+    /// sealed PUNCH goes to `peer` through `relay` every `RELAY_ROUNDS` punch
+    /// intervals for `punch_duration`, and `peer` answers it through `relay` only
+    /// if it would use the relay too: it is on its own slow address, or on that
+    /// relay already. The answer moves the link to the relay (a `PathChanged`
+    /// event); several relays can be offered, and the first to answer wins. A
+    /// probe arriving through a relay offers that relay back, so both ends move.
+    /// Ignored while relay-only, for a link not on its slow address, and for a
+    /// relay not linked directly or linked only over its own slow address.
+    pub fn add_relay(&mut self, now: Instant, relay: PeerId, peer: &PeerId) {
+        if let Some(&idx) = self.peers.get(peer) {
+            self.offer_relay(now, idx, relay);
+        }
+    }
+
+    fn offer_relay(&mut self, now: Instant, idx: u32, relay: PeerId) {
+        if self.relay_only || !self.fast_link(&relay) {
+            return;
+        }
+        let until = now + self.config.punch_duration;
+        let Some(sess) = self.sessions.get_mut(&idx) else { return };
+        if sess.peer == relay || !sess.on_slow() || !matches!(sess.state, State::Live(_)) {
+            return;
+        }
+        let rng = &mut self.rng;
+        let p = sess.punch.get_or_insert_with(|| Punch {
+            token: rng.next_u64(),
+            next_at: now,
+            until,
+            round: 0,
+            relays: Vec::new(),
+        });
+        if p.relays.contains(&relay) || p.relays.len() >= MAX_RELAYS {
+            return;
+        }
+        p.relays.push(relay);
+        p.until = p.until.max(until);
+        // Probe it at once (rounds are only relay probes on a slow address).
+        p.next_at = now;
+        p.round = 0;
+    }
+
+    /// Whether `peer` is linked over a direct path that isn't its slow address:
+    /// a relay worth moving a link onto.
+    fn fast_link(&self, peer: &PeerId) -> bool {
+        self.peers
+            .get(peer)
+            .and_then(|i| self.sessions.get(i))
+            .is_some_and(|s| matches!(s.path, Path::Direct(_)) && !s.on_slow() && matches!(s.state, State::Live(_)))
     }
 
     /// Aims handshakes and punches for `peer` at `addrs` too: guesses at the
@@ -927,7 +1039,7 @@ impl<A: Address> Endpoint<A> {
         match &mut sess.state {
             State::Dialing(d) => Some(d.hs1.clone()),
             State::Live(link) if matches!(sess.path, Path::Via(_)) && !relay_only => {
-                let p = sess.punch.get_or_insert(Punch { token, next_at: now, until, round: 0 });
+                let p = sess.punch.get_or_insert(Punch { token, next_at: now, until, round: 0, relays: Vec::new() });
                 p.until = p.until.max(until);
                 let mut f = Vec::with_capacity(9);
                 wire::put_punch(&mut f, false, p.token);
@@ -937,18 +1049,56 @@ impl<A: Address> Endpoint<A> {
         }
     }
 
-    /// Closes the link to `peer`, telling it so. No event is emitted locally.
+    /// Closes the link to `peer`, telling it so. No event is emitted for `peer`;
+    /// links it relayed go back to their slow addresses (`PathChanged`).
     pub fn disconnect(&mut self, peer: &PeerId) {
         let Some(idx) = self.peers.remove(peer) else { return };
         if let Some(mut sess) = self.sessions.remove(&idx) {
             if let State::Live(link) = &mut sess.state {
                 let mut pt = Vec::with_capacity(1);
                 wire::put_close(&mut pt);
+                let heard = link.last_recv;
                 if let Some(p) = seal(link, &pt) {
                     self.emit(sess.path, sess.peer, p);
                 }
+                self.unrelay(*peer, heard);
             }
         }
+    }
+
+    /// `relay`'s link is gone (last heard from at `at`): the links it carried go
+    /// back to their slow addresses.
+    fn unrelay(&mut self, relay: PeerId, at: Instant) {
+        let mut carried = Vec::new();
+        for (&i, s) in &self.sessions {
+            if matches!(s.path, Path::Via(r) if r == relay) {
+                carried.push(i);
+            }
+        }
+        for idx in carried {
+            self.back_to_slow(idx, at);
+        }
+    }
+
+    /// Moves link `idx` off its relay back to its slow address, if it has one,
+    /// with a PING there at once. Not while relay-only.
+    fn back_to_slow(&mut self, idx: u32, at: Instant) {
+        if self.relay_only {
+            return;
+        }
+        let Some(sess) = self.sessions.get_mut(&idx) else { return };
+        if !matches!(sess.path, Path::Via(_)) {
+            return;
+        }
+        let (Some(slow), State::Live(link)) = (&sess.slow, &mut sess.state) else { return };
+        let path = Path::Direct(slow.clone());
+        link.ping_pending = true;
+        mark_ready(&mut self.ready, idx, link);
+        sess.path = path.clone();
+        sess.last_path = at;
+        sess.punch = None;
+        sess.relay_nonce = None;
+        self.events.push_back(Event::PathChanged { peer: sess.peer, path });
     }
 
     pub fn send(&mut self, peer: &PeerId, lane: Lane, data: &[u8]) -> Result<(), SendError> {
@@ -1132,8 +1282,10 @@ impl<A: Address> Endpoint<A> {
                 guess_probes: 0,
                 spray: None,
                 punch: None,
-                last_direct: now,
+                last_path: now,
                 seen_as: None,
+                slow: None,
+                relay_nonce: None,
             },
         );
         self.start_punch(now, idx);
@@ -1196,6 +1348,8 @@ impl<A: Address> Endpoint<A> {
     }
 
     fn on_data(&mut self, now: Instant, from: Path<A>, receiver: u32, nonce: u64, ciphertext: &[u8]) -> Option<u32> {
+        // Relayed by a peer that is worth relaying through (see `add_relay`).
+        let fast_from = matches!(&from, Path::Via(r) if self.fast_link(r));
         let Some(sess) = self.sessions.get_mut(&receiver) else {
             self.stats.rx_unknown_session += 1;
             return None;
@@ -1227,9 +1381,10 @@ impl<A: Address> Endpoint<A> {
         }
         let mut path_changed = false;
         let mut reflexive = None;
+        let mut offered = None;
         match (&from, &sess.path) {
             (Path::Direct(x), Path::Direct(y)) => {
-                sess.last_direct = now;
+                sess.last_path = now;
                 if x != y {
                     sess.path = from.clone();
                     self.stats.roams += 1;
@@ -1239,10 +1394,17 @@ impl<A: Address> Endpoint<A> {
             // Direct traffic on a relayed link only proves one direction; it
             // makes the address a candidate, and PUNCH_ACK decides.
             (Path::Direct(x), Path::Via(_)) => reflexive = Some(x.clone()),
-            (Path::Via(r), Path::Via(q)) if r != q => {
-                sess.path = from.clone();
-                path_changed = true;
+            (Path::Via(r), Path::Via(q)) => {
+                sess.last_path = now;
+                if r != q {
+                    sess.path = from.clone();
+                    sess.relay_nonce = None;
+                    path_changed = true;
+                }
             }
+            // Relayed while on the slow address: that relay is probed, and its
+            // PUNCH_ACK decides, as for a link given it with `add_relay`.
+            (Path::Via(r), Path::Direct(_)) if fast_from && on_slow(&sess.path, &sess.slow) => offered = Some(*r),
             // Relayed stragglers after an upgrade don't move a direct link back.
             _ => {}
         }
@@ -1255,11 +1417,15 @@ impl<A: Address> Endpoint<A> {
         let mut forwards = Vec::new();
         let mut relayed = Vec::new();
         let mut punch_acks = Vec::new();
+        let mut relay_acks = Vec::new();
         let mut upgraded = None;
+        let mut moved = None;
         let mut observed = None;
         let mut violation = false;
         let mut closed = false;
+        let mut probes_only = true;
         for f in wire::frames(&pt[..n]) {
+            probes_only &= matches!(f, Ok(Frame::Punch(_) | Frame::PunchAck(_)));
             match f {
                 // Answered with an ACK, so a silent-side probe gets a reply.
                 Ok(Frame::Ping) => link.rx.ack_pending = true,
@@ -1292,15 +1458,27 @@ impl<A: Address> Endpoint<A> {
                 Ok(Frame::Punch(t)) => {
                     if let (Some(a), false) = (&direct_from, self.relay_only && matches!(sess.path, Path::Via(_))) {
                         punch_acks.push((a.clone(), t));
-                    }
-                }
-                Ok(Frame::PunchAck(t)) => {
-                    if let (Some(a), Some(p)) = (&direct_from, &sess.punch) {
-                        if p.token == t {
-                            upgraded = Some(a.clone());
+                    } else if let Path::Via(r) = &from {
+                        // Through a relay: answered through it only if this end would
+                        // use the relay too, so the prober moves only if both ends do.
+                        let joins = (fast_from && on_slow(&sess.path, &sess.slow)) || sess.path == from;
+                        if joins && !self.relay_only {
+                            relay_acks.push((*r, t));
                         }
                     }
                 }
+                Ok(Frame::PunchAck(t)) => match (&from, &sess.punch) {
+                    (Path::Direct(a), Some(p)) if p.token == t && sess.slow.as_ref() != Some(a) => {
+                        upgraded = Some(a.clone())
+                    }
+                    // A relay probe answered through the relay: it carries both ways.
+                    (Path::Via(r), Some(p))
+                        if p.token == t && p.relays.contains(r) && fast_from && on_slow(&sess.path, &sess.slow) =>
+                    {
+                        moved = Some(*r);
+                    }
+                    _ => {}
+                },
                 Err(()) => violation = true,
             }
         }
@@ -1312,14 +1490,41 @@ impl<A: Address> Endpoint<A> {
                 self.outbox.push_back(Transmit { dst, payload: p });
             }
         }
+        let mut sealed = Vec::new();
+        for (r, token) in relay_acks {
+            let mut f = Vec::with_capacity(9);
+            wire::put_punch(&mut f, true, token);
+            if let Some(p) = seal(link, &f) {
+                sealed.push((r, p));
+            }
+        }
         if let Some(a) = upgraded {
             sess.path = Path::Direct(a);
             sess.punch = None;
             sess.guesses.clear();
             sess.spray = None;
-            sess.last_direct = now;
+            sess.last_path = now;
             self.stats.punch_succeeded += 1;
             path_changed = true;
+        }
+        if let Some(r) = moved {
+            sess.path = Path::Via(r);
+            sess.relay = Some(r);
+            sess.punch = None;
+            sess.last_path = now;
+            sess.relay_nonce = None;
+            path_changed = true;
+        }
+        // Where the peer sends from: everything but probes goes along its path.
+        let mut follow = false;
+        if !probes_only {
+            match (&from, &sess.path) {
+                (Path::Via(r), Path::Via(q)) if r == q => sess.relay_nonce = sess.relay_nonce.max(Some(nonce)),
+                (Path::Direct(x), Path::Via(_)) => {
+                    follow = sess.slow.as_ref() == Some(x) && sess.relay_nonce.is_some_and(|n| nonce > n)
+                }
+                _ => {}
+            }
         }
         if violation {
             self.stats.rx_malformed += 1;
@@ -1344,6 +1549,18 @@ impl<A: Address> Endpoint<A> {
         }
         if let Some(x) = reflexive {
             self.add_candidate(now, receiver, x);
+        }
+        for (r, ack) in sealed {
+            self.relay_out(r, &peer, ack);
+        }
+        if let Some(r) = offered {
+            self.offer_relay(now, receiver, r);
+        }
+        if moved.is_some() {
+            self.start_punch(now, receiver); // direct candidates, if any, beat the relay
+        }
+        if follow {
+            self.back_to_slow(receiver, now); // the peer went back to the slow address
         }
         for (to, packet, origin) in forwards {
             self.forward(now, receiver, &to, &packet, origin.as_ref());
@@ -1372,15 +1589,10 @@ impl<A: Address> Endpoint<A> {
     }
 
     /// Relays `packet` from the peer on link `src` to peer `to`, tagged with the
-    /// address we see the sender at (`origin`: none if it asked us not to).
+    /// address we see the sender at (`origin`: none if it asked us not to). Not
+    /// to a peer linked only over its slow address: no relay path runs over one.
     fn forward(&mut self, now: Instant, src: u32, to: &PeerId, packet: &[u8], origin: Option<&A>) {
-        let ok = self.config.relay
-            && self.sessions.get(&src).is_some_and(|s| s.peer != *to)
-            && self
-                .peers
-                .get(to)
-                .and_then(|i| self.sessions.get(i))
-                .is_some_and(|s| matches!(s.path, Path::Direct(_)) && matches!(s.state, State::Live(_)));
+        let ok = self.config.relay && self.sessions.get(&src).is_some_and(|s| s.peer != *to) && self.fast_link(to);
         if !ok || packet.len() > MAX_RELAYED_PACKET {
             self.stats.relay_dropped += 1;
             return;
@@ -1454,6 +1666,9 @@ impl<A: Address> Endpoint<A> {
             if let Some(reason) = reason {
                 self.events.push_back(Event::Disconnected { peer: sess.peer, reason });
             }
+            if let State::Live(link) = &sess.state {
+                self.unrelay(sess.peer, link.last_recv);
+            }
         }
     }
 
@@ -1463,6 +1678,7 @@ impl<A: Address> Endpoint<A> {
         let mut expired = Vec::new();
         let mut resend = Vec::new();
         let mut fallbacks = Vec::new();
+        let mut unrelayed = Vec::new();
         let spray = self.config.punch_spray as i32;
         for (&idx, sess) in self.sessions.iter_mut() {
             if let Some(s) = sess.spray.as_mut().filter(|s| now >= s.next_at) {
@@ -1520,11 +1736,21 @@ impl<A: Address> Endpoint<A> {
                             p.next_at = now + self.config.punch_interval;
                             let mut f = Vec::with_capacity(9);
                             wire::put_punch(&mut f, false, p.token);
+                            if p.round % RELAY_ROUNDS == 0 {
+                                for &r in &p.relays {
+                                    if let Some(payload) = seal(link, &f) {
+                                        resend.push((Path::Via(r), sess.peer, payload));
+                                    }
+                                }
+                            }
                             let probe = p.round % GUESS_ROUNDS == 0 && sess.guess_probes > 0;
                             let guessed = if probe { &sess.guesses[..] } else { &[] };
                             sess.guess_probes -= probe as u32;
                             p.round += 1;
-                            let sprayed = sess.candidates.iter().flat_map(|c| {
+                            // Direct candidates are punched only while relayed.
+                            let relayed = matches!(sess.path, Path::Via(_));
+                            let candidates = if relayed { &sess.candidates[..] } else { &[] };
+                            let sprayed = candidates.iter().flat_map(|c| {
                                 std::iter::once(Some(c.clone())).chain((1..=spray).map(|k| c.port_offset(k))).flatten()
                             });
                             for dst in sprayed.chain(guessed.iter().cloned()) {
@@ -1547,8 +1773,15 @@ impl<A: Address> Endpoint<A> {
                         continue;
                     }
                     if let (Path::Direct(_), Some(_)) = (&sess.path, sess.relay) {
-                        if now >= sess.last_direct + self.config.direct_timeout {
+                        if now >= sess.last_path + self.config.direct_timeout {
                             fallbacks.push(idx);
+                        }
+                    }
+                    // A relay that carries nothing from the peer: back to the slow address
+                    // before `idle_timeout` would drop the link.
+                    if let (Path::Via(_), Some(_), false) = (&sess.path, &sess.slow, self.relay_only) {
+                        if now >= sess.last_path + self.config.direct_timeout {
+                            unrelayed.push(idx);
                         }
                     }
                     if !link.confirmed && now >= link.confirm_at {
@@ -1575,15 +1808,17 @@ impl<A: Address> Endpoint<A> {
             let Some(sess) = self.sessions.get_mut(&idx) else { continue };
             let Some(relay) = sess.relay else { continue };
             if !self.peers.contains_key(&relay) {
-                sess.last_direct = now; // no relay to fall back to; check again later
+                sess.last_path = now; // no relay to fall back to; check again later
                 continue;
             }
             if let Path::Direct(old) = std::mem::replace(&mut sess.path, Path::Via(relay)) {
-                if !sess.candidates.contains(&old) {
+                if !sess.candidates.contains(&old) && sess.slow.as_ref() != Some(&old) {
                     sess.candidates.insert(0, old);
                     sess.candidates.truncate(self.config.max_candidates);
                 }
             }
+            sess.last_path = now;
+            sess.relay_nonce = None;
             if let State::Live(link) = &mut sess.state {
                 link.ping_pending = true;
                 mark_ready(&mut self.ready, idx, link);
@@ -1592,6 +1827,9 @@ impl<A: Address> Endpoint<A> {
             self.stats.direct_fallbacks += 1;
             self.events.push_back(Event::PathChanged { peer, path: Path::Via(relay) });
             self.start_punch(now, idx);
+        }
+        for idx in unrelayed {
+            self.back_to_slow(idx, now);
         }
         for idx in failed_dials {
             if let Some(sess) = self.sessions.remove(&idx) {
@@ -1632,7 +1870,10 @@ impl<A: Address> Endpoint<A> {
                         min(d);
                     }
                     if let (Path::Direct(_), Some(_)) = (&sess.path, sess.relay) {
-                        min(sess.last_direct + self.config.direct_timeout);
+                        min(sess.last_path + self.config.direct_timeout);
+                    }
+                    if let (Path::Via(_), Some(_), false) = (&sess.path, &sess.slow, self.relay_only) {
+                        min(sess.last_path + self.config.direct_timeout);
                     }
                 }
             }
@@ -1836,6 +2077,16 @@ mod tests {
     /// every 10 ms, delivering every datagram between them except those to
     /// `down`; returns each datagram sent as (sender index, destination).
     fn route(eps: &mut [Endpoint<u32>], t: &mut Instant, ms: u64, down: Option<u32>) -> Vec<(usize, u32)> {
+        route_with(eps, t, ms, |_, dst| Some(dst) == down)
+    }
+
+    /// As `route`, losing every datagram for which `lost(sender index, destination)` holds.
+    fn route_with(
+        eps: &mut [Endpoint<u32>],
+        t: &mut Instant,
+        ms: u64,
+        lost: impl Fn(usize, u32) -> bool,
+    ) -> Vec<(usize, u32)> {
         let mut sent = Vec::new();
         for _ in 0..ms / 10 {
             for _ in 0..100 {
@@ -1845,7 +2096,7 @@ mod tests {
                     for tx in out {
                         quiet = false;
                         sent.push((i, tx.dst));
-                        let to = (Some(tx.dst) != down).then(|| (tx.dst as usize).checked_sub(1)).flatten();
+                        let to = (!lost(i, tx.dst)).then(|| (tx.dst as usize).checked_sub(1)).flatten();
                         if let Some(ep) = to.and_then(|j| eps.get_mut(j)) {
                             ep.handle_datagram(*t, i as u32 + 1, &tx.payload);
                         }
@@ -1926,5 +2177,203 @@ mod tests {
         route(&mut eps, &mut t, 1000, None);
         assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)));
         assert_eq!(eps[0].stats().rx_handshake_dropped, 0);
+    }
+
+    /// a, b and c at addresses 1, 2 and 3, all linked directly, a and b marking
+    /// each other's address slow as a room marks its signalling pipe; their
+    /// events so far drained.
+    fn slow_trio(t: &mut Instant) -> (Vec<Endpoint<u32>>, [PeerId; 3]) {
+        let ids: Vec<Identity> = (1..=3u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let p = [ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id()];
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        eps[0].connect(*t, 2, p[1]).unwrap();
+        eps[2].connect(*t, 1, p[0]).unwrap();
+        eps[2].connect(*t, 2, p[1]).unwrap();
+        route(&mut eps, t, 200, None);
+        assert!(eps[0].is_connected(&p[1]) && eps[2].is_connected(&p[0]) && eps[2].is_connected(&p[1]));
+        eps[0].set_slow(&p[1], Some(2));
+        eps[1].set_slow(&p[0], Some(1));
+        for ep in eps.iter_mut() {
+            events(ep);
+        }
+        (eps, p)
+    }
+
+    /// The events `ep` emitted since the last call.
+    fn events(ep: &mut Endpoint<u32>) -> Vec<Event<u32>> {
+        std::iter::from_fn(|| ep.poll_event()).collect()
+    }
+
+    /// Sends a message each way between `eps[0]` and `eps[1]`; whether both arrive.
+    fn both_ways(
+        eps: &mut [Endpoint<u32>],
+        p: &[PeerId; 3],
+        t: &mut Instant,
+        lost: impl Fn(usize, u32) -> bool,
+    ) -> bool {
+        eps[0].send(&p[1], Lane::Reliable, b"to b").unwrap();
+        eps[1].send(&p[0], Lane::Reliable, b"to a").unwrap();
+        route_with(eps, t, 500, lost);
+        let mut got = |i: usize, from: PeerId| {
+            events(&mut eps[i]).into_iter().any(|e| matches!(e, Event::Message { peer, .. } if peer == from))
+        };
+        got(1, p[0]) & got(0, p[1])
+    }
+
+    /// A link on its slow address moves to a relay offered with `add_relay` once
+    /// a probe through it is answered, at both ends (b probes back when a's probe
+    /// reaches it), and goes back to the slow address as soon as the relay's link
+    /// closes: the same link throughout, with only `PathChanged` events.
+    #[test]
+    fn slow_link_moves_to_an_answering_relay_and_back_when_it_closes() {
+        let mut t = Instant::from_millis(1);
+        let (mut eps, p) = slow_trio(&mut t);
+        let [a, b, c] = p;
+        eps[0].add_relay(t, c, &b);
+        route(&mut eps, &mut t, 500, None);
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(c)));
+        assert_eq!(eps[1].path(&a), Some(&Path::Via(c)));
+        assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Via(c) }]);
+        assert_eq!(events(&mut eps[1]), vec![Event::PathChanged { peer: a, path: Path::Via(c) }]);
+        eps[0].add_candidates(t, &b, &[2]); // its slow address: never punched to
+        let relayed = eps[2].stats().relayed;
+        assert!(both_ways(&mut eps, &p, &mut t, |_, _| false));
+        assert!(eps[2].stats().relayed > relayed, "the messages went through c");
+        assert_eq!(eps[0].stats().punches_sent, 0);
+
+        eps[2].disconnect(&a);
+        eps[2].disconnect(&b);
+        route(&mut eps, &mut t, 100, None);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)));
+        assert_eq!(eps[1].path(&a), Some(&Path::Direct(1)));
+        let closed = Event::Disconnected { peer: c, reason: DisconnectReason::ClosedByPeer };
+        assert_eq!(events(&mut eps[0]), vec![closed.clone(), Event::PathChanged { peer: b, path: Path::Direct(2) }]);
+        assert_eq!(events(&mut eps[1]), vec![closed, Event::PathChanged { peer: a, path: Path::Direct(1) }]);
+        let relayed = eps[2].stats().relayed;
+        assert!(both_ways(&mut eps, &p, &mut t, |_, _| false));
+        assert_eq!(eps[2].stats().relayed, relayed);
+    }
+
+    /// A relay path that works one way moves nothing: a's probes through c reach
+    /// b, but nothing from c reaches a, so neither b's answers nor b's own probes
+    /// do, and b, which had a's relayed packets, stays on its slow address too.
+    #[test]
+    fn a_one_way_relay_moves_no_link() {
+        let mut t = Instant::from_millis(1);
+        let (mut eps, p) = slow_trio(&mut t);
+        let [a, b, c] = p;
+        eps[0].add_relay(t, c, &b);
+        route_with(&mut eps, &mut t, 6000, |i, dst| i == 2 && dst == 1);
+        // a's probes, b's answers and b's own probes, each every half second.
+        assert!(eps[2].stats().relayed >= 20, "{:?}", eps[2].stats());
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)));
+        assert_eq!(eps[1].path(&a), Some(&Path::Direct(1)));
+        assert_eq!(events(&mut eps[0]), vec![]);
+        assert_eq!(events(&mut eps[1]), vec![]);
+    }
+
+    /// A relay that falls silent (it crashed, say) hands the link back to the slow
+    /// address after `direct_timeout`, before `idle_timeout` would drop the link.
+    #[test]
+    fn a_silent_relay_hands_the_link_back_to_the_slow_address() {
+        let mut t = Instant::from_millis(1);
+        let (mut eps, p) = slow_trio(&mut t);
+        let [a, b, c] = p;
+        eps[0].add_relay(t, c, &b);
+        route(&mut eps, &mut t, 500, None);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        events(&mut eps[0]);
+        events(&mut eps[1]);
+        let c_down = |i: usize, dst: u32| i == 2 || dst == 3;
+        route_with(&mut eps, &mut t, 13_000, c_down);
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(c)), "not before direct_timeout");
+        route_with(&mut eps, &mut t, 3_000, c_down);
+        assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Direct(2) }]);
+        assert_eq!(events(&mut eps[1]), vec![Event::PathChanged { peer: a, path: Path::Direct(1) }]);
+        assert!(both_ways(&mut eps, &p, &mut t, c_down));
+    }
+
+    /// A relay that closes its link to one end only (its close to the other end
+    /// lost, say): that end goes back to the slow address, and the other follows
+    /// as soon as the peer's traffic comes over it, newer than any through the
+    /// relay, rather than after `direct_timeout`.
+    #[test]
+    fn the_other_end_follows_its_peer_back_to_the_slow_address() {
+        let mut t = Instant::from_millis(1);
+        let (mut eps, p) = slow_trio(&mut t);
+        let [a, b, c] = p;
+        eps[0].add_relay(t, c, &b);
+        route(&mut eps, &mut t, 500, None);
+        assert!(both_ways(&mut eps, &p, &mut t, |_, _| false), "through c, each end's traffic");
+        events(&mut eps[0]);
+        events(&mut eps[1]);
+        eps[2].disconnect(&a);
+        route(&mut eps, &mut t, 100, None);
+        assert_eq!(eps[0].path(&b), Some(&Path::Direct(2)));
+        assert_eq!(events(&mut eps[1]), vec![Event::PathChanged { peer: a, path: Path::Direct(1) }]);
+        assert!(eps[1].is_connected(&c), "b heard nothing from c");
+        assert!(both_ways(&mut eps, &p, &mut t, |_, _| false));
+    }
+
+    /// While a has moved to c and b, whose own probes are lost, is still on its
+    /// slow address, b's traffic comes to a over the slow address: a stays on c,
+    /// since none of b's traffic has come through c yet (b never was there).
+    #[test]
+    fn traffic_over_the_slow_address_before_the_peer_moved_leaves_the_relay() {
+        let mut t = Instant::from_millis(1);
+        let (mut eps, p) = slow_trio(&mut t);
+        let [a, b, c] = p;
+        eps[0].add_relay(t, c, &b);
+        // b to c: the first datagram, b's answer to a's probe, goes; b's own probes don't.
+        let n = std::cell::Cell::new(0);
+        let lost = |i: usize, dst: u32| i == 1 && dst == 3 && n.replace(n.get() + 1) > 0;
+        route_with(&mut eps, &mut t, 300, lost);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Direct(1))));
+        eps[1].send(&a, Lane::Reliable, b"over the slow address").unwrap();
+        route_with(&mut eps, &mut t, 300, lost);
+        let got = events(&mut eps[0]);
+        assert!(got.iter().any(|e| matches!(e, Event::Message { peer, .. } if *peer == b)), "{got:?}");
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(c)));
+    }
+
+    /// Moves that never happen: on a path that isn't slow `add_relay` probes
+    /// nothing; a relay-only end neither takes a relay nor answers a probe through
+    /// one, so its peer stays put too; and a relay forwards nothing to a peer it
+    /// reaches only over that peer's slow address.
+    #[test]
+    fn no_move_off_a_fast_path_while_relay_only_or_onto_a_slow_relay_leg() {
+        let mut t = Instant::from_millis(1);
+        let still = |eps: &mut [Endpoint<u32>], p: &[PeerId; 3]| {
+            assert_eq!(eps[0].path(&p[1]), Some(&Path::Direct(2)));
+            assert_eq!(eps[1].path(&p[0]), Some(&Path::Direct(1)));
+            assert_eq!(events(&mut eps[0]), vec![]);
+            assert_eq!(events(&mut eps[1]), vec![]);
+        };
+        let (mut eps, p) = slow_trio(&mut t);
+        eps[0].set_slow(&p[1], None);
+        eps[0].add_relay(t, p[2], &p[1]);
+        eps[1].add_relay(t, p[2], &p[0]); // and a, not on a slow address, doesn't answer b's probes
+        let sent = route(&mut eps, &mut t, 6000, None);
+        assert!(eps[2].stats().relayed >= 10, "b's probes went through c");
+        assert!(!sent.contains(&(0, 3)), "a sent nothing through c");
+        still(&mut eps, &p);
+
+        let (mut eps, p) = slow_trio(&mut t);
+        eps[0].add_relay(t, p[2], &p[1]); // a probe under way stops
+        eps[0].set_relay_only(true);
+        eps[0].add_relay(t, p[2], &p[1]);
+        eps[1].add_relay(t, p[2], &p[0]);
+        route(&mut eps, &mut t, 6000, None);
+        assert!(eps[2].stats().relayed >= 10, "b's probes went through c");
+        still(&mut eps, &p);
+
+        let (mut eps, p) = slow_trio(&mut t);
+        eps[2].set_slow(&p[1], Some(2));
+        eps[0].add_relay(t, p[2], &p[1]);
+        route(&mut eps, &mut t, 6000, None);
+        assert_eq!(eps[2].stats().relayed, 0);
+        assert!(eps[2].stats().relay_dropped >= 10, "a's probes stopped at c");
+        still(&mut eps, &p);
     }
 }
