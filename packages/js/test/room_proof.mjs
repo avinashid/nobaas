@@ -8,7 +8,8 @@
 //   the link at once and no proof drops it after Room.proofMs.
 // Also checks the hello proof against an independent HMAC built the way
 // traversal.rs builds Rust's, so the two stay compatible, and that a room whose
-// own link proof is signed late still joins on both sides.
+// own link proof is signed late still joins on both sides, but not if the link is
+// lost before that proof is sent.
 //
 //   node packages/js/test/room_proof.mjs
 import { createHash, createHmac } from 'node:crypto';
@@ -167,9 +168,42 @@ await until('messages both ways', () => heard.length === 2, 3000);
 if (d.getPresence(c.self)?.name !== 'cy' || c.getPresence(d.self)?.name !== 'di') fail('presence after a late link proof');
 console.log("a link proof signed after the peer's is checked: presence still follows it, both sides join and talk");
 
+//    The link is lost once the peer's proof is checked but while ours is still being
+//    signed: when the signing ends, that stale check must not mark the peer proven (a
+//    later link from it would skip the check) nor replay its held frames.
+const lostOpts = { appId: 'peerwire-test', roomId: `proof-lost-${process.pid}` };
+const e = await joinRoom({ ...lostOpts, presence: { name: 'ed' } });
+let release;
+const signing = new Promise((r) => (release = r));
+const signE = e.proof.pair.bind(e.proof);
+e.proof.pair = async (label, ...rest) => {
+  if (label === 'pw-link') await signing;
+  return signE(label, ...rest);
+};
+let checked = false;
+const checkE = e.proof.checkPair.bind(e.proof);
+e.proof.checkPair = async (...args) => {
+  const ok = await checkE(...args);
+  if (args[0] === 'pw-link' && ok) checked = true;
+  return ok;
+};
+const lostJoins = [];
+e.on('peer-join', (peer) => lostJoins.push(peer));
+const f = await joinRoom({ ...lostOpts, presence: { name: 'fa' } });
+await until("the peer's link proof to be checked", () => checked, 3000);
+if (!e.proving.has(f.self) || e.proven.has(f.self)) fail('the peer should still wait for our proof here');
+const sent = e.proofSent.get(f.self);
+e.onEvent({ type: 'disconnected', peer: f.self, reason: 'timeout' });
+release();
+await sent;
+await sleep(50);
+if (e.proven.has(f.self)) fail('a link lost while our proof was signed left the peer proven');
+if (lostJoins.length || e.peers.length) fail(`a link lost while our proof was signed still joined the peer (${lostJoins.length} peer-join)`);
+console.log('a link lost while our proof is signed: the peer stays unproven, no peer-join');
+
 sig2.close();
 lt.close();
 ep.close();
-await Promise.all([a.leave(), b.leave(), victim.leave(), c.leave(), d.leave()]);
+await Promise.all([a.leave(), b.leave(), victim.leave(), c.leave(), d.leave(), e.leave(), f.leave()]);
 console.log('room_proof: ok');
 process.exit(0);
