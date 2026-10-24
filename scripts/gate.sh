@@ -6,7 +6,7 @@
 #   scripts/gate.sh --quick     skip the browser tests: an author's run before handing a branch over (see AGENTS.md)
 #   scripts/gate.sh --strict    clippy with -D warnings, and the fuzz tests again in a debug build (overflow checks):
 #                               the lead's one full run on the merged main, before a push
-#   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch relay.damus.io, nos.lol, relay.primal.net,
+#   scripts/gate.sh --nostr     also run the public-relay Nostr tests, JS and Rust (touch nos.lol, relay.primal.net, nostr.mom,
 #                               public STUN)
 #   scripts/gate.sh --full      run the Rust steps (tests, clippy, fmt, fuzz) even when no Rust changed: they are
 #                               skipped when every file changed since GATE_BASE is JS, docs or another non-Rust path

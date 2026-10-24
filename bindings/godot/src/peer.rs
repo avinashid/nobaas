@@ -56,7 +56,7 @@ impl PeerwireMultiplayerPeer {
     }
 
     /// Nostr relays (`wss://…`, or `ws://…` on a LAN) peers swap addresses through,
-    /// from the next `host` / `join`. Default: relay.damus.io, nos.lol and relay.primal.net. Empty: no
+    /// from the next `host` / `join`. Default: nos.lol, relay.primal.net and nostr.mom. Empty: no
     /// signaling, so no rooms, and invites work only where the host is reachable.
     #[func]
     fn set_signaling_relays(&mut self, relays: PackedStringArray) {

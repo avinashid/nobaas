@@ -65,7 +65,7 @@ From there everything is standard Godot: `peer_connected` / `peer_disconnected`,
 | `get_connect_error() -> String` | After `connection_failed`: `symmetric` (one side's NAT is symmetric and the other's router filters by port, so punching can't work, and no relay peer linked to both carried the link), `unreachable`, or `""` |
 | `get_connect_error_message() -> String` | After `connection_failed`: the reason as a sentence to show the player, naming the symmetric side; `""` if nothing failed |
 | `set_stun_servers(PackedStringArray)` | `host:port` list, from the next host/join. Default Google + Cloudflare; empty: off |
-| `set_signaling_relays(PackedStringArray)` | Nostr relay URLs, from the next host/join. Default `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.primal.net`; empty: off |
+| `set_signaling_relays(PackedStringArray)` | Nostr relay URLs, from the next host/join. Default `wss://nos.lol`, `wss://relay.primal.net`, `wss://nostr.mom`; empty: off |
 | `set_privacy_mode(mode: int)` | Which addresses this peer gives out: `PRIVACY_DIRECT` (default), `PRIVACY_PUBLIC_ONLY`, `PRIVACY_RELAY_ONLY`. From the next host/join, and for the running session's next invites and offers; links already up are kept, except a relay-only joiner's [relay peer](#relay-peers) links. See [Privacy](#privacy) |
 | `get_privacy_mode() -> int` | The mode set |
 | `set_port_mapping(on: bool)` | Ask the router to forward this peer's UDP port (PCP, NAT-PMP or UPnP), from the next host/join. **Off by default**; it opens a port on the player's router. See [Router port mapping](#router-port-mapping) |
@@ -260,7 +260,7 @@ read or changed on the way. Everything Godot does with those bytes is outside th
   - **Close the door.** Set `refuse_new_connections` once everyone is in (a refusing host also stops announcing
     its room), or kick with `disconnect_peer()`.
 - **Third parties by default.** With the defaults, `host*()` and `join*()` contact Google's and Cloudflare's STUN
-  servers (they learn your public IP and that you run Peerwire) and the Nostr relays `relay.damus.io`, `nos.lol` and `relay.primal.net`.
+  servers (they learn your public IP and that you run Peerwire) and the Nostr relays `nos.lol`, `relay.primal.net` and `nostr.mom`.
   Relays see the room topic (a SHA-256 of `peerwire/room/<app id>/<room>`, so anyone who knows or guesses the name
   can watch who announces in it, and when), each peer's topic (a hash of its public key), your IP and the timing
   of messages. They never see addresses or anything else in an offer: offers are sealed to the recipient's key
