@@ -1282,13 +1282,17 @@ mod tests {
         let (gw, asked) = fake_pcp_gateway();
         let at = NetOptions { portmap_at: Some((gw, "127.0.0.1:9".parse().unwrap())), ..on };
         let mut s = Session::host(at.bind("127.0.0.1:0").unwrap());
-        assert_eq!(port_mapping_info(s.port_mapping()).0, "trying");
+        // Asking the gateway, or already mapped: bind polls once (set_relay_peers),
+        // and a busy host can let the worker get the answer first.
+        let mapped = ("mapped", String::from("203.0.113.7:41000"), "pcp");
+        let info = port_mapping_info(s.port_mapping());
+        assert!(info.0 == "trying" || info == mapped, "{info:?}");
         let end = Instant::now() + Duration::from_secs(5);
         while s.port_mapping().addr().is_none() && Instant::now() < end {
             s.poll();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(port_mapping_info(s.port_mapping()), ("mapped", "203.0.113.7:41000".into(), "pcp"));
+        assert_eq!(port_mapping_info(s.port_mapping()), mapped);
         let inv = Invite::<SocketAddr>::parse(&s.invite()).unwrap();
         assert!(inv.addrs.contains(&"203.0.113.7:41000".parse().unwrap()));
         drop(s);
