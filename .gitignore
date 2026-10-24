@@ -1,5 +1,7 @@
 target/
 packages/js/pkg/
+packages/react/dist/
+packages/react/example/dist/
 node_modules/
 *.png
 tasks/
