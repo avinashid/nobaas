@@ -291,6 +291,9 @@ Run these with Node and the Playwright install on this host:
 - `node packages/js/test/room_leave.mjs`: a room leaving with a full send window reaches
   its peers at once, before `leave()` returns; with the Bye lost, the core's close still does;
   the `pagehide` handler holds the page 20 ms after it, only if it had peers.
+- `node packages/js/test/room_welcome.mjs`: a message a `peer-join` handler sends to the
+  newcomer reaches it, also when the newcomer's presence came while its link proof was
+  being checked (forced in 20 joins); 200 two-member joins and 30 third members lose none.
 - `node packages/js/test/room_throttled.mjs --ab=<other packages/js>`: benchmark, not a test.
   Room send throughput when the sender's timers are throttled like a background tab's.
 - `node packages/js/test/crew.mjs [tabs=4] [shot-prefix]`: plays `demo/crew.html` in four tabs: a kill,

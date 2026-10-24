@@ -60,6 +60,7 @@ NODE=(
   "node room drain|node packages/js/test/room_drain.mjs"
   "node fuzz|node packages/js/test/fuzz.mjs"
   "node room leave|node packages/js/test/room_leave.mjs"
+  "node room welcome|node packages/js/test/room_welcome.mjs"
   "node room fallback|node packages/js/test/room_fallback.mjs"
   "node room adopt|node packages/js/test/room_adopt.mjs"
   "node room same nat|node packages/js/test/room_same_nat.mjs"

@@ -49,7 +49,8 @@ const PROOF_MS = 10000;
 // In a fallback, members get this long to relay a peer before signalling, the
 // slowest path, joins the dial.
 const PEER_FIRST_MS = 1000;
-// Frames held from one peer while its link proof is checked.
+// Frames held from one peer while its link proof is checked (and until our presence
+// has gone to it).
 const MAX_HELD = 256;
 // How long a pagehide handler that said goodbye holds the page. The browser may end
 // the renderer as soon as the handler returns, before its WebRTC thread has put the
@@ -424,7 +425,7 @@ export class Room {
   }
 
   // A frame from a peer that hasn't proved the room key: only its proof (or a
-  // goodbye) is acted on, and what follows the proof waits for the check.
+  // goodbye) is acted on, and what follows the proof waits for the check and our presence.
   unproven(peer, tag, body, data, lane) {
     const held = this.proving.get(peer);
     if (held) {
@@ -438,19 +439,23 @@ export class Room {
     this.proof.checkPair('pw-link', peer, this.self, toHex(body)).then((ok) => {
       // Lost (and maybe linked again) meanwhile: this check is stale.
       if (this.left || this.proving.get(peer) !== rest) return;
-      this.proving.delete(peer);
       if (!ok) return this.lost(peer, 'unproven');
-      clearTimeout(this.deadlines.get(peer));
-      this.deadlines.delete(peer);
-      this.proven.add(peer);
-      this.relayPending(peer);
       // Our presence goes after our own proof, or the peer drops it as unproven and never
       // lists us: signing that proof can finish after this check (WebCrypto keeps no order).
-      const sent = this.proofSent.get(peer);
-      sent.then(() => {
-        if (this.proven.has(peer) && this.proofSent.get(peer) === sent) this.write(peer, frame(T.Presence, enc.encode(JSON.stringify(this.me))), Lane.Reliable);
+      // The held frames go after our presence, and frames keep being held until then: a
+      // peer-join handler that sends to the peer must reach it after our presence, or the
+      // peer drops that as from a peer that hasn't joined. Should our proof never be sent,
+      // the peer stays unproven and the deadline drops it.
+      this.proofSent.get(peer).then(() => {
+        if (this.left || this.proving.get(peer) !== rest) return;
+        this.proving.delete(peer);
+        clearTimeout(this.deadlines.get(peer));
+        this.deadlines.delete(peer);
+        this.proven.add(peer);
+        this.relayPending(peer);
+        this.write(peer, frame(T.Presence, enc.encode(JSON.stringify(this.me))), Lane.Reliable);
+        for (const [d, l] of rest) this.onMessage(peer, d, l);
       });
-      for (const [d, l] of rest) this.onMessage(peer, d, l);
     });
   }
 
