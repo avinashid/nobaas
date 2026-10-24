@@ -328,11 +328,12 @@ impl RelSend {
     /// path it went out on lost it.
     pub(crate) fn resend_all(&mut self, now: Instant) {
         for st in &mut self.streams {
-            let Stream { inflight, by_due, .. } = st;
-            for (&seq, f) in inflight.iter_mut() {
-                if f.due > now {
-                    by_due.remove(&(f.due, seq));
-                    by_due.insert((now, seq));
+            let Some((&lo, _)) = st.inflight.first_key_value() else { continue };
+            // Not inflight.iter_mut(): the seqs in flight are all in here, and this is smaller in wasm.
+            for seq in lo..st.sent_end {
+                if let Some(f) = st.inflight.get_mut(&seq).filter(|f| f.due > now) {
+                    st.by_due.remove(&(f.due, seq));
+                    st.by_due.insert((now, seq));
                     f.due = now;
                 }
             }

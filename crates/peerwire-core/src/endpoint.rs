@@ -526,8 +526,13 @@ impl<A: Address> Session<A> {
             Some(i) => i,
             None => {
                 if self.held.len() >= MAX_RELAYS {
-                    let first = (0..self.held.len()).min_by_key(|&j| self.held[j].until).unwrap_or(0);
-                    self.held.swap_remove(first); // the one that runs out first
+                    let mut first = 0; // the one that runs out first
+                    for j in 1..self.held.len() {
+                        if self.held[j].until < self.held[first].until {
+                            first = j;
+                        }
+                    }
+                    self.held.swap_remove(first);
                 }
                 self.held.push(Hold { relay, until: now, strikes: 0 });
                 self.held.len() - 1
@@ -2609,6 +2614,58 @@ mod tests {
         route(&mut eps, &mut t, 500, None);
         assert_eq!(paths(&eps), (Some(Path::Via(c)), Some(Path::Via(c))));
         assert!(!dropped(&events(&mut eps[0])) && !dropped(&events(&mut eps[1])));
+    }
+
+    /// The stall is timed from the move onto the relay at the earliest: data stuck
+    /// on the slow address before the move, its retries far apart by then, gets
+    /// `RELAY_STALL` on the relay, and goes through there.
+    #[test]
+    fn a_stall_is_timed_from_the_move_onto_the_relay() {
+        let mut t = Instant::from_millis(1);
+        let (mut eps, p) = slow_trio(&mut t);
+        let [a, b, c] = p;
+        let pipe_down = |i: usize, dst: u32| i == 0 && dst == 2;
+        eps[0].send(&b, Lane::Reliable, &[5; 400]).unwrap();
+        route_with(&mut eps, &mut t, 4_000, pipe_down);
+        eps[0].add_relay(t, c, &b);
+        route_with(&mut eps, &mut t, 500, pipe_down);
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(c)), Some(&Path::Via(c))));
+        events(&mut eps[0]);
+        route_with(&mut eps, &mut t, 4_000, pipe_down);
+        assert_eq!(eps[0].path(&b), Some(&Path::Via(c)), "not given up 5 s after the data went out");
+        assert_eq!(events(&mut eps[0]), vec![]);
+        let got = events(&mut eps[1]);
+        let message = Event::Message { peer: a, lane: Lane::Reliable, data: vec![5; 400] };
+        assert!(got.contains(&message), "through c: {got:?}");
+    }
+
+    /// A relay the link holds off isn't roamed to either. b offers c, which a
+    /// holds off, a offers d: both move to d, and b's probe through c, sent after
+    /// a moved, doesn't take a's link onto c.
+    #[test]
+    fn a_held_relay_is_not_roamed_to() {
+        let ids: Vec<Identity> = (1..=4u8).map(|i| Identity::from_secret_bytes(&[i; 32])).collect();
+        let (a, b, c, d) = (ids[0].peer_id(), ids[1].peer_id(), ids[2].peer_id(), ids[3].peer_id());
+        let mut eps: Vec<Endpoint<u32>> =
+            ids.iter().zip(1u8..).map(|(id, s)| Endpoint::new(id, Config::default(), [s; 32])).collect();
+        let mut t = Instant::from_millis(1);
+        eps[0].connect(t, 2, b).unwrap();
+        for r in [2, 3] {
+            eps[r].connect(t, 1, a).unwrap();
+            eps[r].connect(t, 2, b).unwrap();
+        }
+        route(&mut eps, &mut t, 200, None);
+        eps[0].set_slow(&b, Some(2));
+        eps[1].set_slow(&a, Some(1));
+        events(&mut eps[0]);
+        let idx = eps[0].peers[&b];
+        eps[0].sessions.get_mut(&idx).unwrap().hold(c, t);
+        eps[1].add_relay(t, c, &a);
+        eps[0].add_relay(t, d, &b);
+        let sent = route(&mut eps, &mut t, 2_000, None);
+        assert!(sent.iter().filter(|&&(i, dst)| i == 2 && dst == 1).count() >= 2, "c relayed b's probes to a");
+        assert_eq!((eps[0].path(&b), eps[1].path(&a)), (Some(&Path::Via(d)), Some(&Path::Via(d))));
+        assert_eq!(events(&mut eps[0]), vec![Event::PathChanged { peer: b, path: Path::Via(d) }]);
     }
 
     /// Each stall by the same relay doubles its hold, up to 16 times `RELAY_HOLD`;
