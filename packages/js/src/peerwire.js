@@ -13,15 +13,21 @@ const WOULD_BLOCK = -3;
 // Each endpoint keeps a send buffer this size; bigger messages get a buffer of their own.
 const SEND_SCRATCH = 16 * 1024;
 const encoder = new TextEncoder();
+const IN_NODE = typeof globalThis.process?.versions?.node === 'string';
 
+// Only Node reads from disk: file: URLs and absolute paths. Anything else is fetched, and in a
+// browser that includes root-relative paths such as the '/assets/…wasm' bundlers emit.
 export async function loadPeerwire(source) {
   let bytes;
   if (typeof source === 'string' || source instanceof URL) {
-    if (typeof fetch === 'function' && !String(source).startsWith('file:') && !String(source).startsWith('/')) {
-      bytes = await (await fetch(source)).arrayBuffer();
-    } else {
+    const s = String(source);
+    if (IN_NODE && (s.startsWith('file:') || s.startsWith('/'))) {
       const { readFile } = await import('node:fs/promises');
-      bytes = await readFile(source);
+      bytes = await readFile(s.startsWith('file:') ? new URL(s) : s);
+    } else {
+      const res = await fetch(source);
+      if (!res.ok) throw new Error(`loadPeerwire: ${s}: HTTP ${res.status}`);
+      bytes = await res.arrayBuffer();
     }
   } else {
     bytes = source;

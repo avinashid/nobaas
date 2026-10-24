@@ -246,6 +246,8 @@ What the fallback reveals:
 Run these with Node and the Playwright install on this host:
 
 - `node packages/js/test/node_pair.mjs`: two endpoints in Node, checks the glue.
+- `node packages/js/test/wasm_source.mjs`: where `loadPeerwire` reads the module from in Node: an
+  absolute path or `file:` URL from disk, an `http:` URL by fetch (a 404 rejects with its status).
 - `node packages/js/test/privacy.mjs`: host-candidate filtering, and a relay-only
   endpoint linking through a relay and refusing a direct dial.
 - `node packages/js/test/room_node.mjs`: `joinRoom` with three peers in Node: presence,
@@ -339,6 +341,9 @@ Run these with Node and the Playwright install on this host:
   answer from the peer is ignored: one fleet, all of it closed at the end.
 - `node packages/js/test/readme.mjs [shot-prefix]`: runs the README chat above in two
   tabs and checks a message gets across.
+- `node packages/js/test/wasm_url.mjs [shot-prefix]`: two tabs join with a root-relative `wasm`
+  (`'/pkg/peerwire_ffi.wasm'`, the kind of URL a bundler's `?url` import gives) and chat; relative and
+  absolute URLs load, and a 404 rejects with its status.
 - `node packages/js/test/poll.mjs [tabs] [shot.png]`: the pull-style demo in tabs;
   every tab must see every other, and a closed tab must leave.
 - `node packages/js/test/leave.mjs [--runs=10] [--stress=N] [--crash=1]`: closes a streaming
