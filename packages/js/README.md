@@ -117,7 +117,9 @@ Types are in `src/index.d.ts`.
 
 ## Using with React
 
-Join in an effect and leave in its cleanup, so the room lives as long as the component:
+[`@peerwire/react`](../react/README.md) does all of this for you, with TypeScript types: `<RoomProvider>`, and
+hooks for members, messages, shared state and per-peer values that check what other members send. To write your
+own hook instead, join in an effect and leave in its cleanup, so the room lives as long as the component:
 
 ```jsx
 import { useEffect, useState } from 'react';
