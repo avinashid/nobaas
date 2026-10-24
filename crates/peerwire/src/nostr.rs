@@ -26,7 +26,7 @@ use tungstenite::Message;
 /// Ephemeral event kind used by Peerwire signaling.
 pub const KIND: u64 = 25059;
 /// Relays [`NostrSignaling::default`] connects to.
-pub const DEFAULT_RELAYS: &[&str] = &["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"];
+pub const DEFAULT_RELAYS: &[&str] = &["wss://nos.lol", "wss://relay.primal.net", "wss://nostr.mom"];
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a relay thread blocks reading before it looks at its queue again.
