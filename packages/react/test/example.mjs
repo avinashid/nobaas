@@ -113,7 +113,7 @@ window.room = await joinRoom({ appId: 'peerwire-react-example', roomId: ${JSON.s
   await eve.waitForFunction(() => window.room?.peers.length === 3, null, { timeout: 20000 });
   await eve.evaluate(() => {
     room.send({ x: 1 });
-    room.send({ $peerwire: 'set', k: 'count', v: { evil: 1 }, c: 1e9 });
+    room.send({ $peerwire: 'set', k: 'count', v: { evil: 1 }, c: Date.now() + 1000 });
     room.send({ $peerwire: 'live', k: 'cursor', v: { x: 'a', y: {} }, n: 1 });
     room.send('plain text from eve');
   });

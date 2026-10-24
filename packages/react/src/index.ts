@@ -21,7 +21,16 @@ import type { Peer } from './store.js';
 
 export { randomRoomId } from '@peerwire/js';
 export type { JoinRoomOptions, MessageInfo, PeerId, Presence, Room, RoomEvents, SendOptions } from '@peerwire/js';
-export { MAX_KEYS, MAX_KEY_LENGTH, MAX_STORE_LENGTH, MAX_VALUE_LENGTH, SETTLE_MS } from './store.js';
+export {
+  MAX_CLOCK_DRIFT,
+  MAX_KEYS,
+  MAX_KEY_LENGTH,
+  MAX_PEER_KEYS,
+  MAX_PEER_LENGTH,
+  MAX_STORE_LENGTH,
+  MAX_VALUE_LENGTH,
+  SETTLE_MS,
+} from './store.js';
 export type { Peer } from './store.js';
 
 /** `idle`: no options, so no room. `joining`, then `joined` or `error`. */
@@ -36,7 +45,7 @@ export interface RoomState {
 }
 
 /** A message from useMessages. */
-export interface Message<T = any> {
+export interface Message<T = unknown> {
   /** Unique within the page, for React keys. */
   id: number;
   /** Who sent it: a member, or `room.self` for ours. */
@@ -55,8 +64,8 @@ export type SetState<T> = (next: T | ((prev: T) => T)) => void;
 
 const IDLE: RoomState = { room: null, status: 'idle', error: null };
 const JOINING: RoomState = { room: null, status: 'joining', error: null };
-const NO_PEERS: readonly Peer[] = Object.freeze([]);
-const NO_VALUES: Readonly<Record<PeerId, any>> = Object.freeze({});
+const NO_PEERS: readonly Peer<Presence>[] = Object.freeze([]);
+const NO_VALUES: Readonly<Record<PeerId, unknown>> = Object.freeze({});
 const noSubscribe = () => () => {};
 let nextId = 0;
 
@@ -190,20 +199,26 @@ function useLatest<V>(value: V): { readonly current: V } {
   return ref;
 }
 
-// useSharedState's check when none is given: a value of the same kind as `initial`.
+// useSharedState's check when none is given: a string, number or boolean like `initial`. Any other `initial`
+// needs `accept`: checking only that a value is an array or an object would let a member put an object where
+// the app renders text, deeper in.
 function sameKind(initial: unknown): (value: unknown) => boolean {
-  if (initial === null || initial === undefined) return () => true;
-  if (Array.isArray(initial)) return Array.isArray;
   const t = typeof initial;
-  if (t === 'object') return (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (t !== 'string' && t !== 'number' && t !== 'boolean') {
+    throw new TypeError(`useSharedState: give \`accept\` when \`initial\` is not a string, number or boolean (it is ${initial === null ? 'null' : t})`);
+  }
   return (v) => typeof v === t;
 }
+
+type Primitive = string | number | boolean;
+// The type of a value like a primitive `initial`: `0` holds any number.
+type Widen<T> = T extends string ? string : T extends number ? number : T extends boolean ? boolean : never;
 
 /**
  * The other members, oldest first, with their presence. With `accept`, a member whose presence fails it is left
  * out, so `presence` always has the type `accept` checks.
  */
-export function usePeers<P = Presence>(options: { accept?: Accept<P> } & RoomOption = {}): readonly Peer<P>[] {
+export function usePeers<P = unknown>(options: { accept?: Accept<P> } & RoomOption = {}): readonly Peer<P>[] {
   const r = useTarget(options.room);
   const store = r ? storeOf(r) : null;
   const accept = useLatest(options.accept);
@@ -274,7 +289,7 @@ export interface UseMessagesResult<T> {
 }
 
 /** The room's messages as a list, for a chat or an event log. */
-export function useMessages<T = any>(options: UseMessagesOptions<T> = {}): UseMessagesResult<T> {
+export function useMessages<T = unknown>(options: UseMessagesOptions<T> = {}): UseMessagesResult<T> {
   const r = useTarget(options.room);
   const [messages, setMessages] = useState<readonly Message<T>[]>([]);
   // A new limit or check applies from the next message; only a new room empties the list.
@@ -309,9 +324,12 @@ export function useMessages<T = any>(options: UseMessagesOptions<T> = {}): UseMe
  * member that joins later catches up. The last write wins (by a logical clock, so all members agree). Values go
  * as JSON. Until the room is joined the value is `initial` and setting it does nothing.
  *
- * A value that fails `accept` reads as `initial`. Without `accept`, a value must be of the same kind as `initial`:
- * the same `typeof`, an array for an array, a non-array object for an object; anything for null.
+ * A value that fails `accept` reads as `initial`. `accept` can be left out only when `initial` is a string, number
+ * or boolean: then a value must have its `typeof`. For anything else, `accept` must check every part the app
+ * reads, or a member can put an object where the app renders text.
  */
+export function useSharedState<T>(key: string, initial: T, options: { accept: Accept<T> } & RoomOption): [T, SetState<T>];
+export function useSharedState<T extends Primitive>(key: string, initial: T, options?: RoomOption): [Widen<T>, SetState<Widen<T>>];
 export function useSharedState<T>(key: string, initial: T, options: { accept?: Accept<T> } & RoomOption = {}): [T, SetState<T>] {
   const r = useTarget(options.room);
   const store = r ? storeOf(r) : null;
@@ -348,7 +366,7 @@ export function useSharedState<T>(key: string, initial: T, options: { accept?: A
  * leaves drops out, and one that joins gets ours. Ours is not in the record. Values go as JSON. With `accept`, a
  * value that fails it is left out.
  */
-export function usePeerState<T = any>(
+export function usePeerState<T = unknown>(
   key: string,
   options: { accept?: Accept<T> } & RoomOption = {},
 ): [Readonly<Record<PeerId, T>>, (value: T) => void] {

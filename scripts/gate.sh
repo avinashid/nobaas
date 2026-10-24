@@ -68,6 +68,7 @@ NODE=(
   "node nat prediction|node packages/js/test/nat_predict.mjs"
   "node late ice|node packages/js/test/late_ice.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
+  "node react store|node packages/react/test/store.mjs"
   "node react hooks|node packages/react/test/hooks.mjs"
 )
 NODE_FIRST='^node (room adopt|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'

@@ -76,6 +76,7 @@ jobs:
       - name: '@peerwire/react: install, build, types'
         working-directory: packages/react
         run: npm ci --no-audit --no-fund && npm run build && npm run typecheck
+      - run: node packages/react/test/store.mjs
       - run: node packages/react/test/hooks.mjs
 
   docker:

@@ -36,6 +36,6 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p example/tsconfig.json",
     "prepack": "tsc -p tsconfig.json",
-    "test": "node test/hooks.mjs"
+    "test": "node test/store.mjs && node test/hooks.mjs"
   }
 }

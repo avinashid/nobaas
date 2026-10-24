@@ -7,6 +7,8 @@ type Me = { name: string };
 type Point = { x: number; y: number };
 const isMe = (p: unknown): p is Me => typeof (p as Me)?.name === 'string';
 const isPoint = (v: unknown): v is Point => typeof (v as Point)?.x === 'number' && typeof (v as Point)?.y === 'number';
+type Todo = { text: string };
+const isTodos = (v: unknown): v is Todo[] => Array.isArray(v) && v.every((t) => typeof (t as Todo)?.text === 'string');
 
 export function Types() {
   const state: RoomState = useRoom();
@@ -32,6 +34,23 @@ export function Types() {
   setCount((c) => c + 1);
   // @ts-expect-error: a number state
   setCount('one');
+  const [n]: [number, SetState<number>] = useSharedState<number>('n', 0);
+  const [mode] = useSharedState('mode', 'a');
+  const modeText: string = mode;
+  // Anything but a string, number or boolean needs `accept`, which gives the type.
+  // @ts-expect-error: accept is needed for an array
+  useSharedState('todos', []);
+  // @ts-expect-error: and for null
+  useSharedState('pick', null);
+  // @ts-expect-error: and for an object
+  useSharedState('pos', { x: 0, y: 0 });
+  const [todos, setTodos] = useSharedState('todos', [], { accept: isTodos });
+  const firstTodo: string | undefined = todos[0]?.text;
+  setTodos((t) => [...t, { text: 'milk' }]);
+  // @ts-expect-error: inferred, not any
+  const notAny5: number = todos;
+  const [pick] = useSharedState('pick', null as Point | null, { accept: (v) => v === null || isPoint(v) });
+  const picked: Point | null = pick;
 
   const [cursors, setCursor] = usePeerState<Point>('cursor');
   const [points] = usePeerState('cursor', { accept: isPoint });
@@ -47,6 +66,16 @@ export function Types() {
   // @ts-expect-error: y is missing
   setCursor({ x: 1 });
 
+  // Member data with no check is unknown, so it can't be rendered unchecked.
+  const { messages: raw } = useMessages();
+  // @ts-expect-error: unknown, not any
+  const rawText: string = raw[0]!.data;
+  const [anyCursors] = usePeerState('cursor');
+  // @ts-expect-error: unknown, not any
+  const rawX: number = anyCursors['ab' as PeerId]!.x;
+  const anyone = usePeers();
+  // @ts-expect-error: unknown, not any
+  const rawName: string = anyone[0]!.presence.name;
   const { messages, send } = useMessages<string>({ limit: 50 });
   const { messages: texts } = useMessages({ accept: (d) => typeof d === 'string' });
   const text: string | undefined = texts[0]?.data;
@@ -71,7 +100,8 @@ export function Types() {
   return (
     <>
       <RoomProvider appId="a" roomId="r" presence={{ name: 'ana' }} signaling="nostr">
-        {String([status, first, checked, myName, count, at, p, on, last, text, sentTo, notAny1, notAny2, notAny3, notAny4])}
+        {String([status, first, checked, myName, count, n, modeText, firstTodo, picked, at, p, on, last, text, sentTo])}
+        {String([notAny1, notAny2, notAny3, notAny4, notAny5, rawText, rawX, rawName])}
       </RoomProvider>
       {/* @ts-expect-error: appId is required */}
       <RoomProvider roomId="r" />

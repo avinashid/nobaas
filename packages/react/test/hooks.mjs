@@ -1,9 +1,9 @@
 // @peerwire/react in Node: React components rendered with react-dom into jsdom, members of one room over
 // BroadcastChannel (signaling 'local'). Checks server rendering (initial values, no room), joining under StrictMode with no ghost member, presence both
 // ways, messages and their limit, shared state (concurrent writes converge, a late joiner catches up), per-peer
-// values, leaving, switching rooms, a failed join, a member that sends malformed or flooding state messages, the
-// value and memory caps and the limit on catch-up answers, and `accept` keeping a member's wrongly typed
-// presence, messages, shared and per-peer values out.
+// values, leaving, switching rooms, a failed join, a member that sends malformed, flooding or far-ahead state
+// messages, catch-up answers sent once, and `accept` keeping a member's wrongly typed presence, messages, shared
+// and per-peer values out, nested ones too. test/store.mjs covers the store's caps and catch-up in detail.
 // Needs the build: `npm run build` (packages/react) and packages/js/build.sh.
 //
 //   node packages/react/test/hooks.mjs
@@ -35,47 +35,6 @@ const { RoomProvider, useRoom, usePeers, usePresence, useMessages, useRoomEvent,
 const appId = 'peerwire-react-test';
 const roomId = `hooks-${process.pid}`;
 
-// The store's memory caps, on a fake room: a value over MAX_VALUE_LENGTH is ignored, values past
-// MAX_STORE_LENGTH in all are ignored, replacing or dropping values frees room, and a local write over the cap throws.
-{
-  const { RoomStore, MAX_VALUE_LENGTH, MAX_STORE_LENGTH } = await import('../dist/store.js');
-  const on = {};
-  const fake = { self: 'a'.repeat(64), peers: [], on: (e, fn) => ((on[e] = fn), () => {}), getPresence() {}, send() {} };
-  const st = new RoomStore(fake);
-  const x = 'b'.repeat(64);
-  const full = 'x'.repeat(MAX_VALUE_LENGTH - 2); // MAX_VALUE_LENGTH as JSON, with its quotes
-  on.message({ $peerwire: 'set', k: 'over', v: `${full}x`, c: 1 }, x);
-  if (st.getShared('over')) fail('a value over MAX_VALUE_LENGTH was kept');
-  for (let i = 0; i < 300; i++) on.message({ $peerwire: 'set', k: `b${i}`, v: full, c: 1 }, x);
-  const kept = () => Array.from({ length: 301 }, (_, i) => i).filter((i) => st.getShared(`b${i}`)).length;
-  const fit = MAX_STORE_LENGTH / MAX_VALUE_LENGTH;
-  if (kept() !== fit) fail(`kept ${kept()} values of ${MAX_VALUE_LENGTH}, not ${fit}`);
-  for (const k of ['b0', 'b1']) on.message({ $peerwire: 'set', k, v: 'small', c: 2 }, x);
-  on.message({ $peerwire: 'set', k: 'b300', v: full, c: 1 }, x);
-  if (!st.getShared('b300') || kept() !== fit + 1) fail('replacing values did not free room');
-  on.message({ $peerwire: 'set', k: 'b301', v: full, c: 1 }, x);
-  if (st.getShared('b301')) fail('a value past MAX_STORE_LENGTH was kept');
-  // Per-peer values count too, and a member that leaves frees its own.
-  const y = 'c'.repeat(64);
-  on.message({ $peerwire: 'live', k: 'p0', v: full, n: 1 }, y);
-  if (st.getLive('p0')[y]) fail('a per-peer value past MAX_STORE_LENGTH was kept');
-  for (const k of ['b2', 'b3']) on.message({ $peerwire: 'set', k, v: 'small', c: 2 }, x);
-  for (const k of ['p1', 'p2']) on.message({ $peerwire: 'live', k, v: full, n: 1 }, y);
-  if (!st.getLive('p1')[y] || !st.getLive('p2')[y]) fail('per-peer values in freed room were not kept');
-  on.message({ $peerwire: 'set', k: 'b301', v: full, c: 1 }, x);
-  if (st.getShared('b301')) fail('a value past MAX_STORE_LENGTH was kept, with per-peer values');
-  on['peer-leave'](y);
-  on.message({ $peerwire: 'set', k: 'b301', v: full, c: 1 }, x);
-  if (!st.getShared('b301') || st.getLive('p1')[y]) fail('a member that left still holds room');
-  try {
-    st.setShared('mine', `${full}x`);
-    fail('a local value over MAX_VALUE_LENGTH was sent');
-  } catch (e) {
-    if (!(e instanceof RangeError)) throw e;
-  }
-  console.log(`store caps: values over ${MAX_VALUE_LENGTH} ignored, ${fit} of that size fill ${MAX_STORE_LENGTH}, replacing frees room`);
-}
-
 // Server rendering, before there is any DOM: every hook renders its initial value and nothing joins.
 function OnServer() {
   const { status } = useRoom();
@@ -89,7 +48,19 @@ function OnServer() {
 }
 const html = renderToString(h(RoomProvider, { appId, roomId }, h(OnServer)));
 if (html !== '<p>joining 0 undefined 0 7 0</p>') fail(`server render: ${html}`);
-console.log('server render: initial values, no room');
+// RH-2: an array (or object, or null) shared state needs `accept`, which must check what the app renders.
+function NoAccept() {
+  useSharedState('todos', []);
+  return null;
+}
+let noAccept = null;
+try {
+  renderToString(h(RoomProvider, { appId, roomId }, h(NoAccept)));
+} catch (e) {
+  noAccept = e;
+}
+if (!(noAccept instanceof TypeError) || !/accept/.test(noAccept.message)) fail(`useSharedState without accept for an array: ${noAccept}`);
+console.log('server render: initial values, no room; an array shared state without accept throws');
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>');
 globalThis.window = dom.window;
@@ -111,27 +82,37 @@ function Probe({ out }) {
   const [count, setCount] = useSharedState('count', 0);
   const [late] = useSharedState('k1099', 'none');
   const [big] = useSharedState('big', '');
+  // The shallow check RH-2 was about: this one only sees what arrived, it never renders the items.
+  const [todosRaw, setTodos] = useSharedState('todos', [], { accept: Array.isArray });
   const [cursors, setCursor] = usePeerState('cursor');
   const [points] = usePeerState('cursor', { accept: (v) => typeof v?.x === 'number' });
   const [tick, setTick] = useState(0);
   // A new handler every render: the latest one must be called.
   useRoomEvent('message', (data) => out.raw.push([tick, data]));
   out.maxPeers = Math.max(out.maxPeers ?? 0, peers.length);
-  Object.assign(out, { room, status, peers, named, shouty, me, messages, texts, count, late, big, cursors, points });
-  Object.assign(out, { setMe, send, setCount, setCursor, setTick, tick });
+  Object.assign(out, { room, status, peers, named, shouty, me, messages, texts, count, late, big, todosRaw, cursors, points });
+  Object.assign(out, { setMe, send, setCount, setTodos, setCursor, setTick, tick });
   return null;
+}
+
+// What an app renders from shared state: each todo's text. Its check covers every field it renders (RH-2).
+const isTodos = (v) => Array.isArray(v) && v.every((t) => typeof t?.text === 'string');
+function Todos() {
+  const [todos] = useSharedState('todos', [], { accept: isTodos });
+  return h('ul', { className: 'todos' }, todos.map((t, i) => h('li', { key: i }, t.text)));
 }
 
 const members = {};
 function mount(name, { strict = false, presence = { name } } = {}) {
   const out = { raw: [] };
-  const root = createRoot(document.body.appendChild(document.createElement('div')));
+  const el = document.body.appendChild(document.createElement('div'));
+  const root = createRoot(el);
   const render = (p) => {
-    const tree = h(RoomProvider, { appId, roomId, presence: p }, h(Probe, { out }));
+    const tree = h(RoomProvider, { appId, roomId, presence: p }, h(Probe, { out }), h(Todos));
     root.render(strict ? h(StrictMode, null, tree) : tree);
   };
   render(presence);
-  return (members[name] = { name, out, root, render });
+  return (members[name] = { name, out, root, render, el });
 }
 const id = (m) => m.out.room?.self;
 const names = (m) => m.out.peers.map((p) => p.presence?.name).sort().join(',');
@@ -217,11 +198,15 @@ const bad = [
   { $peerwire: 'set', k: 5, v: 999, c: 1e9 },
   { $peerwire: 'set', k: 'x'.repeat(300), v: 1, c: 1 },
   { $peerwire: 'set', k: 'count', v: 999, c: Number.MAX_SAFE_INTEGER + 2 },
+  // RH-1: a clock out of reach, then one far ahead: both ignored, so later writes still win.
+  { $peerwire: 'set', k: 'count', v: 999, c: Number.MAX_SAFE_INTEGER },
+  { $peerwire: 'set', k: 'count', v: 999, c: Date.now() + lib.MAX_CLOCK_DRIFT + 60000 },
   { $peerwire: 'set', k: 'count', v: 999, c: -1 },
   { $peerwire: 'set', k: 'count', v: 999, c: 1.5 },
   { $peerwire: 'sync', s: 'nope', p: [] },
   { $peerwire: 'sync', s: [[1, 2, 3], null, ['count', 999, 1e9, 'not a peer id']], p: [null, [1], ['cursor', { x: 9 }, 0]] },
   { $peerwire: 'sync', s: new Array(1025).fill(['k', 1, 1, E.self]), p: [] },
+  { $peerwire: 'sync', h: 'nope' },
   { $peerwire: 'live', k: 'cursor', v: { x: 999 }, n: 0 },
   { $peerwire: 'live', k: 'cursor', v: { x: 999 }, n: 'x' },
   { $peerwire: 'nonsense' },
@@ -229,36 +214,42 @@ const bad = [
 ];
 for (const m of bad) E.send(m);
 E.send({ $peerwire: 'live', k: 'cursor', v: { x: 7 }, n: 5 });
-await until('the valid value after the malformed ones', () => A.out.cursors[E.self]?.x === 7);
+await until('the valid value after the malformed ones', () => [A, B, C, D].every((m) => m.out.cursors[E.self]?.x === 7));
 if ([A, B, C, D].some((m) => m.out.count !== won + 1)) fail(`a malformed write took: ${[A, B, C, D].map((m) => m.out.count)}`);
+A.out.setCount((c) => c + 1);
+await until('a write after the clock pins', () => [A, B, C, D].every((m) => m.out.count === won + 2));
 // A value over MAX_VALUE_LENGTH is ignored; a smaller one for the key takes.
 E.send({ $peerwire: 'set', k: 'big', v: 'x'.repeat(lib.MAX_VALUE_LENGTH), c: 1 });
 E.send({ $peerwire: 'set', k: 'big', v: 'small', c: 2 });
 await until('the small value', () => [A, B, C, D].every((m) => m.out.big === 'small'));
-// Asking for a catch-up again and again: each member answers at most 4 times while E stays.
+// Asking for a catch-up again and again: each member sends each value once, in at most 4 answers while E stays.
+// E never answers, so each answer asks back once, on its last message.
 const answers = new Map();
+const counts = new Map();
 E.on('message', (d, from) => {
-  if (d?.$peerwire === 'sync' && d.ask === false && d.s.some((e) => e[0] === 'count')) answers.set(from, (answers.get(from) ?? 0) + 1);
+  if (d?.$peerwire !== 'sync' || d.re !== true) return;
+  if (d.ask) answers.set(from, (answers.get(from) ?? 0) + 1);
+  if (d.s?.some((e) => e[0] === 'count')) counts.set(from, (counts.get(from) ?? 0) + 1);
 });
 for (let i = 0; i < 20; i++) E.send({ $peerwire: 'sync', ask: true, s: [], p: [] });
-await until('answers from every member', () => [A, B, C, D].every((m) => answers.get(id(m)) >= 1));
+await until('answers from every member', () => [A, B, C, D].every((m) => counts.get(id(m)) >= 1));
 await sleep(500);
-if ([A, B, C, D].some((m) => answers.get(id(m)) > 4)) fail(`catch-up answers: ${[...answers.values()]}`);
-console.log(`20 catch-up asks answered ${[A, B, C, D].map((m) => answers.get(id(m))).join(', ')} times`);
-// Keys past MAX_KEYS (1024) are ignored: 'count', 'big' and 1100 more offered; 'k1099' must not take.
+if ([A, B, C, D].some((m) => answers.get(id(m)) > 4 || counts.get(id(m)) !== 1)) fail(`catch-up answers: ${[...answers.values()]}; 'count' sent ${[...counts.values()]}`);
+console.log(`20 catch-up asks answered ${[A, B, C, D].map((m) => answers.get(id(m))).join(', ')} times, each value sent once`);
+// A flood of 1100 keys past MAX_KEYS (1024) can't keep out a key a hook reads: 'k1099' still takes.
 for (let i = 0; i < 1100; i++) E.send({ $peerwire: 'set', k: `k${i}`, v: `v${i}`, c: 1 });
 E.send({ $peerwire: 'live', k: 'cursor', v: { x: 8 }, n: 6 });
-await until('the flood', () => A.out.cursors[E.self]?.x === 8);
-if (A.out.late !== 'none') fail(`key ${lib.MAX_KEYS + 1} was kept: ${A.out.late}`);
-E.send({ $peerwire: 'set', k: 'count', v: 42, c: 1e6 });
+await until('the flood', () => [A, B, C, D].every((m) => m.out.cursors[E.self]?.x === 8));
+if ([A, B, C, D].some((m) => m.out.late !== 'v1099')) fail(`a key a hook reads was kept out by a flood: ${[A, B, C, D].map((m) => m.out.late)}`);
+E.send({ $peerwire: 'set', k: 'count', v: 42, c: Date.now() + 1000 });
 await until('a valid write from a raw member', () => [A, B, C, D].every((m) => m.out.count === 42));
-console.log(`malformed state messages ignored, keys capped at ${lib.MAX_KEYS}, a valid write from outside React taken`);
+console.log(`malformed and far-ahead state messages ignored, a flood past ${lib.MAX_KEYS} keys can't keep out a key a hook reads, a valid write from outside React taken`);
 
 // Well-formed messages of the wrong type: what `accept` (or useSharedState's default, the kind of `initial`)
 // keeps out, while hooks without a check still see them.
 E.setPresence({ name: { evil: 1 } });
 E.send({ x: 1 });
-E.send({ $peerwire: 'set', k: 'count', v: { evil: 1 }, c: 2e6 });
+E.send({ $peerwire: 'set', k: 'count', v: { evil: 1 }, c: Date.now() + 2000 });
 E.send({ $peerwire: 'live', k: 'cursor', v: { x: 'evil' }, n: 7 });
 E.send('after the wrong types');
 await until('the wrong types to arrive', () => [A, B, C, D].every((m) => m.out.messages.at(-1)?.data === 'after the wrong types'));
@@ -273,9 +264,25 @@ for (const m of [A, B, C, D]) {
   const [other, x] = m === B ? [A, 20] : [B, -5];
   if (m.out.cursors[E.self]?.x !== 'evil' || E.self in m.out.points || m.out.points[id(other)]?.x !== x) fail(`${m.name}: per-peer check`);
 }
-E.send({ $peerwire: 'set', k: 'count', v: 43, c: 3e6 });
+E.send({ $peerwire: 'set', k: 'count', v: 43, c: Date.now() + 3000 });
 await until('a number again', () => [A, B, C, D].every((m) => m.out.count === 43));
 console.log('accept: a member\'s wrong presence, message, shared and per-peer values kept out; initial meanwhile');
+
+// RH-2: an object nested where the app renders text. The app's check covers each todo's text, so the list reads
+// as initial and every member stays mounted and in the room; the shallow check sees the object arrive.
+const items = (m) => [...m.el.querySelectorAll('ul.todos li')].map((li) => li.textContent).join();
+B.out.setTodos([{ text: 'milk' }]);
+await until('a todo', () => [A, B, C, D].every((m) => items(m) === 'milk'));
+E.send({ $peerwire: 'set', k: 'todos', v: [{ text: { x: 1 } }], c: Date.now() + 4000 });
+await until('the nested object to arrive', () => [A, B, C, D].every((m) => typeof m.out.todosRaw[0]?.text === 'object'));
+await sleep(100);
+for (const m of [A, B, C, D]) {
+  if (!m.el.querySelector('ul.todos') || items(m) !== '') fail(`${m.name}: the list after a nested object: ${m.el.innerHTML.slice(0, 120)}`);
+  if (m.out.status !== 'joined' || m.out.peers.length !== 4) fail(`${m.name}: left after a nested object`);
+}
+C.out.setTodos([{ text: 'eggs' }]);
+await until('a todo after the nested object', () => [A, B, C, D].every((m) => items(m) === 'eggs'));
+console.log('RH-2: a nested object in shared state read as initial by a deep check; every member stayed');
 
 // Leaving: unmounting A shows at once, and its per-peer value goes with it.
 A.root.unmount();
