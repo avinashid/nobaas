@@ -84,6 +84,7 @@ that needs a change is tracked as an NB card.
 | MIC-4 (Low) | **Fixed** by `134fed3` (the button rejoins before it re-tests the network), reviewed 2026-10-24 |
 | MIC-5 (Info) | Open, same section |
 | FL1-1 (Info), FL1-2 (Low) | Open, [WebRTC retries](#webrtc-retries-fast-lane-1--fl1-1-fl1-2) |
+| FL2-1 (Low), FL2-2 (Low) | Open, [Member relays for pipe links](#member-relays-for-pipe-links-fast-lane-2--fl2-1-fl2-2) |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -789,6 +790,60 @@ so nothing is amplified. Repro: one ask to the larger id on a pipe pair made it 
 once, and the dialler retried once. Fix: act on `retry` only when `self < peer`; with
 it, neither happened.
 
+### Member relays for pipe links (Fast lane 2) — FL2-1, FL2-2
+
+A link on the signalling pipe moves to a member that later links directly to both ends
+(`03d3616`, `1d6a3dd`). The room marks the pipe as the link's slow address
+(`Endpoint::set_slow`) and offers every proven direct member (`add_relay`). The core
+probes with a sealed PUNCH through the member and moves on the PUNCH_ACK that comes back
+through it. The far end answers only if it would use that member too. The link goes back
+to the pipe when the member's link goes, when the peer's newer traffic comes over the
+pipe, or after 15 s of relay silence. Reviewed 2026-10-24 by reading the code, with two
+scratch core repros:
+- Only the two ends can move a link. Every move or return needs an inner packet sealed
+  under their session and passing its replay window; a relay can only forward, withhold
+  or delay it. A move needs the prober's random token on a relay it offered. A return to
+  the pipe needs a non-probe packet over the pipe with a nonce above everything that came
+  through the relay, so withheld or replayed pipe packets move nothing. Signalling relays
+  can't inject on the pipe (`from` is sealed).
+- A Bye now also ends the core session, so links the leaver relayed go back at once. A
+  Bye is acted on only as a message on the leaver's own session, so nobody else can send
+  one, and a replay fails the nonce window.
+- Probes are 1:1 to the peer, through at most 8 members, every 500 ms for 5 s.
+  Relay-only moves nothing, answers no probe and never falls back to a pipe. No new
+  frames: a 0.1.x peer ignores a relayed PUNCH, and the link stays on the pipe.
+- A relay no longer forwards to a peer it reaches only over its own pipe. This closes an
+  older drain, where one member made another spend the 3 messages/s budget all its pipes
+  share; the asker has its own pipe. Relays on 0.1.x still forward.
+- After a move, the member stays the link's fallback relay. If the pipe is silent for
+  15 s, the link goes back to that member without a probe; with a 10 s keepalive, that
+  means the pipe is down.
+
+**FL2-1 — A member that drops only data holds a moved link until it fails (Low).** On a
+member relay, `last_path` is kept fresh by any packet, and the peer sends through the
+member too. A member that passes probes, acks and pings but drops larger packets
+triggers neither rule, so reliable data stalls until the link fails as a whole. Before
+Fast lane 2 a member couldn't take a pipe link. Repro (scratch core test): the member
+dropped what it relayed to b above 200 bytes. a's 400-byte message never arrived, the
+link stayed on the member, and a dropped it as timed out at 70 s. Fix: on a relay with a
+slow address, go back to the pipe once reliable data has waited about 5 s unacked, and
+hold that member off for the link for a while: no offer, no answer to its probes, and no
+fallback to it.
+
+**FL2-2 — A member offered as a relay can roam a pipe link onto its own channel (Low).**
+The peer's sealed probes, acks and data for a pipe link pass through every member
+offered for it. A member can keep one and send it raw on its own channel. The core takes
+an authenticated packet from a new direct address as a roam (NB43-I1), and a relayed
+PUNCH_ACK shares the direct punch token. The link then goes to the member, the room
+reads `'direct'` and drops the slow mark, and nothing brings the link back. So NB43-I1
+now reaches any pipe link whose two ends share a direct member. Repro (scratch core
+test): one probe taken from the member's relay queue and sent from the member's address
+moved the link from the pipe to the member. Fix: in JS every handle belongs to one peer
+(a WebRTC link, a pipe or an adopted channel). Pass that peer to the core with each
+datagram, and drop a data packet for another peer's session before any roam, which also
+closes NB43-I1 in JS. Give relay probes their own token. Rust UDP sets no slow address
+and is unchanged.
+
 ### Bounds and residuals from reviews (NB-014…NB-043)
 
 This section records what each earlier review established about resource bounds,
@@ -857,7 +912,8 @@ and what it accepted. Values are from main `7b716a2`.
   - Incoming batches are capped at 64 items but not rate-limited.
   - Residuals:
     - **NB43-I1:** a relaying member can roam a link onto its own pipe, because a
-      direct-to-direct roam needs no path validation.
+      direct-to-direct roam needs no path validation. Since Fast lane 2 this reaches
+      pipe links too (FL2-2).
     - **NB43-I2:** an insider holding the room key can churn the pipe permissions,
       take the shared budget, and send 64 HS1s per batch. Card NB-043b; it supports
       SEC-4.
