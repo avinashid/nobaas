@@ -155,7 +155,9 @@ check(b64(new Uint8Array(0)) === '' && b64(new Uint8Array([0, 255, 128])) === 'A
   globalThis.WebSocket = Fake;
   const tick = (ms) => new Promise((r) => setTimeout(r, ms));
   const s6 = new NostrSignaling(pw, pw.endpoint(), { room: 'hotspot/reconnect', relays: ['wss://a', 'wss://b'] });
-  await tick(20);
+  // start() dials only after its key derivation, which a loaded machine can hold up
+  // well past a fixed tick: wait for both sockets, then open them.
+  for (let i = 0; i < 1000 && made.length < 2; i++) await tick(5);
   made.forEach((w) => w.open());
   await s6.ready;
   const back = [];
