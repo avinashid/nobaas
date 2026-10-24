@@ -8,6 +8,8 @@
 //   tab's real local addresses on the new link; nothing throws;
 // - the global room (MIC-1): with the grant stored before the tabs open, or given while
 //   they are in it, the other tab gets no local address, and the pair still links;
+//   the button pressed there rejoins before its network re-test, so a tab joining
+//   during the re-test hears none either (MIC-4);
 // - a refused prompt (a browser whose fake UI says no): 'denied', a warning, and the
 //   room is not joined again;
 // - a candidate pair whose local address is hidden takes its family from the remote.
@@ -67,7 +69,9 @@ try {
   // does (Chrome shows local addresses only with a stored grant), so store it too.
   await ctx.grantPermissions(['microphone'], { origin });
   await a.click('#mic');
-  await wait(a, (id) => window.netlab.self && window.netlab.self !== id && window.netlab.peers().length === 1, before.me.id);
+  // The room is joined again first, then the network re-tested (MIC-4): wait for both.
+  await wait(a, ([id, at]) => window.netlab.self && window.netlab.self !== id && window.netlab.peers().length === 1
+    && window.netlab.report().me.network?.at !== at, [before.me.id, before.me.network.at]);
   const after = await report(a);
   const hosts1 = after.me.network.host.map((c) => c.address);
   ok(after.me.mediaPermission === 'granted', `after the button: mediaPermission ${after.me.mediaPermission}`);
@@ -155,6 +159,62 @@ try {
   }
   if (hSettled.status === 'rejected') ok(false, `global room, granted while in it: ${hSettled.reason.message}`);
   else ok(hSettled.value.rejoinLog && none(hSettled.value.hosts), `global room, granted while in it: rejoined, linked, local addresses given ${JSON.stringify(hSettled.value.hosts)}`);
+
+  // MIC-4: the button, pressed in the global room, rejoins it without the local addresses
+  // before it re-tests the network (seconds on a real network; held 5 s here), so a tab
+  // that joins meanwhile hears none of them. getUserMedia waits until the grant is
+  // stored, as a tap on Allow stores it while the prompt is open. M, the tab that joins
+  // during the re-test, keeps every description and candidate it is given.
+  const kctx = await browsers[0].newContext({ viewport: { width: 1360, height: 900 } });
+  await kctx.addInitScript(() => {
+    const Pc = window.RTCPeerConnection;
+    window.__probeHold = 0;
+    window.__heard = [];
+    window.RTCPeerConnection = class extends Pc {
+      createDataChannel(label, ...x) {
+        if (label === 'probe') this.__probe = true; // the network test's connection
+        return super.createDataChannel(label, ...x);
+      }
+      async setLocalDescription(...d) {
+        if (this.__probe && window.__probeHold) await new Promise((r) => setTimeout(r, window.__probeHold));
+        return super.setLocalDescription(...d);
+      }
+      setRemoteDescription(d) {
+        if (d?.sdp) window.__heard.push(d.sdp);
+        return super.setRemoteDescription(d);
+      }
+      addIceCandidate(c) {
+        if (c?.candidate) window.__heard.push(c.candidate);
+        return super.addIceCandidate(c);
+      }
+    };
+    const md = navigator.mediaDevices;
+    const gum = md?.getUserMedia?.bind(md);
+    if (gum) md.getUserMedia = async (c) => { await window.__gumGate; return gum(c); };
+  });
+  try {
+    const k = await open(kctx, globalUrl('kilo'));
+    await wait(k, () => window.netlab.self && window.netlab.report().me.network);
+    const k0 = await report(k);
+    await k.evaluate(() => { window.__probeHold = 5000; window.__gumGate = new Promise((r) => { window.__gumOpen = r; }); });
+    await k.click('#mic');
+    await kctx.grantPermissions(['microphone'], { origin });
+    await k.waitForTimeout(300); // the permission change reaches the page while the button asks
+    await k.evaluate(() => window.__gumOpen());
+    const m = await open(kctx, globalUrl('mike'));
+    const kNew = await wait(k, (id) => window.netlab.self && window.netlab.self !== id, k0.me.id, 20000).then(() => k.evaluate(() => window.netlab.self));
+    await linkedTo(m, kNew);
+    await wait(k, (at) => window.netlab.report().me.network?.at !== at, k0.me.network.at, 20000); // the re-test ended
+    await m.waitForTimeout(1500);
+    const locals = [...new Set((await report(k)).me.network.host.map((c) => c.address))];
+    const heard = await m.evaluate(() => window.__heard.join('\n'));
+    const named = locals.filter((ip) => heard.includes(ip));
+    ok(locals.length > 0 && !locals.some(hidden) && !named.length,
+      `global room, the button: a tab that joined during the re-test linked and heard ${named.length ? named.join(', ') : 'none'} of its ${locals.length} local addresses`);
+  } catch (e) {
+    ok(false, `global room, the button: ${e.message}`);
+  }
+  await kctx.close();
 
   // A refused prompt: 'denied', a warning, still the same member of the room.
   const dctx = await launch('--use-fake-ui-for-media-stream=deny');

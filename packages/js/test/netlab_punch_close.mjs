@@ -12,7 +12,8 @@
 // 4. easy side, aborted while its spray connection opens: it closes;
 // 5. easy side, aborted while it applies the answer: no stale error on the card;
 // 6. easy side, a second answer straight after the first: ignored, the punch runs on.
-// Sprays aim only at TEST-NET-3 (203.0.113.9), which goes nowhere.
+// Sprays aim only at TEST-NET-3 (203.0.113.9), and V drops those candidates, so nothing
+// is sent off the host.
 //
 //   node packages/js/test/netlab_punch_close.mjs
 import { spawn } from 'node:child_process';
@@ -58,6 +59,15 @@ const holdPcs = () => {
     async setLocalDescription(d) {
       if (window.__hold) await wait();
       return super.setLocalDescription(d);
+    }
+    // The spray's candidates at TEST-NET-3 are counted and dropped here, so no ICE
+    // check leaves the host.
+    addIceCandidate(c) {
+      if (c?.candidate?.includes(' 203.0.113.9 ')) {
+        window.__dropped = (window.__dropped ?? 0) + 1;
+        return Promise.resolve();
+      }
+      return super.addIceCandidate(c);
     }
   };
 };
@@ -175,8 +185,8 @@ try {
   r = await after(n);
   ok(r.states.length === 1 && stopped(r), `5 easy side, aborted while applying the answer: card "${r.bday?.why}"`);
 
-  // 6. Two answers back to back: the second is ignored, and the punch runs on. (Its spray
-  // of 1024 candidates holds up what V hears next for seconds, so wait for the abort.)
+  // 6. Two answers back to back: the second is ignored, and the punch runs on. Its spray's
+  // candidates are dropped in V, so it checks nothing off the host.
   n = await accept('easy', false);
   const theirs = await a.waitForFunction((x) => window.__offers.get(x), vId, { timeout: 20000 }).then((h) => h.jsonValue());
   const answer = await a.evaluate(async (sdp) => {
@@ -190,12 +200,19 @@ try {
   await v.waitForFunction(() => [...document.querySelectorAll('#log div')].some((d) => /spraying \d+ ports at 203\.0\.113\.9/.test(d.textContent)), null, { timeout: 15000 });
   await pause(1500);
   const running = await after(n);
+  const remote = await v.evaluate(async ([from, ip]) => {
+    let k = 0;
+    for (const pc of window.__pcs.slice(from)) for (const s of (await pc.getStats()).values()) if (s.type === 'remote-candidate' && s.address === ip) k++;
+    return k;
+  }, [n, TESTNET]);
   await abort();
   await v.waitForFunction((x) => window.netlab.birthday().find((b) => b.id === x)?.status !== 'running', aId, { timeout: 30000 }).catch(() => {});
   r = await after(n);
+  const dropped = await v.evaluate(() => window.__dropped ?? 0);
   await a.evaluate(() => window.__answerPc.close());
   ok(running.bday?.status === 'running' && !running.errors.length && running.states.every((s) => s !== 'closed') && stopped(r),
     `6 easy side, a second answer: still ${running.bday?.status}${running.bday?.why ? ` (${running.bday.why})` : ''}, then card "${r.bday?.why}"`);
+  ok(dropped > 0 && remote === 0, `and its spray stayed on the host: ${dropped} candidates at ${TESTNET} dropped, ${remote} given to ICE`);
   ok(!errors.length, `no page errors${errors.length ? `: ${errors.join('; ')}` : ''}`);
 } catch (e) {
   ok(false, e.stack ?? String(e));
