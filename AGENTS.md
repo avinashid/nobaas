@@ -73,7 +73,7 @@ Report what actually ran and its output. Never claim a test passed without runni
   formula. This machine is small (4 cores, aarch64): no heavy load tests; use the simulator or estimates.
 - Tests stay local: loopback, LAN, or the simulator. Never point code at third-party production services or run
   anything at scale against public infrastructure. Public STUN (Google, Cloudflare) and the Nostr relays
-  `relay.damus.io`, `nos.lol` and `relay.primal.net` are the only external services allowed, and only for small, local-to-local tests.
+  `nos.lol`, `relay.primal.net` and `nostr.mom` are the only external services allowed, and only for small, local-to-local tests.
 - Match the surrounding style. rustfmt is not installed, so format by hand to the existing code.
 
 ## Git

@@ -44,7 +44,7 @@ Meeting by name instead of passing an invite needs a signaling carrier:
 use peerwire::{Node, NostrSignaling};
 
 let mut node = Node::builder()
-    .signaling(NostrSignaling::new(["wss://relay.damus.io", "wss://nos.lol"]))
+    .signaling(NostrSignaling::new(["wss://nos.lol", "wss://nostr.mom"]))
     .bind("[::]:0")?;
 node.join_room("my-app", "lobby"); // finds and connects the room's peers
 # Ok::<(), Box<dyn std::error::Error>>(())

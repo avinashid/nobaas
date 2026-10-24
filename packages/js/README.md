@@ -76,8 +76,8 @@ await room.leave();                             // peers see 'peer-leave' at onc
   10 s is dropped without seeing presence or messages. A name anyone can guess
   (`'lobby'`) makes a public lobby; for a closed room use at least 128 random bits:
   `randomRoomId()`. Members are trusted alike: anyone given the roomId can join.
-- **Signalling:** `'nostr'` publishes ephemeral events to `wss://relay.damus.io`,
-  `wss://nos.lol` and `wss://relay.primal.net` (override with `relays`) and uses Google and Cloudflare STUN
+- **Signalling:** `'nostr'` publishes ephemeral events to `wss://nos.lol`,
+  `wss://relay.primal.net` and `wss://nostr.mom` (override with `relays`) and uses Google and Cloudflare STUN
   (override with `iceServers`). Relays see the room topic and the PeerIds in
   hellos, not the roomId; offers are sealed to the recipient. Each side sends one
   offer or answer with its candidates, once ICE gathering is complete or 300 ms
@@ -160,7 +160,7 @@ it is given:
 
 - Same browser: open `demo/index.html` or the arena pages in several tabs.
 - Different machines: add `?signal=nostr&room=<something only you know>` to every
-  page. Peers meet through `wss://relay.damus.io`, `wss://nos.lol` and `wss://relay.primal.net` and use
+  page. Peers meet through `wss://nos.lol`, `wss://relay.primal.net` and `wss://nostr.mom` and use
   Google's public STUN. Peers behind symmetric NATs on both sides still meet: see
   below.
 
