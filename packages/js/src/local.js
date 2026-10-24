@@ -18,7 +18,7 @@ export class LocalTransport {
       if (peer) signaling.send(peer, { kind: 'dg', bytes });
     };
     signaling.onMessage((from, msg) => {
-      if (isPeerId(from) && msg.kind === 'dg' && msg.bytes instanceof Uint8Array) this.ep.receive(this.handle(from), msg.bytes);
+      if (isPeerId(from) && msg.kind === 'dg' && msg.bytes instanceof Uint8Array) this.ep.receive(this.handle(from), msg.bytes, from);
     });
   }
 

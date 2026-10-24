@@ -9,7 +9,10 @@
 // - with Fast lane 1: d joins and the link moves to d; then a and b's ICE works again and
 //   a retry (retryDirect) opens a channel: the link goes 'direct', the same session with
 //   no leave or join, the room clears the pipe's slow mark, d relays nothing more for it,
-//   and d leaving changes nothing.
+//   and d leaving changes nothing;
+// - FL2-2: e joins, and one of b's datagrams for a, kept back as a relaying member could,
+//   comes to a on e's channel: a's link to b doesn't move onto it;
+// - every datagram the transport gives an endpoint names the peer of the channel it came on.
 //
 //   node packages/js/test/room_relay_move.mjs
 import { joinRoom } from '../src/index.js';
@@ -102,13 +105,23 @@ const fakePc = (owner) => class FakePc {
   }
 };
 
-const room = (name) => joinRoom({
-  appId: 'peerwire-test',
-  roomId: `relay-move-${process.pid}`,
-  presence: { name },
-  fallbackMs: 300,
-  RTCPeerConnection: fakePc(name),
-});
+// Every datagram the transport gives an endpoint names the peer whose channel it came on.
+const unnamed = [];
+const room = async (name) => {
+  const r = await joinRoom({
+    appId: 'peerwire-test',
+    roomId: `relay-move-${process.pid}`,
+    presence: { name },
+    fallbackMs: 300,
+    RTCPeerConnection: fakePc(name),
+  });
+  const receive = r.endpoint.receive.bind(r.endpoint);
+  r.endpoint.receive = (addr, bytes, peer) => {
+    if (typeof peer !== 'string' || peer === r.self) unnamed.push(`${name}: handle ${addr}, peer ${peer}`);
+    receive(addr, bytes, peer);
+  };
+  return r;
+};
 const same = (r, want) => JSON.stringify(r) === JSON.stringify(want);
 
 blocked.add('a|b').add('b|a');
@@ -201,6 +214,27 @@ await both('after d left', 'direct again');
 if (bLog().length || sessions() !== '0,0') fail(`a new session or a leave: ${bLog()}, connected ${sessions()}`);
 console.log(`d joins, the link moves to d, a retry takes it direct ${direct} ms later: same link, slow mark cleared, nothing more through d, d leaving changes nothing`);
 
+// FL2-2: one of b's datagrams for a, kept back, comes to a on e's channel. The transport
+// names e as its peer, so a's core drops it unread, and the link to b stays on b's channel.
+const e = await room('e');
+await until('e linked to a', () => a.route(e.self)?.kind === 'direct', 30000);
+const send = b.endpoint.onTransmit;
+const toA = b.transport.byPeer.get(a.self);
+let kept = null;
+b.endpoint.onTransmit = (h, bytes) => (h === toA && !kept ? (kept = bytes) : send(h, bytes));
+b.send('one kept back', { to: a.self });
+await until("a datagram of b's for a, kept", () => kept !== null, 5000);
+b.endpoint.onTransmit = send;
+const pathsA = seen.get(a).paths;
+a.transport.links.get(a.transport.byPeer.get(e.self)).dc.onmessage({ data: kept.slice().buffer });
+await sleep(100);
+if (seen.get(a).paths !== pathsA) fail("b's datagram on e's channel moved a's link to b");
+await both("after b's datagram came on e's channel", 'not moved');
+if (bLog().length || sessions() !== '0,0') fail(`a new session or a leave: ${bLog()}, connected ${sessions()}`);
+console.log("e joins: one of b's datagrams for a, on e's channel, leaves the link where it was");
+await e.leave();
+
+if (unnamed.length) fail(`datagrams given to an endpoint without their channel's peer: ${unnamed.slice(0, 5)}`);
 await Promise.all([a.leave(), b.leave()]);
 console.log('room_relay_move: ok');
 process.exit(0);

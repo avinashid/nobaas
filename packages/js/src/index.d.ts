@@ -269,13 +269,15 @@ export declare class Endpoint {
   /** Marks `addr` as a slow address of the linked `peer` (a signalling pipe), or clears the mark (`null`). Paths
    * rank slow address, then relay, then direct. On it the link moves to a relay offered with `addRelay` once a
    * probe through it is answered, and goes back to it ('pathChanged') when that relay's link goes, the peer's
-   * traffic comes over it again, or the relay carries nothing for 15 s. Does nothing for a peer not linked, or
-   * after `close()`. */
+   * traffic comes over it again, the relay carries nothing for 15 s, or data sent through it goes unacknowledged
+   * for 5 s. Then the link holds that relay off for a minute, twice as long each time it stalls the link again (up
+   * to 16 minutes). Does nothing for a peer not linked, or after `close()`. */
   setSlow(peer: PeerId | Uint8Array, addr: number | null): void;
   /** Offers `relay`, a peer linked directly, to carry the link to `peer` while that link is on its slow address
    * (`setSlow`): a sealed probe goes through `relay` every half second for 5 s, and the link moves there
-   * ('pathChanged') once `peer` answers through it, which it does only if it would use the relay too. Does
-   * nothing while relay-only, for a link not on its slow address, or after `close()`. */
+   * ('pathChanged') once `peer` answers through it, which it does only if it would use the relay too. The first
+   * probe goes out after the current task, with any others offered in it. Does nothing while relay-only, for a
+   * link not on its slow address, for a relay the link holds off (see `setSlow`), or after `close()`. */
   addRelay(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): void;
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
    * (reason 'closed') now rather than after its idle timeout. No local event for `peer`, though links it relayed
@@ -301,8 +303,11 @@ export declare class Endpoint {
    * in wasm memory between tries instead of being copied in each time. `data` is matched by
    * identity and must not change between tries; one message is kept at a time. */
   sendRetry(peer: PeerId | Uint8Array, data: string | Uint8Array, lane?: number): number;
-  /** Ignored after `close()`: late datagrams are normal. */
-  receive(addr: number, bytes: Uint8Array): void;
+  /** A datagram that arrived on handle `addr`. `peer`: the only peer that sends on that handle (its DataChannel,
+   * its signalling pipe), if there is one: a packet there for another peer's link, or a handshake from anyone else,
+   * is then dropped unread, so a peer that relays for others can't move their links onto its own channel. Ignored
+   * after `close()`: late datagrams are normal. */
+  receive(addr: number, bytes: Uint8Array, peer?: PeerId | Uint8Array | null): void;
   pump(): void;
   /** Frees the endpoint; a second call does nothing. Close the transport first, so that no
    * datagram arrives for a closed endpoint (`room.leave()` does this). */

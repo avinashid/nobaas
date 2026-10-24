@@ -128,7 +128,8 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
   throws(() => new WebRtcTransport(pw.endpoint(), fakeSig(), { RTCPeerConnection: Pc, privacy: 'relay-only', relay: 'ab'.repeat(4096) }), 'relay-only with a bad relay id');
 }
 
-// LocalTransport: datagrams from a bad `from` never reach the endpoint.
+// LocalTransport: datagrams from a bad `from` never reach the endpoint; one from a good
+// `from` does, naming it as the peer of its handle (FL2-2).
 {
   const sig = fakeSig();
   const e2 = pw.endpoint();
@@ -136,6 +137,12 @@ const fakeSig = () => ({ handlers: [], sent: [], onHello: () => {}, onMessage(fn
   for (const from of hostile) sig.handlers[0](from, { kind: 'dg', bytes: new Uint8Array(40) });
   check(t.byPeer.size === 0 && e2.stats().rxPackets === 0, 'LocalTransport drops datagrams from bad froms');
   throws(() => t.dial('ab'.repeat(4096)), 'LocalTransport.dial with a bad id');
+  const named = [];
+  const receive = e2.receive.bind(e2);
+  e2.receive = (addr, bytes, peer) => (named.push(peer), receive(addr, bytes, peer));
+  const good = pw.endpoint().id;
+  sig.handlers[0](good, { kind: 'dg', bytes: new Uint8Array(40) });
+  check(named.length === 1 && named[0] === good && e2.stats().rxPackets === 1, "LocalTransport names a datagram's sender as its handle's peer");
 }
 
 // NostrSignaling: a hello with a bad `from` in a well-formed relay event is dropped.
