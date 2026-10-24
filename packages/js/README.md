@@ -115,6 +115,69 @@ started queue grows until you drain it. `demo/poll.html` runs this way.
 
 Types are in `src/index.d.ts`.
 
+## Using with React
+
+Join in an effect and leave in its cleanup, so the room lives as long as the component:
+
+```jsx
+import { useEffect, useState } from 'react';
+import { joinRoom } from '@peerwire/js';
+
+export function useRoom(appId, roomId) {
+  const [room, setRoom] = useState(null);
+  const [peers, setPeers] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [error, setError] = useState(null);
+  useEffect(() => {
+    let gone = false, joined = null;
+    joinRoom({ appId, roomId }).then((r) => {
+      if (gone) return r.leave(); // cleaned up before the join resolved
+      joined = r;
+      const sync = () => setPeers([...r.peers]);
+      r.on('peer-join', sync);
+      r.on('peer-leave', sync);
+      r.on('message', (data, peer) => setMessages((m) => [...m, { peer, data }]));
+      setRoom(r);
+      sync();
+    }, (e) => gone || setError(e));
+    return () => { gone = true; joined?.leave(); setRoom(null); setPeers([]); setMessages([]); };
+  }, [appId, roomId]);
+  return { room, peers, messages, error };
+}
+
+function Chat() {
+  const { room, peers, messages, error } = useRoom('my-app', 'lobby');
+  if (error) return <p>{error.message}</p>;
+  if (!room) return <p>joining…</p>;
+  return (
+    <>
+      <p>{peers.length} peers</p>
+      <ul>{messages.map((m, i) => <li key={i}>{m.peer.slice(0, 6)}: {m.data}</li>)}</ul>
+      <button onClick={() => room.send('hi')}>Say hi</button>
+    </>
+  );
+}
+```
+
+- **StrictMode** mounts, cleans up and mounts again in development, so the first join
+  can resolve after its cleanup has run. The `gone` check leaves that room at once;
+  without it the page stays in the room twice and the other members see a second peer
+  for as long as the page is open.
+- **Dependencies:** list the options' values (`appId`, `roomId`), not an options object
+  made on each render, or every render leaves and joins again. Change presence with
+  `room.setPresence`, not by joining again.
+- **Client only:** a room needs the browser (WebRTC, BroadcastChannel). Effects don't run
+  during server rendering, so the hook is safe in a page that is rendered on the server
+  too. In Next.js, use it in a client component (`'use client'`). Importing
+  `@peerwire/js` touches no browser globals.
+- **The wasm:** bundlers find it next to the package; Vite does in dev and in a build.
+  To choose the file yourself, pass its URL as `wasm`:
+  `import wasmUrl from '@peerwire/js/peerwire_ffi.wasm?url'` (Vite), then
+  `joinRoom({ appId, roomId, wasm: wasmUrl })`. Root-relative URLs work too, such as
+  `wasm: '/peerwire_ffi.wasm'` for a copy in Vite's `public/`.
+- **Messages in state** suit a chat. For a game, handle `message` in a ref or a store
+  outside React, and render from it each frame.
+
 ## Files
 
 | File | What it is |
