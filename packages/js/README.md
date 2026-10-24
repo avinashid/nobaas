@@ -325,7 +325,8 @@ the fallback and the peer stay as they are. The room retries:
 Only the dialling side (the smaller id) offers; the other side asks it to. Each retry is
 an offer and an answer over the signalling relays, so a room keeps them rare: one at a time,
 at least 2 s apart, peers in turn, and a peer's requests count once per 20 s. A 20-peer room
-whose retries all fail makes about one per peer per 5 min, a few a minute at most.
+whose retries all fail makes about one per peer per 5 min, a few a minute at most. On the
+answering side, a peer's retry offers make at most one new connection per 2 s.
 
 **A direct channel found later.** A DataChannel to the peer opened outside the room (a
 browser birthday punch's, `src/birthday.js`, as Net Lab runs one) can take a fallback
@@ -431,6 +432,9 @@ Run these with Node and the Playwright install on this host:
   closes quietly and the next, twice as late, goes direct. The larger id's `retryDirect()` asks the
   dialling side. A `'public-only'` retry carries no host candidate. A microphone grant retries in a
   `'direct'` room only (not with `retryOnGrant: false`); so do `online` and a new connection type.
+  20 proven retry offers 50 ms apart make one connection and one answer (a copy of that offer is
+  answered again), the larger id ignores a request, and a retry whose `createOffer` throws fails
+  quietly so the next one goes direct.
 - `node packages/js/test/retry_backoff.mjs`: the retry schedule on a fake clock: the backoff and its
   jitter, one retry at a time, 2 s apart, peers in turn, requests once per 20 s; 20 failing peers
   for an hour stay within a few retries a minute.

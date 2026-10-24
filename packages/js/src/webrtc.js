@@ -175,6 +175,11 @@ function unaddressed(l) {
 }
 
 export class WebRtcTransport {
+  // A retry offer that makes a new connection is taken at most once per this many ms per
+  // peer (a copy of the one taken is still answered again). A peer's own retries are a
+  // fallback clock apart, so only a peer that floods them is refused. Tests shorten it.
+  static retryAnswerMs = 2000;
+
   // `loss` drops that fraction of outgoing datagrams, for testing.
   // `trickle: false` sends one offer/answer with every candidate once ICE
   // gathering finishes (fewer signalling messages, for relays like Nostr).
@@ -213,7 +218,8 @@ export class WebRtcTransport {
     this.trickle = trickle;
     this.dropped = 0; // datagrams dropped by the simulated `loss`
     this.congested = 0; // datagrams dropped because the DataChannel was full or refused them
-    this.badSignals = 0; // signals refused as malformed or unproven (see onSignal)
+    this.badSignals = 0; // signals refused as malformed, unproven or too soon (see onSignal, apply)
+    this.retryTaken = new Map(); // peer hex -> when its last retry offer made a connection
     this.resent = 0; // offers and answers sent again (OFFER_RESEND_MS)
     this.restarts = 0; // ICE restarts begun (as the dialling side)
     this.retried = 0; // retries begun (as the dialling side), see retry()
@@ -564,7 +570,16 @@ export class WebRtcTransport {
     this.dropRtc(peer);
     this.retried++;
     this.tr(peer, 'retry', { dialer: true });
-    this.dial(peer, { retry: true }).catch(() => {}); // a retry that can't start just ends (the room's hold)
+    const dialing = this.dial(peer, { retry: true });
+    const h = this.byPeer.get(peer); // dial() makes its link before its first await
+    dialing.catch(() => {
+      // A retry that can't start (createOffer threw) ends as one that didn't open: its link
+      // goes, so it doesn't refuse the next retry.
+      if (h === undefined || this.byPeer.get(peer) !== h) return;
+      this.dropRtc(peer);
+      this.tr(peer, 'retry-failed', {});
+      this.onPeer(peer, 'retry-failed');
+    });
     return true;
   }
 
@@ -573,6 +588,16 @@ export class WebRtcTransport {
     if (!isPeerId(peer) || !this.allowed(peer)) return;
     this.signal(peer, { kind: 'retry' });
     this.tr(peer, 'retry', { dialer: false });
+  }
+
+  // Whether a retry offer from `peer` may make a new connection now (see retryAnswerMs).
+  takeRetry(peer) {
+    const now = Date.now();
+    const ms = WebRtcTransport.retryAnswerMs;
+    if (now - (this.retryTaken.get(peer) ?? -Infinity) < ms) return false;
+    for (const [p, t] of this.retryTaken) if (now - t >= ms) this.retryTaken.delete(p);
+    this.retryTaken.set(peer, now);
+    return true;
   }
 
   async onSignal(from, msg) {
@@ -604,13 +629,13 @@ export class WebRtcTransport {
     if (msg.kind === 'offer') {
       const sdp = typeof msg.sdp?.sdp === 'string' ? msg.sdp.sdp : null;
       const old = msg.retry === true ? this.links.get(this.byPeer.get(from)) : null;
-      if (old && old.offerSdp !== sdp) {
-        // A retry (see retry()): the dialling side closed its link, which never opened, and
-        // offers afresh, so ours goes too. Not one that opened (it carries the link, or is
-        // about to) or that we dial.
-        if (old.dialer || old.opened || old.dc.readyState === 'open') return;
-        this.dropRtc(from);
-      }
+      // A retry (see retry()): the dialling side closed its link, which never opened, and
+      // offers afresh, so ours goes too. Not one that opened (it carries the link, or is
+      // about to) or that we dial.
+      if (old && old.offerSdp !== sdp && (old.dialer || old.opened || old.dc.readyState === 'open')) return;
+      // One that makes a new connection, at most once per retryAnswerMs (a copy doesn't).
+      if (msg.retry === true && old?.offerSdp !== sdp && !this.takeRetry(from)) return void this.badSignals++;
+      if (old && old.offerSdp !== sdp) this.dropRtc(from);
       const fresh = !this.byPeer.has(from);
       if (!fresh) {
         // The same offer again: our answer was lost (or is still being made). Send it again.
@@ -938,6 +963,7 @@ export class WebRtcTransport {
 
   close() {
     this.checking.clear();
+    this.retryTaken.clear();
     for (const peer of [...this.carriers.keys()]) this.dropCarrier(peer, undefined, true);
     for (const p of this.pipes.values()) clearTimeout(p.timer);
     this.pipes.clear();
