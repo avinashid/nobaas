@@ -62,11 +62,12 @@ NODE=(
   "node room leave|node packages/js/test/room_leave.mjs"
   "node room fallback|node packages/js/test/room_fallback.mjs"
   "node room adopt|node packages/js/test/room_adopt.mjs"
+  "node room same nat|node packages/js/test/room_same_nat.mjs"
   "node nat prediction|node packages/js/test/nat_predict.mjs"
   "node late ice|node packages/js/test/late_ice.mjs"
   "node birthday primitives|node packages/js/test/birthday.mjs"
 )
-NODE_FIRST='^node (room adopt|fuzz|room fallback|nostr bounds|pump re-arm)$'
+NODE_FIRST='^node (room adopt|room same nat|fuzz|room fallback|nostr bounds|pump re-arm)$'
 # Browser tests (headless Chromium on loopback): one at a time, as WebRTC timing suffers under load.
 BROWSER=(
   "browser|node packages/js/test/browser.mjs 2"
@@ -82,6 +83,7 @@ BROWSER=(
   "netlab|env RTC_OFF=2 node packages/js/test/netlab.mjs 3"
   "netlab rooms|node packages/js/test/netlab_rooms.mjs"
   "netlab mic|node packages/js/test/netlab_mic.mjs"
+  "netlab punch close|node packages/js/test/netlab_punch_close.mjs"
 )
 
 # Paths that cannot change a Rust test, clippy or fmt result. Anything else runs the Rust steps: a new crate,

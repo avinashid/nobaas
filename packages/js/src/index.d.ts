@@ -63,7 +63,8 @@ export interface JoinRoomOptions {
   /** Default: none for `'local'`, Google and Cloudflare STUN otherwise. */
   iceServers?: RTCIceServer[];
   /** Which of your addresses peers see in ICE candidates. `'direct'` (default): all of them.
-   * `'public-only'`: no LAN or loopback (`host`) candidates, only what STUN reports, so tabs of one
+   * `'public-only'`: no LAN or loopback (`host`) candidates, only what STUN reports (and no local address in
+   * a candidate's related address or the SDP's `c=` line either), so tabs of one
    * machine with no STUN server can't link. Relay-only is not available for rooms: use
    * `WebRtcTransport` with `privacy: 'relay-only'`. */
   privacy?: 'direct' | 'public-only';
@@ -78,6 +79,11 @@ export interface JoinRoomOptions {
   fallback?: 'auto' | 'peers' | 'off';
   /** How long a WebRTC link may take to open before the fallback starts. Default 8000 ms. */
   fallbackMs?: number;
+  /** The same for a peer behind your own public IPv4 (its ICE candidates name a public address yours do), such
+   * as a laptop on a phone's hotspot, where browsers find no direct path unless they show their LAN addresses.
+   * Default 3000 ms (at most `fallbackMs`). ICE goes on checking: if the link's DataChannel opens later (two
+   * desktops on one Wi-Fi), the link moves onto it and `route(peer)` says `'direct'` again. */
+  sameNatFallbackMs?: number;
   /** A WebRTC implementation for runtimes without one (Node: node-datachannel's polyfill).
    * Without WebRTC, `'local'` rooms send datagrams over the BroadcastChannel. */
   RTCPeerConnection?: typeof globalThis.RTCPeerConnection;
@@ -308,9 +314,16 @@ export declare class WebRtcTransport implements Transport {
     signaling: SignalingAdapter,
     options?: {
       iceServers?: RTCIceServer[];
-      /** `'carrier'`: an adopted channel started or stopped carrying the peer's link (see `adopt`). With
-       * `'closed'`, `handle` is the closed link's endpoint handle. */
+      /** `'failed'`: the DataChannel isn't open `fallbackMs` after its offer or answer (`sameNatFallbackMs` for a
+       * peer behind our public IPv4), or ICE failed; ICE goes on checking, and a channel that opens later takes
+       * over a link the endpoint made by other means (a relayed one punches over it; a pipe's datagrams go over it,
+       * and the far end's core moves the link there). `'carrier'`: an adopted channel started or stopped carrying
+       * the peer's link (see `adopt`). With `'closed'`, `handle` is the closed link's endpoint handle. */
       onPeer?: (peer: PeerId, state: 'open' | 'closed' | 'failed' | 'carrier', handle?: number) => void;
+      /** Default 8000 ms. */
+      fallbackMs?: number;
+      /** Default 3000 ms, at most `fallbackMs`. */
+      sameNatFallbackMs?: number;
       loss?: number;
       trickle?: boolean;
       /** `'relay-only'` needs `relay`: WebRTC then runs only with that peer. */
@@ -340,8 +353,9 @@ export declare class WebRtcTransport implements Transport {
    * Diagnostics: called for each link's signalling (`offer-sent`, `offer-received`, `answer-sent`, `answer-received`,
    * `ice-batch-sent`, `ice-batch-received`, with `candidateSummary` counts, `resend: true` on a copy and
    * `restart: true` for an ICE restart), ICE (`ice-state` with `state`, `candidate-error` with the STUN server `url`,
-   * `code`, `text`, `address`, `ice-restart` with `n`, `reason`, `dialer`) and port prediction (`guesses` with the
-   * peer's `ip`, `next`, `step` and the `n` candidates added).
+   * `code`, `text`, `address`, `ice-restart` with `n`, `reason`, `dialer`), port prediction (`guesses` with the
+   * peer's `ip`, `next`, `step` and the `n` candidates added) and `same-nat` (the peer's candidates name our
+   * public IPv4 `ip`, so the link falls back after `ms`).
    */
   trace: ((peer: PeerId, what: string, detail: Record<string, unknown>) => void) | null;
   /**
