@@ -56,7 +56,9 @@ export interface JoinRoomOptions {
   queue?: boolean;
   /** 32 bytes restoring an identity from `room.endpoint.secret()`; a fresh one by default. */
   secret?: Uint8Array;
-  /** Where to load `peerwire_ffi.wasm` from: a URL, a file path (Node) or the bytes. Default: next to this package. */
+  /** Where to load `peerwire_ffi.wasm` from: a URL (in a browser, relative and root-relative ones such as a bundler's
+   * `?url` import are fetched from the page's origin), a file path or `file:` URL (Node) or the bytes. Default: next to
+   * this package. */
   wasm?: string | URL | BufferSource;
   /** Nostr relays, for `signaling: 'nostr'`. */
   relays?: string[];
@@ -219,6 +221,8 @@ export interface Peerwire {
   endpoint(options?: { secret?: Uint8Array | null; shareAddresses?: boolean; relayOnly?: boolean }): Endpoint;
 }
 
+/** Loads the module from a URL (fetched; in a browser, relative and root-relative ones too), an absolute path or
+ * `file:` URL (read from disk, in Node only) or its bytes. A fetch with an HTTP error status rejects with it. */
 export declare function loadPeerwire(source: string | URL | BufferSource): Promise<Peerwire>;
 
 /** Every method that takes a peer throws a TypeError unless it is 32 bytes or 64 lowercase hex

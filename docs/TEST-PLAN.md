@@ -28,6 +28,7 @@ browser tests.
 | wasm build | `packages/js/build.sh` | builds `packages/js/pkg/peerwire_ffi.wasm` |
 | wasm size and imports | `WebAssembly.Module.imports` in Node | ≤ `WASM_MAX_BYTES` (350 KB) and 0 imports |
 | Node glue | `node packages/js/test/node_pair.mjs` | two endpoints connect; 1000 × 64 B and one 64 KiB reliable message arrive, the large one intact |
+| Node wasm source | `node packages/js/test/wasm_source.mjs` | `loadPeerwire` in Node reads an absolute path, a `file:` URL (string or URL) and bytes from disk as before; a missing path fails with ENOENT (disk, not fetch); an `http:` URL is fetched, and a 404 rejects with `HTTP 404` |
 | Node privacy | `node packages/js/test/privacy.mjs` | host candidates are filtered; a relay-only endpoint links through its relay and refuses a direct dial |
 | Node room | `node packages/js/test/room_node.mjs` | three `joinRoom` peers mesh; presence, lanes, targeted sends, backpressure, leave, a late joiner and `poll()` work |
 | Node peer ids | `node packages/js/test/peer_id.mjs` | SEC-1: an over-long or malformed peer id (the 8192-character repro, wrong sizes, uppercase, non-strings) throws a TypeError at every wasm copy and the module keeps working; BroadcastChannel, Nostr, WebRTC, local and room signalling drop a `from` that isn't 64 lowercase hex |
@@ -43,6 +44,7 @@ browser tests.
 | Browser | `node packages/js/test/browser.mjs 2` | two Chromium tabs form a WebRTC mesh on loopback and exchange data |
 | Arena | `node packages/js/test/arena.mjs 8 10` | every island's checkpoint hashes match, ticks keep confirming |
 | README chat | `node packages/js/test/readme.mjs` | the chat block in `packages/js/README.md` runs in two tabs, messages cross both ways, and it stays ≤ 10 lines |
+| wasm URL | `node packages/js/test/wasm_url.mjs` | two Chromium tabs join with `wasm: '/pkg/peerwire_ffi.wasm'` (root-relative, as a bundler's `?url` import gives) and a message crosses; a relative path, an absolute URL and a URL object load; a path that 404s rejects with `HTTP 404` |
 | Poll | `node packages/js/test/poll.mjs 3` | three tabs driven only by `poll()`/`sendTo()` see each other; a closed tab leaves |
 | WebRTC signals | `node packages/js/test/webrtc_signals.mjs` | NB-014: malformed offers leave no link and no unhandled rejection; 300 random signals neither throw nor reject; real offers are still answered |
 | Tab close | `node packages/js/test/leave.mjs --runs=5 --crash=0` | a tab streaming reliable data to two others is closed; both see its `peer-leave` within 5 s, every run (the Bye and the core's close go out from `pagehide`). By hand: `--runs=10 --stress=3` on a loaded host, and the default `--crash=1` crashes a tab (`chrome://crash`, no `pagehide`), whose leave comes by the 30 s idle timeout |
