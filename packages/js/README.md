@@ -281,6 +281,15 @@ presence and messages run unchanged on it. A pipe opens only for a peer whose he
 proved the room key. `fallback: 'peers'` skips step 3; `'off'` keeps WebRTC only.
 TURN in `iceServers` still works and is faster than step 3 when you have a server.
 
+**A member beats signalling.** A link over signalling moves to a member that links
+directly to both of you later (it joined, or its own WebRTC links opened). The room
+offers every such member, the core sends a sealed probe through it, and the link moves
+there (`'peer'`) once the far end answers through the member, which it does only if it
+would use that member too: one stray packet never moves it. If the member leaves, the
+link goes back to signalling at once (after 15 s of silence if it vanishes without a
+word), then on to another member that answers. It is the same link throughout, with no
+`'peer-leave'` or `'peer-join'`. A member never relays onto its own pipe.
+
 **Direct still wins.** ICE goes on checking after the fallback starts. If the link's own
 DataChannel opens later (two desktops on one Wi-Fi resolve each other's mDNS names), the
 link moves onto it, and `room.route(peer)` says `'direct'` again:

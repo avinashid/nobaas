@@ -195,7 +195,7 @@ export class Endpoint {
     this.transmitErrors = 0; // datagrams lost because onTransmit threw
   }
   // close() frees the wasm handle and buffers, so nothing may reach them afterwards:
-  // send and connect* throw, receive, addCandidate and setRelayOnly do nothing, queries return null or false
+  // send and connect* throw, receive, addCandidate, setSlow, addRelay and setRelayOnly do nothing, queries return null or false
   // (stats() returns the counters as they were at close).
   live(what) {
     if (this.closed) throw new Error(`${what}: endpoint closed`);
@@ -249,6 +249,24 @@ export class Endpoint {
   addCandidate(addr, peer) {
     if (this.closed) return;
     this.pw.x.pw_add_candidate(this.h, nowUs(), addr, this.setPeer(peer));
+    this.pump();
+  }
+  // Handle `addr` reaches the linked `peer` slowly (a signalling pipe), or null: no
+  // longer. On it the link moves to a relay offered with addRelay once a probe through
+  // that relay is answered, and goes back to `addr` when the relay goes.
+  setSlow(peer, addr) {
+    if (this.closed) return;
+    this.pw.x.pw_set_slow(this.h, this.setPeer(peer), addr ?? 0, addr == null ? 0 : 1);
+  }
+  // Offers `relay`, a peer linked directly, to carry the link to `peer` while that link
+  // is on its slow address: probes go through `relay`, and the link moves there once
+  // `peer` answers through it. Does nothing while relay-only or after close().
+  addRelay(relay, peer) {
+    if (this.closed) return;
+    const pp = this.setPeer(peer);
+    const rp = this.pw.put(peerBytes(relay));
+    this.pw.x.pw_add_relay(this.h, nowUs(), rp, pp);
+    this.pw.free(rp, 32);
     this.pump();
   }
   // Ends the session with `peer` and sends it a sealed close at once (this pumps), so it

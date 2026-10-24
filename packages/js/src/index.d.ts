@@ -155,7 +155,8 @@ export declare class Room {
   /** How `peer` is reached: its own WebRTC link, a channel handed to `adoptChannel` (`adopted`), relayed by
    * member `via`, or over the signalling relays; null while it isn't linked. A `'peer'` or `'signaling'` route
    * can become `'direct'` later, with the same session (no `peer-leave` or `peer-join`): ICE goes on checking,
-   * the room retries WebRTC (see `retryDirect`), or a channel is adopted. */
+   * the room retries WebRTC (see `retryDirect`), or a channel is adopted. A `'signaling'` route also moves to a
+   * member linked directly to both of you once that member is seen to relay both ways, and back if it goes. */
   route(peer: PeerId): { kind: 'direct'; adopted?: true } | { kind: 'peer'; via: PeerId } | { kind: 'signaling' } | null;
   /** Tries WebRTC again, now, with `peer` (or every peer) the room reaches only by fallback: a new connection,
    * so one made after a network change, or a microphone or camera grant (privacy `'direct'`), offers the new
@@ -265,8 +266,20 @@ export declare class Endpoint {
    * answers from it. Does nothing for a peer linked directly or unknown, while relay-only for one linked
    * through a relay or being dialled with one (nothing is sent to `addr`), or after `close()`. */
   addCandidate(addr: number, peer: PeerId | Uint8Array): void;
+  /** Marks `addr` as a slow address of the linked `peer` (a signalling pipe), or clears the mark (`null`). Paths
+   * rank slow address, then relay, then direct. On it the link moves to a relay offered with `addRelay` once a
+   * probe through it is answered, and goes back to it ('pathChanged') when that relay's link goes, the peer's
+   * traffic comes over it again, or the relay carries nothing for 15 s. Does nothing for a peer not linked, or
+   * after `close()`. */
+  setSlow(peer: PeerId | Uint8Array, addr: number | null): void;
+  /** Offers `relay`, a peer linked directly, to carry the link to `peer` while that link is on its slow address
+   * (`setSlow`): a sealed probe goes through `relay` every half second for 5 s, and the link moves there
+   * ('pathChanged') once `peer` answers through it, which it does only if it would use the relay too. Does
+   * nothing while relay-only, for a link not on its slow address, or after `close()`. */
+  addRelay(relay: PeerId | Uint8Array, peer: PeerId | Uint8Array): void;
   /** Ends the session with `peer` and sends it a sealed close at once (pumps), so it sees 'disconnected'
-   * (reason 'closed') now rather than after its idle timeout. No local event; does nothing after `close()`. */
+   * (reason 'closed') now rather than after its idle timeout. No local event for `peer`, though links it relayed
+   * go back to their slow addresses ('pathChanged'); does nothing after `close()`. */
   disconnect(peer: PeerId | Uint8Array): void;
   /** Relayed links never punch to a direct path, dials through a relay alone (given the relay before any
    * direct address of their own, or with a relay when this is turned on) send nothing direct, relays forward
