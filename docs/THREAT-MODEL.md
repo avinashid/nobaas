@@ -81,7 +81,8 @@ that needs a change is tracked as an NB card.
 | NB48b-5, NB48b-6 (Info) | **Fixed** by `08425b8` (a stale link's close keeps the peer) and `2a00ecb` (CARRY replies bounded), re-checked 2026-10-24 |
 | MIC-1, MIC-3 (Low) | **Fixed** by `d78d046`, `877d02c` and `6303bd8` (Net Lab's global room and punch offers; `public-only` in `@peerwire/js` 0.1.1 and earlier), reviewed 2026-10-24; residual MIC-4 ([below](#bounds-and-residuals-from-reviews-nb-014nb-043)) |
 | MIC-2 (Info) | **Fixed** by `9282d36` (a punch that ended closes what it opened) and `691dec0` (one offer and one answer per punch, which also closes a Low NB48-1 bypass), reviewed 2026-10-24 |
-| MIC-4 (Low), MIC-5 (Info) | Open, same section |
+| MIC-4 (Low) | **Fixed** by `134fed3` (the button rejoins before it re-tests the network), reviewed 2026-10-24 |
+| MIC-5 (Info) | Open, same section |
 | Earlier reviews' bounds and residuals | Recorded in [Bounds from reviews](#bounds-and-residuals-from-reviews-nb-014nb-043) |
 
 ### SEC-1 — Unvalidated peer-id length corrupts the wasm heap (High) — NB-021
@@ -920,8 +921,12 @@ and what it accepted. Values are from main `7b716a2`.
     only then rejoins with `public-only`; `guardGlobal` leaves it to the button. A
     member who links in that window gets the real local addresses. In Chromium, with
     a 2.5 s re-test, a tab that joined during it got all four of the other tab's local
-    addresses, and none with the rejoin first. Suggested: rejoin as soon as the
-    permission changes, before anything else that waits.
+    addresses, and none with the rejoin first. **Fixed** by `134fed3`: the button
+    rejoins as soon as `getUserMedia` resolves, then re-tests. Leaving the old room
+    closes its connections synchronously, so a description still gathering there is
+    never sent. Accepted residual: the grant is stored before `getUserMedia`
+    resolves, so during the device's open time a member joining the old room could
+    still be described with the local addresses, if gathering also finishes in it.
 
 ---
 
