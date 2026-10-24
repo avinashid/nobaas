@@ -271,6 +271,25 @@ pub unsafe extern "C" fn pw_handle_datagram(h: *mut PwEndpoint, now_us: u64, add
     (*h).ep.handle_datagram(now(now_us), addr, bytes(data, len));
 }
 
+/// Like `pw_handle_datagram`, for handle `addr`, a channel only `peer_id` sends
+/// on (its WebRTC DataChannel, its signalling pipe): a packet on it for another
+/// peer's link, or a handshake from anyone else, is dropped unread, so no peer
+/// can move another's link onto its own channel. PW_ERR_INVALID, and nothing
+/// read, for a null `peer_id`. See `Endpoint::handle_datagram_from`.
+#[no_mangle]
+pub unsafe extern "C" fn pw_handle_datagram_from(
+    h: *mut PwEndpoint,
+    now_us: u64,
+    addr: u32,
+    peer_id: *const u8,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    let Some(p) = peer(peer_id) else { return PW_ERR_INVALID };
+    (*h).ep.handle_datagram_from(now(now_us), addr, &p, bytes(data, len));
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pw_handle_timeout(h: *mut PwEndpoint, now_us: u64) {
     (*h).ep.handle_timeout(now(now_us));
@@ -584,6 +603,36 @@ mod tests {
             }
             if buf[0] == 5 && buf[33] == 0 {
                 out.push(u32::from_le_bytes(buf[34..38].try_into().unwrap()));
+            }
+        }
+    }
+
+    /// pw_handle_datagram_from: a datagram of b's on handle 3, c's channel, is
+    /// dropped unread, so a's link to b stays at handle 2; with no peer it is
+    /// refused; on handle 4, a channel of b's, the same datagram moves the link there.
+    #[test]
+    fn handle_datagram_from_drops_another_peers_packets() {
+        unsafe {
+            let mut ids = [[0u8; 32]; 3];
+            let eps: Vec<_> = (0..3)
+                .map(|i| pw_endpoint_new(std::ptr::null(), [i as u8 + 1; 32].as_ptr(), 0, ids[i].as_mut_ptr()))
+                .collect();
+            let (a, b) = (eps[0], eps[1]);
+            assert_eq!(pw_connect(a, 0, 2, ids[1].as_ptr()), 0);
+            pump(a, b, 1000);
+            assert_eq!(pw_is_connected(a, ids[1].as_ptr()), 1);
+            direct_paths(a);
+            assert_eq!(pw_send(b, ids[0].as_ptr(), 0, b"hi".as_ptr(), 2), 0);
+            let (mut buf, mut addr) = (vec![0u8; 2048], 0u32);
+            let n = pw_poll_transmit(b, 2000, &mut addr, buf.as_mut_ptr(), buf.len()) as usize;
+            assert_eq!(addr, 1);
+            assert_eq!(pw_handle_datagram_from(a, 2000, 3, ids[2].as_ptr(), buf.as_ptr(), n), 0);
+            assert_eq!(direct_paths(a), Vec::<u32>::new());
+            assert_eq!(pw_handle_datagram_from(a, 2000, 4, std::ptr::null(), buf.as_ptr(), n), PW_ERR_INVALID);
+            assert_eq!(pw_handle_datagram_from(a, 2000, 4, ids[1].as_ptr(), buf.as_ptr(), n), 0);
+            assert_eq!(direct_paths(a), vec![4]);
+            for h in eps {
+                pw_endpoint_free(h);
             }
         }
     }

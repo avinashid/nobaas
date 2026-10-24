@@ -13,7 +13,9 @@
 // - a link that is direct already: false, at once;
 // - while the endpoint's path still names a relayed channel that just closed, the old
 //   WebRTC link to the peer closing doesn't drop it (NB48b-5);
-// - 500 CARRY get a handful of CARRIED, none past the buffer cap (NB48b-6).
+// - 500 CARRY get a handful of CARRIED, none past the buffer cap (NB48b-6);
+// - every datagram the transport gives an endpoint, an adopted channel's too, names the
+//   peer of the channel it came on.
 //
 //   node packages/js/test/room_adopt.mjs
 import { joinRoom } from '../src/index.js';
@@ -136,13 +138,24 @@ function punched() {
 }
 
 let n = 0;
-const room = (name) => joinRoom({
-  appId: 'peerwire-test',
-  roomId: `adopt-${process.pid}-${n}`,
-  presence: { name },
-  fallbackMs: 300,
-  RTCPeerConnection: fakePc(name),
-});
+// Every datagram the transport gives an endpoint (an adopted channel's too) names the peer
+// whose channel it came on.
+const unnamed = [];
+const room = async (name) => {
+  const r = await joinRoom({
+    appId: 'peerwire-test',
+    roomId: `adopt-${process.pid}-${n}`,
+    presence: { name },
+    fallbackMs: 300,
+    RTCPeerConnection: fakePc(name),
+  });
+  const receive = r.endpoint.receive.bind(r.endpoint);
+  r.endpoint.receive = (addr, bytes, peer) => {
+    if (typeof peer !== 'string' || peer === r.self) unnamed.push(`${name}: handle ${addr}, peer ${peer}`);
+    receive(addr, bytes, peer);
+  };
+  return r;
+};
 const isAdopted = (r) => r?.kind === 'direct' && r.adopted === true;
 
 // 1. Over signalling.
@@ -277,5 +290,6 @@ block('a2', 'b2');
   await Promise.all([a.leave(), b.leave(), c.leave()]);
 }
 
+if (unnamed.length) fail(`datagrams given to an endpoint without their channel's peer: ${unnamed.slice(0, 5)}`);
 console.log('room_adopt: ok');
 process.exit(0);

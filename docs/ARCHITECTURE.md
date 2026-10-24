@@ -46,7 +46,11 @@ over a signaling carrier, and simultaneous dials. See [NAT-TRAVERSAL.md](NAT-TRA
 5. **Rank paths.** Paths rank slow address, then relay, then direct. A host marks an address slow
    (`set_slow`: a browser room's signalling pipe) and offers relays for it (`add_relay`). The link then
    sends a sealed PUNCH through each relay and moves to the first whose PUNCH_ACK comes back through it. The far
-   end answers only if it would use that relay too. When the relay goes, the link goes back to the slow address.
+   end answers only if it would use that relay too. When the relay goes, the link goes back to the slow address,
+   as it does when data sent through the relay goes unacknowledged for 5 s; then it holds that relay off for a minute,
+   twice as long on each repeat. A browser host names the peer whose channel each datagram came on
+   (`handle_datagram_from`), so a member can't send another peer's packets on its own channel to move their link
+   onto it; on UDP a link still roams to wherever its peer's packets come from.
 
 ## Lanes
 

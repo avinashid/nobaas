@@ -305,7 +305,7 @@ export class WebRtcTransport {
     dc.onmessage = (e) => {
       if (!(e.data instanceof ArrayBuffer) || e.data.byteLength > MAX_DATAGRAM) return;
       l.heard = true;
-      this.ep.receive(h, new Uint8Array(e.data));
+      this.ep.receive(h, new Uint8Array(e.data), peer);
     };
     pc.onicecandidate = (e) => {
       const c = e.candidate;
@@ -810,7 +810,7 @@ export class WebRtcTransport {
         return void this.badSignals++;
       }
       this.piped.received++;
-      this.ep.receive(h, bytes);
+      this.ep.receive(h, bytes, from);
     }
   }
 
@@ -860,7 +860,7 @@ export class WebRtcTransport {
         const b = new Uint8Array(e.data);
         // Anything from the far end means it adopted its end too.
         if (!c.live) settle(true);
-        if (b.length !== 1) return this.ep.receive(c.addr, b);
+        if (b.length !== 1) return this.ep.receive(c.addr, b, peer);
         if (b[0] === CARRY && Date.now() - c.replied >= CARRY_EVERY_MS) {
           c.replied = Date.now();
           say(CARRIED);

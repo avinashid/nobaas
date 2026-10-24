@@ -260,14 +260,15 @@ export class Endpoint {
   }
   // Offers `relay`, a peer linked directly, to carry the link to `peer` while that link
   // is on its slow address: probes go through `relay`, and the link moves there once
-  // `peer` answers through it. Does nothing while relay-only or after close().
+  // `peer` answers through it. The probes go out after this task, with those of any other
+  // relays offered in it. Does nothing while relay-only or after close().
   addRelay(relay, peer) {
     if (this.closed) return;
     const pp = this.setPeer(peer);
     const rp = this.pw.put(peerBytes(relay));
     this.pw.x.pw_add_relay(this.h, nowUs(), rp, pp);
     this.pw.free(rp, 32);
-    this.pump();
+    this.schedule();
   }
   // Ends the session with `peer` and sends it a sealed close at once (this pumps), so it
   // sees 'disconnected' now rather than after its idle timeout. No local event; does
@@ -387,14 +388,18 @@ export class Endpoint {
     if (r !== WOULD_BLOCK) this.unkeep();
     return r;
   }
-  // Feed a datagram that arrived on transport handle `addr`. Over MAX_DATAGRAM is never ours: dropped.
-  // After close() a late datagram is normal and is dropped too.
-  receive(addr, bytes) {
+  // Feed a datagram that arrived on transport handle `addr`. `peer`, if given: the only peer that
+  // sends on that handle (its DataChannel, its pipe), so a packet there for another peer's link is
+  // dropped unread. Over MAX_DATAGRAM is never ours: dropped. After close() a late datagram is
+  // normal and is dropped too.
+  receive(addr, bytes, peer = null) {
     if (this.closed) return;
     bytes = bytesOf(bytes);
     if (bytes.length > MAX_DATAGRAM) return;
+    const pp = peer == null ? 0 : this.setPeer(peer);
     this.pw.mem().set(bytes, this.rxBuf);
-    this.pw.x.pw_handle_datagram(this.h, nowUs(), addr, this.rxBuf, bytes.length);
+    if (pp) this.pw.x.pw_handle_datagram_from(this.h, nowUs(), addr, pp, this.rxBuf, bytes.length);
+    else this.pw.x.pw_handle_datagram(this.h, nowUs(), addr, this.rxBuf, bytes.length);
     this.received = true;
     this.schedule();
   }

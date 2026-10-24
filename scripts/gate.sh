@@ -58,6 +58,7 @@ NODE=(
   "node pump re-arm|node packages/js/test/pump_rearm.mjs"
   "node endpoint closed|node packages/js/test/endpoint_closed.mjs"
   "node scratch buffers|node packages/js/test/scratch_buffers.mjs"
+  "node receive from|node packages/js/test/receive_from.mjs"
   "node room drain|node packages/js/test/room_drain.mjs"
   "node fuzz|node packages/js/test/fuzz.mjs"
   "node room leave|node packages/js/test/room_leave.mjs"
