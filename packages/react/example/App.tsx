@@ -5,6 +5,11 @@ import { RoomProvider, useMessages, usePeers, usePeerState, useRoom, useSharedSt
 type Me = { name: string };
 type Point = { x: number; y: number };
 
+// Other members can send anything, so each hook takes only what passes a check, which also gives its type.
+// React throws on an object where it expects text, and that would unmount the app (and leave the room).
+const isMe = (p: unknown): p is Me => typeof (p as Me)?.name === 'string';
+const isPoint = (v: unknown): v is Point => Number.isFinite((v as Point)?.x) && Number.isFinite((v as Point)?.y);
+
 export function App({ roomId, signaling, initialName }: { roomId: string; signaling: 'local' | 'nostr'; initialName: string }) {
   const [name, setName] = useState(initialName);
   return (
@@ -32,7 +37,7 @@ function Status() {
 }
 
 function Members() {
-  const peers = usePeers<Me>();
+  const peers = usePeers({ accept: isMe });
   return (
     <section>
       <h2>In the room ({peers.length} besides you)</h2>
@@ -47,7 +52,8 @@ function Members() {
   );
 }
 
-// One number for the whole room: anyone can change it, and someone who joins later sees it.
+// One number for the whole room: anyone can change it, and someone who joins later sees it. With no `accept`,
+// useSharedState takes only values of the kind `initial` is: numbers here.
 function Counter() {
   const [count, setCount] = useSharedState('count', 0);
   return (
@@ -61,8 +67,8 @@ function Counter() {
 }
 
 function Chat() {
-  const peers = usePeers<Me>();
-  const { messages, send } = useMessages<string>(100);
+  const peers = usePeers({ accept: isMe });
+  const { messages, send } = useMessages({ limit: 100, accept: (data) => typeof data === 'string' });
   const [text, setText] = useState('');
   const nameOf = (id: string) => peers.find((p) => p.id === id)?.presence.name ?? id.slice(0, 6);
   const submit = (e: FormEvent) => {
@@ -76,7 +82,7 @@ function Chat() {
       <ul id="log">
         {messages.map((m) => (
           <li key={m.id}>
-            <b>{m.mine ? 'me' : nameOf(m.peer)}:</b> {String(m.data)}
+            <b>{m.mine ? 'me' : nameOf(m.peer)}:</b> {m.data}
           </li>
         ))}
       </ul>
@@ -90,8 +96,8 @@ function Chat() {
 
 // Everyone's pointer, live: positions go on the unreliable lane, as fractions of the board.
 function Board() {
-  const peers = usePeers<Me>();
-  const [cursors, setCursor] = usePeerState<Point>('cursor');
+  const peers = usePeers({ accept: isMe });
+  const [cursors, setCursor] = usePeerState('cursor', { accept: isPoint });
   const move = (e: PointerEvent<HTMLDivElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     setCursor({ x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height });

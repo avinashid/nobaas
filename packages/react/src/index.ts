@@ -8,6 +8,7 @@ import {
   useContext,
   useEffect,
   useInsertionEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -153,27 +154,64 @@ export function useRoom(): RoomState {
   return state;
 }
 
-// Every hook below works on `room` when it is given (null: no room), else on the nearest RoomProvider's.
+/** Which room a hook works on: `room` when given (null: none), else the nearest RoomProvider's. */
+export interface RoomOption {
+  room?: Room | null;
+}
+
+/**
+ * A check of a value another member sent, which TypeScript also takes as the value's type, e.g.
+ * `(v) => typeof v === 'string'`. Members can send any JSON, so render nothing a check hasn't passed: an object
+ * where React expects text throws, and an app with no error boundary unmounts and leaves the room.
+ */
+export type Accept<T> = ((value: unknown) => value is T) | ((value: unknown) => boolean);
+
 function useTarget(room: Room | null | undefined): Room | null {
   const state = useContext(RoomContext);
   return room === undefined ? (state?.room ?? null) : room;
 }
 
-/** The other members, oldest first, with their presence. */
-export function usePeers<P = Presence>(room?: Room | null): readonly Peer<P>[] {
-  const r = useTarget(room);
+// The latest value passed, for callbacks that shouldn't change identity with it.
+function useLatest<V>(value: V): { readonly current: V } {
+  const ref = useRef(value);
+  useInsertionEffect(() => {
+    ref.current = value;
+  });
+  return ref;
+}
+
+// useSharedState's check when none is given: a value of the same kind as `initial`.
+function sameKind(initial: unknown): (value: unknown) => boolean {
+  if (initial === null || initial === undefined) return () => true;
+  if (Array.isArray(initial)) return Array.isArray;
+  const t = typeof initial;
+  if (t === 'object') return (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
+  return (v) => typeof v === t;
+}
+
+/**
+ * The other members, oldest first, with their presence. With `accept`, a member whose presence fails it is left
+ * out, so `presence` always has the type `accept` checks.
+ */
+export function usePeers<P = Presence>(options: { accept?: Accept<P> } & RoomOption = {}): readonly Peer<P>[] {
+  const r = useTarget(options.room);
   const store = r ? storeOf(r) : null;
+  const accept = useLatest(options.accept);
   const subscribe = useCallback((fn: () => void) => (store ? store.subscribe('peers', fn) : () => {}), [store]);
-  return useSyncExternalStore(
+  const all = useSyncExternalStore(
     store ? subscribe : noSubscribe,
     () => (store ? store.peers() : NO_PEERS),
     () => NO_PEERS,
-  ) as readonly Peer<P>[];
+  );
+  return useMemo(() => {
+    const ok = accept.current;
+    return (ok ? all.filter((p) => ok(p.presence)) : all) as readonly Peer<P>[];
+  }, [all, accept]);
 }
 
 /** Our presence and a setter: like useState, and every member sees the change. */
-export function usePresence<P = Presence>(room?: Room | null): [P | undefined, SetState<P>] {
-  const r = useTarget(room);
+export function usePresence<P = Presence>(options: RoomOption = {}): [P | undefined, SetState<P>] {
+  const r = useTarget(options.room);
   const store = r ? storeOf(r) : null;
   const subscribe = useCallback((fn: () => void) => (store ? store.subscribe('self', fn) : () => {}), [store]);
   const presence = useSyncExternalStore(
@@ -194,14 +232,12 @@ export function usePresence<P = Presence>(room?: Room | null): [P | undefined, S
 
 /**
  * Calls `handler` for each room event, always the latest handler passed, so it can be an inline function.
- * `message` skips the messages this package sends for shared and per-peer state.
+ * `message` skips the messages this package sends for shared and per-peer state. Arguments come from other
+ * members as sent: check them.
  */
-export function useRoomEvent<E extends keyof RoomEvents>(event: E, handler: RoomEvents[E], room?: Room | null): void {
-  const r = useTarget(room);
-  const latest = useRef(handler);
-  useInsertionEffect(() => {
-    latest.current = handler;
-  });
+export function useRoomEvent<E extends keyof RoomEvents>(event: E, handler: RoomEvents[E], options: RoomOption = {}): void {
+  const r = useTarget(options.room);
+  const latest = useLatest(handler);
   useEffect(() => {
     if (!r) return;
     const fn = (...args: unknown[]) => {
@@ -209,7 +245,14 @@ export function useRoomEvent<E extends keyof RoomEvents>(event: E, handler: Room
       (latest.current as (...args: unknown[]) => void)(...args);
     };
     return r.on(event, fn as RoomEvents[E]);
-  }, [r, event]);
+  }, [r, event, latest]);
+}
+
+export interface UseMessagesOptions<T> extends RoomOption {
+  /** How many to keep, newest last. Default 200. */
+  limit?: number;
+  /** Keep only messages that pass; `info` says how each was sent. Without it, every message is kept as sent. */
+  accept?: ((data: unknown, info: MessageInfo) => data is T) | ((data: unknown, info: MessageInfo) => boolean);
 }
 
 export interface UseMessagesResult<T> {
@@ -220,24 +263,22 @@ export interface UseMessagesResult<T> {
   clear: () => void;
 }
 
-/** The room's messages as a list, for a chat or an event log: the newest `limit` (default 200) are kept. */
-export function useMessages<T = any>(limit = 200, room?: Room | null): UseMessagesResult<T> {
-  const r = useTarget(room);
+/** The room's messages as a list, for a chat or an event log. */
+export function useMessages<T = any>(options: UseMessagesOptions<T> = {}): UseMessagesResult<T> {
+  const r = useTarget(options.room);
   const [messages, setMessages] = useState<readonly Message<T>[]>([]);
-  const keep = Math.max(1, limit);
-  // A new limit applies from the next message; only a new room empties the list.
-  const kept = useRef(keep);
-  useInsertionEffect(() => {
-    kept.current = keep;
-  });
-  const add = useCallback((m: Message<T>) => setMessages((list) => [...list, m].slice(-kept.current)), []);
+  // A new limit or check applies from the next message; only a new room empties the list.
+  const keep = useLatest(Math.max(1, options.limit ?? 200));
+  const accept = useLatest(options.accept);
+  const add = useCallback((m: Message<T>) => setMessages((list) => [...list, m].slice(-keep.current)), [keep]);
   useEffect(() => {
     setMessages((list) => (list.length ? [] : list));
     if (!r) return;
     return r.on('message', (data, peer, info) => {
-      if (!isInternal(data)) add({ id: ++nextId, peer, data, lane: info.lane, kind: info.kind, at: Date.now(), mine: false });
+      if (isInternal(data) || (accept.current && !accept.current(data, info))) return;
+      add({ id: ++nextId, peer, data, lane: info.lane, kind: info.kind, at: Date.now(), mine: false });
     });
-  }, [r, add]);
+  }, [r, add, accept]);
   const send = useCallback(
     (data: T, options?: SendOptions) => {
       if (!r) return 0;
@@ -257,14 +298,15 @@ export function useMessages<T = any>(limit = 200, room?: Room | null): UseMessag
  * State shared by the whole room: like useState, but every member that uses `key` sees the same value, and a
  * member that joins later catches up. The last write wins (by a logical clock, so all members agree). Values go
  * as JSON. Until the room is joined the value is `initial` and setting it does nothing.
+ *
+ * A value that fails `accept` reads as `initial`. Without `accept`, a value must be of the same kind as `initial`:
+ * the same `typeof`, an array for an array, a non-array object for an object; anything for null.
  */
-export function useSharedState<T>(key: string, initial: T, room?: Room | null): [T, SetState<T>] {
-  const r = useTarget(room);
+export function useSharedState<T>(key: string, initial: T, options: { accept?: Accept<T> } & RoomOption = {}): [T, SetState<T>] {
+  const r = useTarget(options.room);
   const store = r ? storeOf(r) : null;
-  const first = useRef(initial);
-  useInsertionEffect(() => {
-    first.current = initial;
-  });
+  const ok = options.accept ?? sameKind(initial);
+  const latest = useLatest({ initial, ok });
   const subscribe = useCallback(
     (fn: () => void) => {
       if (!store) return () => {};
@@ -282,22 +324,27 @@ export function useSharedState<T>(key: string, initial: T, room?: Room | null): 
     (next) => {
       if (!store) return;
       const cur = store.getShared(key);
-      const prev = cur ? (cur.v as T) : first.current;
+      const prev = cur && latest.current.ok(cur.v) ? (cur.v as T) : latest.current.initial;
       store.setShared(key, typeof next === 'function' ? (next as (prev: T) => T)(prev) : next);
     },
-    [store, key],
+    [store, key, latest],
   );
-  return [entry ? (entry.v as T) : initial, set];
+  return [entry && ok(entry.v) ? (entry.v as T) : initial, set];
 }
 
 /**
  * Each member's latest value for `key`, such as a cursor or a controller's input, and a setter for ours. Values
  * go on the unreliable lane as they change, then once reliably when they settle (SETTLE_MS); a member that
- * leaves drops out, and one that joins gets ours. Ours is not in the record. Values go as JSON.
+ * leaves drops out, and one that joins gets ours. Ours is not in the record. Values go as JSON. With `accept`, a
+ * value that fails it is left out.
  */
-export function usePeerState<T>(key: string, room?: Room | null): [Readonly<Record<PeerId, T>>, (value: T) => void] {
-  const r = useTarget(room);
+export function usePeerState<T = any>(
+  key: string,
+  options: { accept?: Accept<T> } & RoomOption = {},
+): [Readonly<Record<PeerId, T>>, (value: T) => void] {
+  const r = useTarget(options.room);
   const store = r ? storeOf(r) : null;
+  const accept = useLatest(options.accept);
   const subscribe = useCallback(
     (fn: () => void) => {
       if (!store) return () => {};
@@ -306,11 +353,18 @@ export function usePeerState<T>(key: string, room?: Room | null): [Readonly<Reco
     },
     [store, key],
   );
-  const values = useSyncExternalStore(
+  const all = useSyncExternalStore(
     store ? subscribe : noSubscribe,
     () => (store ? store.getLive(key) : NO_VALUES),
     () => NO_VALUES,
-  ) as Readonly<Record<PeerId, T>>;
+  );
+  const values = useMemo(() => {
+    const ok = accept.current;
+    if (!ok) return all;
+    const kept: Record<PeerId, unknown> = {};
+    for (const [peer, v] of Object.entries(all)) if (ok(v)) kept[peer] = v;
+    return Object.freeze(kept);
+  }, [all, accept]) as Readonly<Record<PeerId, T>>;
   const set = useCallback((value: T) => store?.setLive(key, value), [store, key]);
   return [values, set];
 }

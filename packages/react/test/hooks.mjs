@@ -1,7 +1,8 @@
 // @peerwire/react in Node: React components rendered with react-dom into jsdom, members of one room over
 // BroadcastChannel (signaling 'local'). Checks server rendering (initial values, no room), joining under StrictMode with no ghost member, presence both
 // ways, messages and their limit, shared state (concurrent writes converge, a late joiner catches up), per-peer
-// values, leaving, switching rooms, a failed join, and a member that sends malformed or flooding state messages.
+// values, leaving, switching rooms, a failed join, a member that sends malformed or flooding state messages, and
+// `accept` keeping a member's wrongly typed presence, messages, shared and per-peer values out.
 // Needs the build: `npm run build` (packages/react) and packages/js/build.sh.
 //
 //   node packages/react/test/hooks.mjs
@@ -59,16 +60,20 @@ const { createRoot } = await import('react-dom/client');
 function Probe({ out }) {
   const { room, status } = useRoom();
   const peers = usePeers();
+  const named = usePeers({ accept: (p) => typeof p?.name === 'string' });
   const [me, setMe] = usePresence();
-  const { messages, send } = useMessages(5);
+  const { messages, send } = useMessages({ limit: 5 });
+  const { messages: texts } = useMessages({ accept: (d) => typeof d === 'string' });
   const [count, setCount] = useSharedState('count', 0);
   const [late] = useSharedState('k1099', 'none');
   const [cursors, setCursor] = usePeerState('cursor');
+  const [points] = usePeerState('cursor', { accept: (v) => typeof v?.x === 'number' });
   const [tick, setTick] = useState(0);
   // A new handler every render: the latest one must be called.
   useRoomEvent('message', (data) => out.raw.push([tick, data]));
   out.maxPeers = Math.max(out.maxPeers ?? 0, peers.length);
-  Object.assign(out, { room, status, peers, me, messages, count, late, cursors, setMe, send, setCount, setCursor, setTick, tick });
+  Object.assign(out, { room, status, peers, named, me, messages, texts, count, late, cursors, points });
+  Object.assign(out, { setMe, send, setCount, setCursor, setTick, tick });
   return null;
 }
 
@@ -182,13 +187,35 @@ E.send({ $peerwire: 'live', k: 'cursor', v: { x: 7 }, n: 5 });
 await until('the valid value after the malformed ones', () => A.out.cursors[E.self]?.x === 7);
 if ([A, B, C, D].some((m) => m.out.count !== won + 1)) fail(`a malformed write took: ${[A, B, C, D].map((m) => m.out.count)}`);
 // Keys past MAX_KEYS (1024) are ignored: 'count' and 'k1099' make 1100 offered; 'k1099' must not take.
-for (let i = 0; i < 1100; i++) E.send({ $peerwire: 'set', k: `k${i}`, v: i, c: 1 });
+for (let i = 0; i < 1100; i++) E.send({ $peerwire: 'set', k: `k${i}`, v: `v${i}`, c: 1 });
 E.send({ $peerwire: 'live', k: 'cursor', v: { x: 8 }, n: 6 });
 await until('the flood', () => A.out.cursors[E.self]?.x === 8);
 if (A.out.late !== 'none') fail(`key ${lib.MAX_KEYS + 1} was kept: ${A.out.late}`);
 E.send({ $peerwire: 'set', k: 'count', v: 42, c: 1e6 });
 await until('a valid write from a raw member', () => [A, B, C, D].every((m) => m.out.count === 42));
 console.log(`malformed state messages ignored, keys capped at ${lib.MAX_KEYS}, a valid write from outside React taken`);
+
+// Well-formed messages of the wrong type: what `accept` (or useSharedState's default, the kind of `initial`)
+// keeps out, while hooks without a check still see them.
+E.setPresence({ name: { evil: 1 } });
+E.send({ x: 1 });
+E.send({ $peerwire: 'set', k: 'count', v: { evil: 1 }, c: 2e6 });
+E.send({ $peerwire: 'live', k: 'cursor', v: { x: 'evil' }, n: 7 });
+E.send('after the wrong types');
+await until('the wrong types to arrive', () => [A, B, C, D].every((m) => m.out.messages.at(-1)?.data === 'after the wrong types'));
+for (const m of [A, B, C, D]) {
+  const e = m.out.peers.find((p) => p.id === E.self);
+  if (typeof e?.presence?.name !== 'object' || m.out.named.some((p) => p.id === E.self)) fail(`${m.name}: presence check`);
+  if (m.out.named.length !== m.out.peers.length - 1) fail(`${m.name}: the check dropped a well-named member`);
+  if (!m.out.messages.some((x) => x.data?.x === 1) || m.out.texts.some((x) => typeof x.data !== 'string')) fail(`${m.name}: message check`);
+  if (m.out.texts.at(-1)?.data !== 'after the wrong types') fail(`${m.name}: the message check dropped text`);
+  if (m.out.count !== 0) fail(`${m.name}: an object in a number's shared state read as ${JSON.stringify(m.out.count)}, not initial`);
+  const [other, x] = m === B ? [A, 20] : [B, -5];
+  if (m.out.cursors[E.self]?.x !== 'evil' || E.self in m.out.points || m.out.points[id(other)]?.x !== x) fail(`${m.name}: per-peer check`);
+}
+E.send({ $peerwire: 'set', k: 'count', v: 43, c: 3e6 });
+await until('a number again', () => [A, B, C, D].every((m) => m.out.count === 43));
+console.log('accept: a member\'s wrong presence, message, shared and per-peer values kept out; initial meanwhile');
 
 // Leaving: unmounting A shows at once, and its per-peer value goes with it.
 A.root.unmount();
@@ -200,7 +227,7 @@ console.log('unmount: members see the leave, the per-peer value goes');
 function Switch({ out }) {
   const [opts, setOpts] = useState(null);
   const state = usePeerwireRoom(opts);
-  const peers = usePeers(state.room);
+  const peers = usePeers({ room: state.room });
   Object.assign(out, state, { peers, setOpts });
   return null;
 }

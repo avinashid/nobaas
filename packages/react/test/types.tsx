@@ -5,6 +5,8 @@ import type { Message, Peer, PeerId, Room, RoomState, RoomStatus, SetState } fro
 
 type Me = { name: string };
 type Point = { x: number; y: number };
+const isMe = (p: unknown): p is Me => typeof (p as Me)?.name === 'string';
+const isPoint = (v: unknown): v is Point => typeof (v as Point)?.x === 'number' && typeof (v as Point)?.y === 'number';
 
 export function Types() {
   const state: RoomState = useRoom();
@@ -14,6 +16,10 @@ export function Types() {
 
   const peers: readonly Peer<Me>[] = usePeers<Me>();
   const first: string | undefined = peers[0]?.presence.name;
+  // accept's guard gives the type.
+  const checked: readonly Peer<Me>[] = usePeers({ accept: isMe });
+  // @ts-expect-error: inferred, not any
+  const notAny1: number = checked[0]!.presence.name;
 
   const [me, setMe] = usePresence<Me>();
   const myName: string | undefined = me?.name;
@@ -28,12 +34,26 @@ export function Types() {
   setCount('one');
 
   const [cursors, setCursor] = usePeerState<Point>('cursor');
+  const [points] = usePeerState('cursor', { accept: isPoint });
+  const p: Point | undefined = points['ab' as PeerId];
+  // @ts-expect-error: inferred, not any
+  const notAny2: string = points['ab' as PeerId]!;
+  const [flag] = useSharedState('flag', false, { accept: (v) => typeof v === 'boolean' });
+  const on: boolean = flag;
+  // @ts-expect-error: inferred, not any
+  const notAny4: string = flag;
   const at: Point | undefined = cursors['ab' as PeerId];
   setCursor({ x: 1, y: 2 });
   // @ts-expect-error: y is missing
   setCursor({ x: 1 });
 
-  const { messages, send } = useMessages<string>(50);
+  const { messages, send } = useMessages<string>({ limit: 50 });
+  const { messages: texts } = useMessages({ accept: (d) => typeof d === 'string' });
+  const text: string | undefined = texts[0]?.data;
+  // @ts-expect-error: inferred, not any
+  const notAny3: number = texts[0]!.data;
+  // @ts-expect-error: the limit goes in the options
+  useMessages(50);
   const last: Message<string> | undefined = messages.at(-1);
   const sentTo: number = send('hi', { to: peers.map((p) => p.id) });
   // @ts-expect-error: a string list
@@ -45,12 +65,13 @@ export function Types() {
   useRoomEvent('nope', () => {});
 
   const explicit = usePeerwireRoom(null);
-  usePeers(explicit.room);
+  usePeers({ room: explicit.room });
+  useRoomEvent('presence', () => {}, { room: explicit.room });
 
   return (
     <>
       <RoomProvider appId="a" roomId="r" presence={{ name: 'ana' }} signaling="nostr">
-        {String([status, first, myName, count, at, last, sentTo])}
+        {String([status, first, checked, myName, count, at, p, on, last, text, sentTo, notAny1, notAny2, notAny3, notAny4])}
       </RoomProvider>
       {/* @ts-expect-error: appId is required */}
       <RoomProvider roomId="r" />

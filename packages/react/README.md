@@ -15,6 +15,8 @@ npm install @peerwire/react @peerwire/js
 ```tsx
 import { RoomProvider, usePeers, useSharedState } from '@peerwire/react';
 
+const named = (p: unknown): p is { name: string } => typeof (p as { name?: unknown })?.name === 'string';
+
 export function App() {
   return (
     <RoomProvider appId="my-app" roomId="lobby" presence={{ name: 'Ana' }}>
@@ -24,8 +26,8 @@ export function App() {
 }
 
 function Counter() {
-  const peers = usePeers<{ name: string }>();
-  const [count, setCount] = useSharedState('count', 0);
+  const peers = usePeers({ accept: named }); // members whose presence has a text name
+  const [count, setCount] = useSharedState('count', 0); // numbers only, as `initial` is one
   return <button onClick={() => setCount((c) => c + 1)}>{count} (with {peers.map((p) => p.presence.name).join(', ')})</button>;
 }
 ```
@@ -40,17 +42,37 @@ people you give its id can join.
 |---|---|
 | `<RoomProvider {...joinRoomOptions}>` | Joins the room while mounted; the hooks below use it. Changing `presence` sends it; changing another option joins again. |
 | `useRoom()` | `{ room, status, error }`: `room` is null until joined; `status` is `'joining'`, `'joined'` or `'error'`. |
-| `usePeers<P>()` | The other members, oldest first: `{ id, presence }[]`. |
-| `usePresence<P>()` | `[ours, setOurs]`, like `useState`; every member sees the change. |
-| `useMessages<T>(limit = 200)` | `{ messages, send, clear }`. `messages` holds the newest `limit`, each `{ id, peer, data, lane, kind, at, mine }`; `send(data, { to, lane })` is `room.send`, and adds the message with `mine: true`. |
+| `usePeers({ accept })` | The other members, oldest first: `{ id, presence }[]`. |
+| `usePresence()` | `[ours, setOurs]`, like `useState`; every member sees the change. |
+| `useMessages({ limit, accept })` | `{ messages, send, clear }`. `messages` holds the newest `limit` (default 200), each `{ id, peer, data, lane, kind, at, mine }`; `send(data, { to, lane })` is `room.send`, and adds the message with `mine: true`. |
 | `useRoomEvent(event, handler)` | Calls the latest `handler` for `'peer-join'`, `'peer-leave'`, `'presence'` or `'message'`. |
-| `useSharedState<T>(key, initial)` | `[value, setValue]` shared by the whole room (below). |
-| `usePeerState<T>(key)` | `[byPeer, setOurs]`: each other member's latest value, such as a cursor (below). |
+| `useSharedState(key, initial, { accept })` | `[value, setValue]` shared by the whole room (below). |
+| `usePeerState(key, { accept })` | `[byPeer, setOurs]`: each other member's latest value, such as a cursor (below). |
 | `usePeerwireRoom(options \| null)` | What `RoomProvider` uses: joins without a provider, returns `{ room, status, error }`; null stays out. |
 
-Every hook but `useRoom` takes an optional last argument, a `Room` (or null), to work on that room instead of the
-nearest provider's. `randomRoomId` and the `@peerwire/js` types (`Room`, `PeerId`, `JoinRoomOptions`, ...) are
-re-exported.
+Every hook but `useRoom` takes an options object last. Its `room` (a `Room`, or null for none) works on that room
+instead of the nearest provider's. `randomRoomId` and the `@peerwire/js` types (`Room`, `PeerId`,
+`JoinRoomOptions`, ...) are re-exported.
+
+### Checking what members send
+
+Another member can send any JSON in place of what your types say: an object where you expect a name, a string
+where you expect a number. React throws when it renders an object as text, and with no error boundary the whole
+app unmounts, which also leaves the room. So check every value from other members before you render it: give the
+hooks an `accept` check. A type guard there also gives the hook its type, with no generic to write:
+
+```tsx
+const isPoint = (v: unknown): v is { x: number; y: number } => Number.isFinite((v as any)?.x) && Number.isFinite((v as any)?.y);
+
+const { messages } = useMessages({ accept: (data) => typeof data === 'string' }); // Message<string>[]
+const [cursors] = usePeerState('cursor', { accept: isPoint });                    // { [peer]: { x, y } }
+```
+
+What fails the check is kept out: a message isn't added, a member's value is left out of `usePeerState`, and a
+member whose presence fails is left out of `usePeers`. A shared value that fails reads as `initial`, on every
+member alike. `useSharedState` checks even without `accept`: a value must be of the kind `initial` is (the same
+`typeof`, an array for an array, a non-array object for an object; anything when `initial` is null). The check
+should be a plain function of the value; when it changes, the new one applies from the next change in the room.
 
 ### Shared state
 
@@ -69,8 +91,8 @@ joins gets everyone's current value. A value over one datagram (about 1 KB) goes
 
 ### Limits
 
-- Members are trusted alike, as in the room itself: any member can write any shared key. Data from another member
-  is untrusted input to your app, whatever the TypeScript type says, so check it before you use it.
+- Members are trusted alike, as in the room itself: any member can write any shared key. A check keeps out values
+  of the wrong type, not a member who writes well-typed nonsense.
 - Each store keeps at most 1024 shared keys and 1024 per-peer keys (`MAX_KEYS`), up to 256 characters each.
   Keys past that from other members are ignored.
 - Shared and per-peer state travel as messages with a `$peerwire` field. The hooks hide them, but code that calls
@@ -86,7 +108,7 @@ server (without a room) and join in the browser. Importing it touches no browser
 
 ```tsx
 const { room, status } = usePeerwireRoom(ready ? { appId: 'my-app', roomId } : null);
-const peers = usePeers(room);
+const peers = usePeers({ room });
 ```
 
 ## Example and tests
@@ -100,6 +122,7 @@ const peers = usePeers(room);
 - `node test/hooks.mjs`: the hooks in Node, in react-dom over jsdom, with members of one room over
   BroadcastChannel. It covers server rendering, StrictMode with no ghost member, presence both ways, messages and their limit, shared
   state (concurrent writes converge, a late joiner catches up), per-peer values, leaving, switching rooms, a
-  failed join, and a member that sends malformed or flooding state messages. Needs `packages/js/build.sh` first.
+  failed join, a member that sends malformed or flooding state messages, and `accept` keeping a member's wrongly
+  typed values out. Needs `packages/js/build.sh` first.
 - `node test/example.mjs [screenshot-prefix]`: builds the example with Vite and plays it in three tabs of
-  headless Chromium on loopback.
+  headless Chromium on loopback, with a fourth member outside React that sends the wrong types.
