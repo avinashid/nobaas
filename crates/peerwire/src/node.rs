@@ -1163,8 +1163,11 @@ mod tests {
         let (gw, log) = pcp_gateway(ext, 120);
         let b = Node::builder().stun_servers(Vec::<String>::new()).port_mapping_at(gw, "127.0.0.1:9".parse().unwrap());
         let mut n = b.bind("127.0.0.1:0").unwrap();
-        assert_eq!(n.port_mapping(), PortMapping::Trying);
         let mapped = SocketAddr::from((ext, 41000));
+        // Asking the gateway, or already mapped: bind polls once (set_relay_peers),
+        // and a busy host can let the worker get the answer first.
+        let pcp = PortMapping::Mapped { addr: mapped, protocol: crate::portmap::MapProtocol::Pcp };
+        assert!([PortMapping::Trying, pcp].contains(&n.port_mapping()), "{:?}", n.port_mapping());
         assert!(eventually(|| {
             n.poll();
             n.port_mapping().addr() == Some(mapped)
