@@ -66,6 +66,8 @@ pub(crate) const URGENT_GAP: Duration = Duration::from_millis(4);
 struct Fragment {
     fin: bool,
     data: Vec<u8>,
+    /// The first transmission; `sent_at` is the latest.
+    first_sent: Instant,
     sent_at: Instant,
     due: Instant,
     tries: u32,
@@ -310,6 +312,31 @@ impl RelSend {
     /// Fragments sent for the first time, both streams.
     pub(crate) fn fragments_sent(&self) -> u64 {
         self.streams.iter().map(|s| s.fragments_sent).sum()
+    }
+
+    /// When the oldest fragment still unacknowledged, of either stream, was first
+    /// sent. Fragments go out in sequence order, so it is a stream's lowest in flight.
+    pub(crate) fn oldest_unacked(&self) -> Option<Instant> {
+        let first = |s: &Stream| s.inflight.first_key_value().map(|(_, f)| f.first_sent);
+        match (first(&self.streams[REL]), first(&self.streams[URG])) {
+            (Some(r), Some(u)) => Some(r.min(u)),
+            (r, u) => r.or(u),
+        }
+    }
+
+    /// Makes every fragment in flight due at `now`, as if its timer ran out: the
+    /// path it went out on lost it.
+    pub(crate) fn resend_all(&mut self, now: Instant) {
+        for st in &mut self.streams {
+            let Stream { inflight, by_due, .. } = st;
+            for (&seq, f) in inflight.iter_mut() {
+                if f.due > now {
+                    by_due.remove(&(f.due, seq));
+                    by_due.insert((now, seq));
+                    f.due = now;
+                }
+            }
+        }
     }
 
     /// Fragments sent again (timeouts, fast retransmits, tail probes), both streams.
@@ -612,6 +639,7 @@ impl RelSend {
                 Fragment {
                     fin,
                     data,
+                    first_sent: now,
                     sent_at: now,
                     due: now + self.rto,
                     tries: 1,
