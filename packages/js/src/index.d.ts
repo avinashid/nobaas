@@ -376,7 +376,8 @@ export declare class WebRtcTransport implements Transport {
   readonly congested: number;
   /**
    * Signals refused: a `from` that isn't a PeerId or an empty message, an offer whose `offerProof` fails or whose
-   * SDP doesn't apply, an `ice-batch` that isn't a list of at most 32, or one that failed unexpectedly. Answers and
+   * SDP doesn't apply, a retry offer that would make a peer's second new connection within 2 s, an `ice-batch`
+   * that isn't a list of at most 32, or one that failed unexpectedly. Answers and
    * ICE candidates that don't apply are not counted (copies and races are normal). The WebRTC counterpart of
    * NostrSignaling's `stats.rejected`.
    */

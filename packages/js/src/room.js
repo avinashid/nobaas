@@ -193,7 +193,7 @@ export class Room {
       // its first datagram there: one now (its ACK moves the far end's too), not at the next
       // keepalive, up to 10 s on.
       if (state === 'open' && this.routes.get(peer)?.kind === 'signaling' && this.proven.has(peer)) this.write(peer, Uint8Array.of(T.Nudge), Lane.Reliable);
-      else if (state === 'retry') this.retries.ask(peer);
+      else if (state === 'retry' && this.self < peer) this.retries.ask(peer); // only the dialling side is asked
     });
     // Peers on a fallback: WebRTC is tried again now and then (see retryDirect).
     this.retries = new DirectRetries((peer) => this.retryNow(peer), { holdMs: (this.transport.fallbackMs ?? 8000) + 10000 });

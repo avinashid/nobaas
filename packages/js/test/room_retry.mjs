@@ -17,11 +17,16 @@
 //    with the same type doesn't;
 // 7. leave() stops the retries;
 // 8. a retry offer that doesn't prove the room key replaces nothing;
-// 9. nor does a proven one while the answerer's link is open: the pair stays direct.
+// 9. nor does a proven one while the answerer's link is open: the pair stays direct;
+// 10. 20 proven retry offers with new descriptions, 50 ms apart, make one connection and
+//     one answer (WebRtcTransport.retryAnswerMs); a copy of the one taken is answered again;
+// 11. a 'retry' ask sent to the larger id is ignored: it doesn't ask back, nobody retries;
+// 12. a retry whose createOffer throws ends as a failed one: its link goes, and the next
+//     retry goes direct.
 //
 //   node packages/js/test/room_retry.mjs
 import { joinRoom } from '../src/index.js';
-import { BroadcastSignaling } from '../src/webrtc.js';
+import { BroadcastSignaling, WebRtcTransport } from '../src/webrtc.js';
 import { DirectRetries } from '../src/retry.js';
 
 const fail = (m) => {
@@ -47,6 +52,8 @@ const failing = new Map();
 const failNext = (x, y, n) => (failing.set(`${x}|${y}`, n), failing.set(`${y}|${x}`, n));
 const pcs = new Map(); // token -> FakePc
 let tokens = 0;
+const made = new Map(); // owner -> connections made
+const throwOffer = new Set(); // owners whose next createOffer throws
 
 class FakeDc {
   constructor() {
@@ -79,12 +86,14 @@ const fakePc = (owner) => class FakePc {
     this.localDescription = null;
     this.remoteDescription = null;
     pcs.set(this.token, this);
+    made.set(owner, (made.get(owner) ?? 0) + 1);
   }
   createDataChannel() {
     this.dc = new FakeDc();
     return this.dc;
   }
   async createOffer() {
+    if (throwOffer.delete(this.owner)) throw new Error('createOffer failed');
     return { type: 'offer', sdp: sdpOf(this.token) };
   }
   async createAnswer() {
@@ -149,6 +158,7 @@ const room = async (name, extra) => {
     RTCPeerConnection: fakePc(name),
     ...extra,
   });
+  r.owner = name;
   // Every endpoint event and transport state, to check the session stays the same one.
   r.seen = { connected: 0, pathChanged: 0, failed: 0, retryFailed: 0, joins: 0, leaves: 0 };
   const ev = r.endpoint.onEvent;
@@ -363,6 +373,71 @@ for (const privacy of ['public-only', 'direct']) {
   await until('data after the offer', () => got.length === 1, 3000);
   if (b.transport.byPeer.get(a.self) !== old || routes(a, b).join() !== 'direct,direct' || a.seen.leaves || b.seen.leaves) fail(`a retry offer replaced an open link: ${routes(a, b)}`);
   console.log('9. a proven retry offer to a direct pair is ignored: the open link stays');
+  await Promise.all([a.leave(), b.leave()]);
+}
+
+// 10. A flood of proven retry offers, each with a new description, to the answering side:
+// one makes a connection and an answer, the rest are refused until retryAnswerMs is over.
+{
+  DirectRetries.firstMs = 60000;
+  const floor = WebRtcTransport.retryAnswerMs;
+  WebRtcTransport.retryAnswerMs = 10000; // well over the flood, however slow the host
+  const [a, b] = await pair(1);
+  await until('a link over signalling', () => routes(a, b).join() === 'signaling,signaling');
+  b.transport.fallbackMs = 10000; // the connection b makes lives through the flood (8 s by default)
+  const answers = () => sent.filter((s) => s.from === b.self && s.to === a.self && s.body?.kind === 'answer');
+  const [made0, answers0, bad0, resent0] = [made.get(b.owner), answers().length, b.transport.badSignals, b.transport.resent];
+  const p = await a.transport.offerProof.sign(b.self);
+  const offers = [];
+  for (let i = 0; i < 20; i++) {
+    const pc = new (fakePc(`x${n}`))();
+    offers.push({ kind: 'offer', sdp: { type: 'offer', sdp: sdpOf(pc.token) }, p, retry: true });
+    a.transport.signal(b.self, offers[i]);
+    await sleep(50);
+  }
+  await until('the flood handled', () => b.transport.badSignals - bad0 + answers().length - answers0 >= 20, 5000);
+  await sleep(300);
+  const conns = made.get(b.owner) - made0;
+  if (conns !== 1 || answers().length - answers0 !== 1) fail(`20 retry offers made ${conns} connections and ${answers().length - answers0} answers, want 1 and 1`);
+  if (b.transport.badSignals - bad0 !== 19) fail(`${b.transport.badSignals - bad0} retry offers refused, want 19`);
+  // A copy of the offer taken (its answer lost, say) is answered again, with no new connection.
+  const before = made.get(b.owner);
+  a.transport.signal(b.self, offers[0]);
+  await until('the answer sent again', () => b.transport.resent > resent0, 3000);
+  if (made.get(b.owner) !== before || answers().length - answers0 !== 2) fail(`a copy of the taken offer: ${made.get(b.owner) - before} connections, ${answers().length - answers0} answers`);
+  if (routes(a, b).join() !== 'signaling,signaling' || a.seen.leaves || b.seen.leaves) fail(`after the flood: ${routes(a, b)}, ${JSON.stringify([a.seen, b.seen])}`);
+  console.log(`10. 20 proven retry offers 50 ms apart made 1 connection and 1 answer (19 refused); a copy of the one taken was answered again`);
+  await Promise.all([a.leave(), b.leave()]);
+  WebRtcTransport.retryAnswerMs = floor;
+}
+
+// 11. A 'retry' ask sent to the larger id (only the dialling side acts on one): no ask back.
+{
+  DirectRetries.firstMs = 60000;
+  const [a, b] = await pair(1);
+  await until('a link over signalling', () => routes(a, b).join() === 'signaling,signaling');
+  const from = sent.length;
+  a.transport.signal(b.self, { kind: 'retry' });
+  await sleep(800);
+  const back = sent.slice(from).filter((s) => s.from === b.self && s.body?.kind === 'retry');
+  if (back.length || a.transport.retried || b.transport.retried) fail(`an ask to the larger id: ${back.length} asks back, retries a ${a.transport.retried}, b ${b.transport.retried}`);
+  console.log("11. a 'retry' ask sent to the larger id is ignored: no ask back, no retry");
+  await Promise.all([a.leave(), b.leave()]);
+}
+
+// 12. A retry whose createOffer throws: its link goes ('retry-failed'), the next goes direct.
+{
+  DirectRetries.firstMs = 60000;
+  const [a, b] = await pair(1);
+  await until('a link over signalling', () => routes(a, b).join() === 'signaling,signaling');
+  throwOffer.add(a.owner);
+  if (a.retryDirect(b.self) !== 1) fail('retryDirect(peer) on a peer over signalling is not 1');
+  await until("the retry that couldn't start failed", () => a.seen.retryFailed === 1, 3000);
+  if (a.transport.has(b.self)) fail("the retry that couldn't start left its link behind");
+  if (a.retryDirect(b.self) !== 1) fail('the second retryDirect(peer) is not 1');
+  await until('direct on the next retry', () => routes(a, b).join() === 'direct,direct', 5000);
+  if (a.transport.retried !== 2 || a.seen.leaves || b.seen.leaves) fail(`retries ${a.transport.retried}, ${JSON.stringify([a.seen, b.seen])}`);
+  console.log("12. a retry whose createOffer threw failed quietly and left no link; the next went direct");
   await Promise.all([a.leave(), b.leave()]);
 }
 
